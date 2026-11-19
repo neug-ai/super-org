@@ -1,13 +1,28 @@
 import { afterEach, expect, it, vi } from 'vitest'
 import { Commands } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
-import { feishuRead, readFeishu, feishuReferences, readFeishuLink } from '../src/sources/feishu.ts'
+import { feishuRead, readFeishu, feishuReferences, readFeishuLink, withMentionNames } from '../src/sources/feishu.ts'
 import type { FeishuRef } from '../src/sources/feishu.ts'
 const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
 const event: FeishuRef = { triggerId: 'source', chatId: 'oc_chat', messageId: 'om_source' }
 const source = { message_id: 'om_source', chat_id: 'oc_chat', parent_id: 'om_parent', root_id: 'om_root', thread_id: 'omt_thread' }
 const message = { message_id: 'om_root', chat_id: 'oc_chat', msg_type: 'merge_forward', content: '<forwarded_messages>Earlier discussion ![Image](img_one)</forwarded_messages>', sender: { id: 'ou_user', name: 'User', sender_type: 'user' }, create_time: '2026-09-11 12:00' }
 afterEach(() => vi.restoreAllMocks())
+it('resolves whole numbered mentions regardless of order and leaves unknown longer mentions intact', () => {
+  const text = 'Evidence: @_user_1. Review: @_user_10. @_user_1负责，@_user_100 待确认。'
+  const mentions = [{ key: '@_user_1', name: 'Alice' }, { key: '@_user_10', name: 'Bob' }]
+  const expected = 'Evidence: @Alice. Review: @Bob. @Alice负责，@_user_100 待确认。'
+  expect(withMentionNames(text, mentions)).toBe(expected)
+  expect(withMentionNames(text, mentions.toReversed())).toBe(expected)
+})
+it('renders each mention once and treats other keys and display names literally', () => {
+  expect(withMentionNames('@_user_1 @_user_10 @_group[2] @_user_25', [
+    { key: '@_user_1', name: '_user_10' },
+    { key: '@_user_10', name: 'Bob$&' },
+    { key: '@_group[2]', name: 'Reviewers' },
+    { key: '@_user_25' },
+  ])).toBe('@_user_10 @Bob$& @Reviewers @_user_25')
+})
 it('resolves legacy source metadata and reads merged forwards without embedding automatic thread expansion', async () => {
   const lark = vi.spyOn(commands, 'lark').mockResolvedValueOnce({ items: [source] }).mockResolvedValueOnce({ messages: [{ ...message, thread_replies: [{ content: 'Automatic expansion omitted' }] }] })
   const result = await readFeishu(commands, event, 'feishu/source/root', 20)
