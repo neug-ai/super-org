@@ -258,6 +258,61 @@ describe('feishu source', () => {
     expect(lark.mock.calls.filter(([args]) => args[1] === '+threads-messages-list')).toHaveLength(1)
     h.store.close()
   })
+  it('recovers a later topic page after a timeout without delivering the first page twice', async () => {
+    const h = host()
+    try {
+      const ref = { source: 'feishu', id: 'oc_1:om_root' }
+      const thread = 'feishu:oc_1:om_root'
+      const checkpoint = KV.feishu.seen(thread)
+      subscribed(h, ref, { chatId: 'oc_1', messageId: 'om_root', sourceTriggerId: 'source-trigger' })
+      h.store.set(checkpoint, ['om_a'])
+      h.store.set(KV.feishu.initialized(thread), true)
+      const settings = h.store.settings()
+      const source = settings.sources.feishu!
+      h.store.saveSettings({ ...settings, sources: { ...settings.sources,
+        feishu: { ...source, config: { ...source.config, readPageSize: 2 } } } })
+
+      const reply = (id: string) => ({ message_id: id, chat_id: 'oc_1', msg_type: 'text', content: `reply ${id}`,
+        create_time: String(Date.now()), sender: { id: MEMBER, sender_type: 'user' }, thread_id: 'omt_1', root_id: 'om_root' })
+      const pages: (string | undefined)[] = []
+      let failLaterPage = true
+      vi.spyOn(h.commands, 'lark').mockImplementation(async args => {
+        if (args[0] === 'api') return { items: [{ message_id: 'om_root', chat_id: 'oc_1', thread_id: 'omt_1' }] }
+        expect(args[1]).toBe('+threads-messages-list')
+        expect(args[args.indexOf('--page-size') + 1]).toBe('2')
+        const token = args[args.indexOf('--page-token') + 1]
+        pages.push(args.includes('--page-token') ? token : undefined)
+        if (!args.includes('--page-token')) return { thread_id: 'omt_1', has_more: true, page_token: 'older',
+          messages: [reply('om_d'), reply('om_c')] }
+        expect(token).toBe('older')
+        if (failLaterPage) throw new Error('second page timed out')
+        return { thread_id: 'omt_1', has_more: false, messages: [reply('om_b'), reply('om_a')] }
+      })
+      const delivered = () => h.receive.mock.calls.map(([trigger]) => trigger.meta.messageId)
+
+      await pollFeishuThreads(h)
+      expect(pages).toEqual([undefined, 'older'])
+      expect(delivered()).toEqual(['om_c', 'om_d'])
+      expect(h.store.threads.get(thread)?.meta.pollError).toContain('second page timed out')
+      const partialCheckpoint = h.store.get(checkpoint)
+
+      failLaterPage = false
+      pages.length = 0
+      await pollFeishuThreads(h)
+      expect(pages).toEqual([undefined, 'older'])
+      expect(delivered()).toEqual(['om_c', 'om_d', 'om_b'])
+      expect(partialCheckpoint).toEqual(['om_a'])
+      expect(h.store.get(checkpoint)).toEqual(expect.arrayContaining(['om_a', 'om_b', 'om_c', 'om_d']))
+      expect(h.store.threads.get(thread)?.meta).not.toHaveProperty('pollError')
+
+      pages.length = 0
+      await pollFeishuThreads(h)
+      expect(pages).toEqual([undefined])
+      expect(delivered()).toEqual(['om_c', 'om_d', 'om_b'])
+    } finally {
+      h.store.close()
+    }
+  })
   it('recovers the topics of a chat while they had a message in the last two weeks, and forgets quieter ones', async () => {
     const h = host()
     const day = 24 * 3600_000
