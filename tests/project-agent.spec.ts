@@ -293,6 +293,33 @@ it('continues DingTalk conversation, reads local knowledge, and retains project 
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: '你可以先读目录。' }))
     expect(projects.detail(id).tasks).toHaveLength(1)
     expect(projects.detail(id).tickets).toEqual([])
+    const deliver = (msgId: string, data: Record<string, unknown>) => receive({ headers: { messageId: msgId },
+      data: JSON.stringify({ ...JSON.parse(frame.data), msgId, ...data }) })
+    await deliver('observe-new-member', { senderStaffId: 'new-member', senderId: 'opaque-new-member',
+      text: { content: '登记项目成员' } })
+    await h.runtime.idle()
+    const newMember = projects.memberForAccount(id, 'dingtalk', 'test-corp', 'new-member')!
+    propose.mockImplementationOnce(async prompt => {
+      const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+      expect(context.message.text).toBe('任务1负责人')
+      expect(context.message.mentions).toEqual({ members: [{ memberId: newMember.id, name: newMember.name }], unresolvedCount: 0 })
+      return { calls: [call('task.update', { taskId: task.id, changes: { ownerId: newMember.id } })], reply: '' }
+    })
+    await deliver('mention-assignment', { senderId: 'opaque-member',
+      atUsers: [{ dingtalkId: 'bot' }, { dingtalkId: 'opaque-new-member' }], text: { content: '任务1负责人  ' } })
+    await h.runtime.idle()
+    expect(projects.detail(id).tasks[0]?.ownerId).toBe(newMember.id)
+    propose.mockImplementationOnce(async prompt => {
+      const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+      expect(context.message.mentions).toMatchObject({ members: [{ memberId: newMember.id }], unresolvedCount: 1 })
+      expect(prompt).toContain('勿按列表顺序猜测')
+      return done('请说明这两位分别对应哪项任务。')
+    })
+    await deliver('ambiguous-mentions', { senderId: 'opaque-member',
+      atUsers: [{ dingtalkId: 'bot' }, { dingtalkId: 'opaque-new-member' }, { dingtalkId: 'opaque-unknown' }],
+      text: { content: '任务1负责人  ，任务2负责人  ' } })
+    await h.runtime.idle()
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: '请说明这两位分别对应哪项任务。' }))
     const historyTools = h.runtime.projectTools!
     const { message } = h.runtime.projectAgent!.runs(id).find(run => run.message.text === '知识库从哪开始读？')!
     const turn = historyTools.execute('conversation.history.read', { messageId: 'no-keywords' },

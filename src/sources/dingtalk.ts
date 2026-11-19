@@ -81,10 +81,22 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
     const { memberId } = evidence(trigger)
     if (!memberId) return enrollFirst
     if (!trigger.channel || !agent) return '项目消息通道尚未就绪。'
+    const { corpId } = sender(trigger)
+    const mentions = new Map<string, { memberId: string; name: string }>()
+    let unresolvedCount = 0
+    const mentionedStaffIds = trigger.meta.mentionedStaffIds
+    if (corpId && Array.isArray(mentionedStaffIds)) {
+      for (const staffId of mentionedStaffIds) {
+        const member = typeof staffId === 'string' ? projects.directoryMemberForAccount('dingtalk', corpId, staffId) : undefined
+        if (member) mentions.set(member.id, { memberId: member.id, name: member.name })
+        else unresolvedCount++
+      }
+    }
     const result = agent.submit({ projectId, actorId: memberId, messageId: trigger.id, channel: trigger.channel,
       text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '',
       sentAt: trigger.at, nativeMessageId: typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined,
-      replyToNativeMessageId: typeof trigger.meta.replyToMessageId === 'string' ? trigger.meta.replyToMessageId : undefined })
+      replyToNativeMessageId: typeof trigger.meta.replyToMessageId === 'string' ? trigger.meta.replyToMessageId : undefined,
+      ...(mentions.size || unresolvedCount ? { mentions: { members: [...mentions.values()], unresolvedCount } } : {}) })
     return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' : '已收到，正在结合项目现状处理。'
   }
   const enroll = (trigger: Trigger) => {
@@ -126,12 +138,15 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
 export const dingTalkRoute = family<Route, [string]>('dingtalk-route:')
 const tickets = family<string, [string, string]>('dingtalk-ticket:')
 const bodies = family<{ messageType: string; content: unknown }, [string]>('dingtalk-body:')
+const senderIdentities = family<string | null, [string]>('dingtalk-sender-identity:')
+const optionalIdentity = z.string().min(1).max(256).optional()
+const AtUser = z.object({ dingtalkId: optionalIdentity, staffId: z.string().min(1).max(128).optional() })
 const deliveries = family<{ messageId: string; format: string; transport: string; messageType: string; at: string }, [string]>('dingtalk-last-delivery:')
 const Message = z.object({ msgId: z.string().min(1), conversationId: z.string().min(1),
   conversationType: z.string(), isInAtList: z.boolean().optional(), senderStaffId: z.string().min(1),
   senderCorpId: z.string().min(1), senderNick: z.string().optional(), chatbotUserId: z.string().optional(), senderId: z.string().optional(),
   robotCode: z.string().min(1), msgtype: z.string(), text: z.object({ content: z.string().optional() }).nullish(),
-  content: z.unknown().optional(),
+  content: z.unknown().optional(), atUsers: z.unknown().optional(),
   createAt: z.number().optional(), sessionWebhook: z.string().url(), sessionWebhookExpiredTime: z.number() })
 export interface Route { webhook: string; expires: number; robotCode: string; conversationId: string; corpId?: string }
 export const ticketReference = (text: string): string | undefined => /(?:^|\s)#([a-f0-9]{12,32})(?=\s|$|[，。,:：])/i.exec(text)?.[1]?.toLowerCase()
@@ -186,7 +201,28 @@ function quotedText(value: unknown, depth = 0): string {
   if (Array.isArray(body.children)) return quotedText(body.children, depth + 1)
   return contentText(value)
 }
-export function dingTalkTrigger(raw: unknown, context: SourceContext): { trigger: Trigger; route: Route; body?: { messageType: string; content: unknown } } | undefined {
+function senderIdentity(message: z.output<typeof Message>, dingTalkId: string) {
+  return senderIdentities(key(message.robotCode, message.senderCorpId, dingTalkId))
+}
+/** The Stream mention list identifies recipients but does not locate them in the message body. */
+function mentionedStaffIds(message: z.output<typeof Message>, context: SourceContext): (string | null)[] {
+  if (!Array.isArray(message.atUsers)) return []
+  const recipients = new Map<string, string | null>()
+  for (const item of message.atUsers.slice(0, 50)) {
+    const parsed = AtUser.safeParse(item)
+    if (!parsed.success) continue
+    const { dingtalkId, staffId } = parsed.data
+    if (!dingtalkId && !staffId || dingtalkId && dingtalkId === message.chatbotUserId) continue
+    const observed = !dingtalkId ? undefined : dingtalkId === message.senderId ? message.senderStaffId
+      : context.state.get(senderIdentity(message, dingtalkId))
+    const identity = observed === null || observed && staffId && observed !== staffId ? null : staffId ?? observed ?? null
+    recipients.set(dingtalkId ? `opaque:${dingtalkId}` : `staff:${staffId}`, identity)
+  }
+  return [...recipients.values()]
+}
+export function dingTalkTrigger(raw: unknown, context: SourceContext): {
+  trigger: Trigger; route: Route; body?: { messageType: string; content: unknown }; senderKey?: ReturnType<typeof senderIdentity>
+} | undefined {
   // The agreed receiving scope is group mentions; content type is not an additional filter.
   if (!raw || typeof raw !== 'object') return
   const head = raw as Record<string, unknown>
@@ -209,12 +245,16 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): { trigger
   const origin = matches.length === 1 ? context.triggers.get(matches[0]!.origin.triggerId) : undefined
   const threads = origin?.threads ?? [{ source: 'dingtalk', id }]
   const conversation = message.conversationId
+  const mentions = mentionedStaffIds(message, context)
   return {
+    ...(message.senderId && message.senderId.length <= 256 && message.senderStaffId.length <= 128
+      ? { senderKey: senderIdentity(message, message.senderId) } : {}),
     trigger: { id, source: 'dingtalk', threads, actor: { source: 'dingtalk', id: message.senderStaffId }, human: true,
       addressed: 'mention', at: new Date(message.createAt ?? Date.now()).toISOString(), text,
       channel: { source: 'dingtalk', thread: `dingtalk:${conversation}`, address: { conversationId: conversation, triggerId: id } },
       meta: { conversationId: conversation, conversationType: '2', senderCorpId: message.senderCorpId, robotCode: message.robotCode,
         messageId: message.msgId, messageType: message.msgtype, chatbotUserId: message.chatbotUserId,
+        ...(mentions.length ? { mentionedStaffIds: mentions } : {}),
         ...(message.senderNick?.trim() ? { senderNick: message.senderNick.trim().slice(0, 200) } : {}),
         ...(quote ? { replyToMessageId: quote.msgId, replyToMessageType: quote.msgType, replyToBot } : {}),
         ...(botQuote ? { replyToBotText: botQuote.slice(0, 8000) } : {}),
@@ -253,7 +293,12 @@ export class DingTalk {
       try {
         const parsed = dingTalkTrigger(JSON.parse(frame.data), context)
         if (parsed && (!intake?.conversationId || intake.conversationId === parsed.route.conversationId)) await context.atomic(() => {
-          const { trigger } = parsed
+          const { trigger, senderKey } = parsed
+          if (senderKey && context.config('dingtalk') !== undefined) {
+            const observed = context.state.get(senderKey)
+            if (observed === undefined) context.state.set(senderKey, trigger.actor.id)
+            else if (observed !== null && observed !== trigger.actor.id) context.state.set(senderKey, null)
+          }
           const handlers = intake?.forConversation ? intake.forConversation(parsed.route.conversationId) : intake
           if (handlers?.project) {
             trigger.meta.projectId = handlers.project.id

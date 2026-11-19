@@ -10,6 +10,8 @@ export const ProjectMessage = z.strictObject({
   nativeMessageId: id.optional(),
   replyToNativeMessageId: id.optional(),
   sourceUrl: z.url({ protocol: /^https?$/ }).optional(),
+  mentions: z.strictObject({ members: z.array(z.strictObject({ memberId: id, name: z.string().min(1).max(200) })).max(50),
+    unresolvedCount: z.number().int().min(0).max(50) }).optional(),
   channel: z.strictObject({ source: id, thread: id, address: z.record(z.string(), z.string()) }),
 })
 export type ProjectMessage = z.output<typeof ProjectMessage>
