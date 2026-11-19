@@ -302,6 +302,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'POST projects/:id/tasks/:taskId/reviews/:reviewId': { body: true, answer: () => new Refusal(409, { error: 'Review service unavailable' }) },
   'POST projects/:id/messages': { body: true, answer: () => new Refusal(409, { error: 'Project Agent unavailable' }) },
   'GET projects/:id/agent-runs': { answer: () => [] },
+  'GET projects/:id/conversation': { answer: () => [] },
   'GET projects/:id/checks': { answer: () => [] },
   'GET projects/:id/history': { query: ['before'], answer: () => ({ entries: [], next: null, notifications: [], synchronization: [], remote: [], checks: [] }) },
   'POST projects/:id/synchronization/:operationId/retry': { answer: () => ({ status: 'queued' }) },

@@ -36,6 +36,7 @@ export interface Api {
   'PUT projects/:id/conversation-preferences': { body: { requestId: string; revision: number; value: CommunicationPreference }; response: ReturnType<Communication['update']> }
   'POST projects/:id/messages': { body: { messageId?: string; text: string; quoted?: string }; response: ReturnType<ProjectAgent['submit']> }
   'GET projects/:id/agent-runs': { response: ProjectAgentRun[] }
+  'GET projects/:id/conversation': { response: ReturnType<ProjectAgent['webConversation']> }
   'GET projects/:id/checks': { response: import('./project-progress.ts').ProjectCheck[] }
   'GET projects/:id/history': { query?: { before?: number }; response: ReturnType<import('./project-history.ts').ProjectHistory['view']> }
   'POST projects/:id/synchronization/:operationId/retry': { response: { status: 'queued' } }

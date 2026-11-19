@@ -105,6 +105,8 @@ it('opens one project section at a time and saves an internal task without an is
       connections: { github: { state: 'paused', detail: 'Off', code: 'sourceOff' } },
       agent: { main: 'running', load: { running: 2, queued: 1, maxWorkers: 4 } } }
     if (route === 'GET projects/agents') return { ...agents }
+    if (route === 'GET projects/:id/conversation') return [{ id: 'turn-1', at: '2026-11-16T00:00:00Z',
+      status: 'completed', text: 'What did we decide about the rollout?', reply: 'Start with the pilot group.' }]
     if (route === 'POST projects/:id/changes') {
       project.tasks.push({ id: 'task', ...request!.body.change.value, description: '', status: 'todo', priority: 'eliminate',
         acceptance: '', ownerId: null, milestoneId: null, dueDate: null, blockedBy: [], ticketId: null,
@@ -119,6 +121,10 @@ it('opens one project section at a time and saves an internal task without an is
   try {
     expect(content()).toContain(zh['project.firstTask'])
     expect(content()).not.toContain('Use main?')
+    expect(call.mock.calls.some(([route]) => route === 'GET projects/:id/conversation')).toBe(false)
+    await act(async () => { nav(zh['project.conversation']).click() })
+    expect(content()).toContain('Start with the pilot group.')
+    expect(page.container.querySelector('.dt-work-main textarea')).not.toBeNull()
     await act(async () => { nav(zh['project.decisions']).click() })
     expect(nav(zh['project.decisions']).getAttribute('aria-current')).toBe('page')
     expect(content()).toContain('Use the latest stable commit.')

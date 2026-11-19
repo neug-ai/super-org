@@ -48,6 +48,7 @@ export const ProjectInput = z.strictObject({
   status: z.enum(['planning', 'active', 'paused', 'completed', 'archived']).default('active'),
   repository: ProjectRepository.nullable().optional(),
   dingTalkGroup: z.string().trim().min(1).max(300).nullable().optional(),
+  feishuChatId: z.string().trim().max(300).regex(/^oc_[a-zA-Z0-9]+$/).nullable().optional(),
   autoAdvance: z.boolean().optional(),
 })
 export type ProjectInput = z.input<typeof ProjectInput>
@@ -169,7 +170,7 @@ export class Projects {
   }
 
   list(): ProjectSummary[] {
-    return this.records(KV.projects.project).map(({ tasks, milestones: _milestones, decisions, memberIds, dingTalkGroup: _group, ...project }) => ({
+    return this.records(KV.projects.project).map(({ tasks, milestones: _milestones, decisions, memberIds, dingTalkGroup: _group, feishuChatId: _feishu, ...project }) => ({
       ...project, taskCount: tasks.filter(task => task.status !== 'cancelled').length,
       completedCount: tasks.filter(task => task.status === 'done').length,
       memberCount: memberIds.length, pendingCount: decisions.filter(decision => !decision.answeredAt).length,
@@ -186,6 +187,15 @@ export class Projects {
   forDingTalkGroup(group: string): { id: string; repository: string | null } | undefined {
     const project = this.records(KV.projects.project).find(project => project.dingTalkGroup === group && project.status !== 'archived')
     return project && { id: project.id, repository: project.repository ?? null }
+  }
+
+  forFeishuChat(chatId: string): Project | undefined {
+    return this.records(KV.projects.project).find(project => project.feishuChatId === chatId && project.status !== 'archived')
+  }
+
+  private checkFeishuChat(chatId?: string | null, projectId?: string): void {
+    if (chatId && this.records(KV.projects.project).some(project => project.id !== projectId && project.feishuChatId === chatId))
+      throw new ProjectError(409, 'This Feishu chat is already linked to another project')
   }
 
   private checkDingTalkGroup(group?: string | null, projectId?: string): void {
@@ -283,6 +293,7 @@ export class Projects {
   create(value: z.output<typeof ProjectInput>): ProjectDetail {
     return this.store.atomic(() => {
       this.checkDingTalkGroup(value.dingTalkGroup)
+      this.checkFeishuChat(value.feishuChatId)
       const at = isoNow()
       const project = { ...value, repository: value.repository ?? null, ...(value.repository && { repositoryLinkedAt: at }),
         issueUrl: null, id: randomUUID(), revision: 0, createdAt: at, updatedAt: at,
@@ -452,6 +463,7 @@ export class Projects {
       switch (change.kind) {
         case 'project':
           this.checkDingTalkGroup(change.value.dingTalkGroup, project.id)
+          this.checkFeishuChat(change.value.feishuChatId, project.id)
           if (change.value.repository !== undefined && change.value.repository !== project.repository)
             project.repositoryLinkedAt = change.value.repository ? at : undefined
           for (const [key, value] of Object.entries(change.value)) {

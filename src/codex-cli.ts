@@ -22,6 +22,7 @@ import { RobotAgents } from './harness/robot-agents.ts'
 import { dingTalkProjectIntake } from './sources/dingtalk.ts'
 import { DingTalk, dingTalkKind } from './sources/dingtalk.ts'
 import { githubKind, watchGithub } from './sources/github.ts'
+import { feishuKind, runFeishu } from './sources/feishu.ts'
 import { GithubAppSchema } from './infra/github-app.ts'
 
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`
@@ -231,6 +232,7 @@ async function main(): Promise<void> {
   let runtime: Runtime | undefined, robot: DingTalk | undefined
   const githubController = new AbortController()
   let githubPolling: Promise<void> | undefined
+  let feishuPolling: Promise<unknown> | undefined
   let stopping: Promise<void> | undefined
   const stop = () => stopping ??= (async () => {
     robot?.stop()
@@ -239,6 +241,7 @@ async function main(): Promise<void> {
     const stopped = runtime?.stop()
     await harness.close()
     await stopped
+    await feishuPolling
   })()
   try {
     runtime = new Runtime(ctx, machine, () => { log('restart_required'); void stop() },
@@ -247,6 +250,7 @@ async function main(): Promise<void> {
       undefined, robotAgents)
     runtime.lifetime.addEventListener('abort', () => { githubController.abort(); robot?.stop(); void harness.close() }, { once: true })
     runtime.sources.register(githubKind)
+    runtime.sources.register(feishuKind)
     if (clientId && clientSecret) {
       const kind = dingTalkKind(message => robot!.send(message))
       runtime.sources.register(kind)
@@ -268,6 +272,7 @@ async function main(): Promise<void> {
         github: { ...policy.sources.github, allowed } } }, runtime.store.blockRevision('policy'), 'sync')
     }
     await harness.listen()
+    feishuPolling = runFeishu(runtime.context(feishuKind), runtime.lifetime)
     await robot?.start()
     githubPolling = watchGithub(runtime.context(githubKind), githubController.signal)
     for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { void stop().catch(() => { process.exitCode = 1 }) })

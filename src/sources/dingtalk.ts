@@ -82,7 +82,9 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
     if (!memberId) return enrollFirst
     if (!trigger.channel || !agent) return '项目消息通道尚未就绪。'
     const result = agent.submit({ projectId, actorId: memberId, messageId: trigger.id, channel: trigger.channel,
-      text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '' })
+      text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '',
+      sentAt: trigger.at, nativeMessageId: typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined,
+      replyToNativeMessageId: typeof trigger.meta.replyToMessageId === 'string' ? trigger.meta.replyToMessageId : undefined })
     return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' : '已收到，正在结合项目现状处理。'
   }
   const enroll = (trigger: Trigger) => {

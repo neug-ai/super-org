@@ -6,6 +6,10 @@ export const ProjectMessage = z.strictObject({
   projectId: id, messageId: id, actorId: id.nullable(), text: z.string().trim().min(1).max(26000),
   quoted: z.string().max(16000).default(''),
   reviewId: id.optional(),
+  sentAt: z.iso.datetime().optional(),
+  nativeMessageId: id.optional(),
+  replyToNativeMessageId: id.optional(),
+  sourceUrl: z.url({ protocol: /^https?$/ }).optional(),
   channel: z.strictObject({ source: id, thread: id, address: z.record(z.string(), z.string()) }),
 })
 export type ProjectMessage = z.output<typeof ProjectMessage>

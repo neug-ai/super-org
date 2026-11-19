@@ -18,9 +18,9 @@ const TASK_VIEWS = ['kanban', 'priority', 'list'] as const
 type TaskView = typeof TASK_VIEWS[number]
 const ISSUE_REFERENCE = /^(?:https?:\/\/github\.com\/)?([\w-]+\/[\w.-]+)(?:\/issues\/|#)([1-9]\d*)\/?(?:[?#].*)?$/
 const ISSUE_NUMBER = /^#([1-9]\d*)$/
-const SECTIONS = ['tasks', 'members', 'milestones', 'decisions', 'tickets', 'history'] as const
+const SECTIONS = ['tasks', 'conversation', 'members', 'milestones', 'decisions', 'tickets', 'history'] as const
 type ProjectSection = typeof SECTIONS[number]
-const SECTION_ICONS = { tasks: 'queue', members: 'user', milestones: 'clock', decisions: 'decision', tickets: 'history', history: 'history' } as const
+const SECTION_ICONS = { tasks: 'queue', conversation: 'message', members: 'user', milestones: 'clock', decisions: 'decision', tickets: 'history', history: 'history' } as const
 const field = (data: FormData, name: string) => String(data.get(name) ?? '').trim()
 const optional = (data: FormData, name: string) => field(data, name) || null
 type Change = ProjectChange['change']
@@ -82,6 +82,7 @@ function ProjectFields({ t, project }: Basic & { project?: Project }) {
       defaultValue={project?.description} maxLength={8000} /></Field>
     <Field label={t('project.repository')}><Input name="repository" defaultValue={project?.repository ?? ''} placeholder="owner/name" maxLength={200} /></Field>
     <Field label={t('project.dingTalkGroup')}><Input name="dingTalkGroup" defaultValue={project?.dingTalkGroup ?? ''} maxLength={300} /></Field>
+    <Field label={t('project.feishuChatId')}><Input name="feishuChatId" defaultValue={project?.feishuChatId ?? ''} maxLength={300} /></Field>
     {project && <Status label={t('project.status')} value={project.status} choices={PROJECT_STATES} translated={value => t(`project.state.${value}`)} />}
     <label className="dt-work-status">
       <input type="checkbox" name="autoAdvance" defaultChecked={project?.autoAdvance ?? false} />
@@ -92,7 +93,7 @@ function ProjectFields({ t, project }: Basic & { project?: Project }) {
 }
 const projectValue = (data: FormData) => ({
   name: field(data, 'name'), objective: field(data, 'objective'), description: field(data, 'description'),
-  repository: optional(data, 'repository'), dingTalkGroup: optional(data, 'dingTalkGroup'),
+  repository: optional(data, 'repository'), dingTalkGroup: optional(data, 'dingTalkGroup'), feishuChatId: optional(data, 'feishuChatId'),
   autoAdvance: data.has('autoAdvance'),
   status: (field(data, 'status') || 'active') as Project['status'],
 })
@@ -371,6 +372,49 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, openTi
   </article>
 }
 
+function ProjectConversation({ t, call, id }: Basic & { call: Call; id: string }) {
+  const { data, error, reload } = usePoll(() => call('GET projects/:id/conversation', { id }), [call, id], 2000)
+  const [text, setText] = useState('')
+  const [draftId, setDraftId] = useState<string>()
+  const [pending, setPending] = useState(false)
+  const [failure, setFailure] = useState('')
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const message = text.trim()
+    if (!message || pending) return
+    const messageId = draftId ?? crypto.randomUUID()
+    setDraftId(messageId)
+    setPending(true)
+    setFailure('')
+    try {
+      const result = await call('POST projects/:id/messages', { id, body: { messageId, text: message } })
+      if (result.status === 'disabled') {
+        setFailure(t('project.conversationDisabled'))
+        return
+      }
+      setText('')
+      setDraftId(undefined)
+      await reload()
+    } catch (cause) { setFailure(errorText(cause)) }
+    finally { setPending(false) }
+  }
+  return <section className="dt-card dt-project-panel">
+    <div className="dt-project-heading"><h3>{t('project.conversation')}</h3></div>
+    {(failure || error) && <p className="dt-error" role="alert">{failure || error?.message}</p>}
+    {!!data?.length && <ol className="dt-project-records" aria-live="polite">{data.map(turn => <li key={turn.id} className="dt-project-record">
+      <time className="dt-project-meta" dateTime={turn.at}>{new Date(turn.at).toLocaleString()}</time>
+      <p className="dt-project-description">{turn.text}</p>
+      {turn.reply ? <MarkdownContent t={t} text={turn.reply} /> : turn.status === 'running'
+        ? <p className="dt-hint" role="status">{t('project.conversationWaiting')}</p> : null}
+    </li>)}</ol>}
+    <form onSubmit={event => { void submit(event) }}>
+      <Field label={t('project.conversationMessage')}><textarea className="dt-textarea" rows={3} maxLength={26000}
+        value={text} onChange={event => { setText(event.target.value); setDraftId(undefined) }} disabled={pending} required /></Field>
+      <Button type="submit" variant="primary" disabled={pending || !text.trim()}>{t('project.send')}</Button>
+    </form>
+  </section>
+}
+
 function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directoryChanged, execution,
   section, selectSection }: Basic & {
   call: Call; id: string; directory: Member[]; openTicket?: (id: string) => void; changed: () => Promise<void>
@@ -589,6 +633,7 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
     {section === 'decisions' && <ProjectDecisions t={t} project={project}
       updatePlan={execution?.planner ? () => { void updatePlan() } : undefined} planning={pending} planFeedback={planFeedback}
       edit={decision => setEditor({ type: 'decision', revision, decision })} inspect={inspect} />}
+    {section === 'conversation' && <ProjectConversation call={call} t={t} id={id} />}
     {section === 'history' && <ProjectHistory call={call} t={t} project={project} />}
     {section === 'tickets' && <ProjectTickets t={t} project={project} inspect={inspect} openTicket={openTicket} />}
     {section === 'tasks' && <>

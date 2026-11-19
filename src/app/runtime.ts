@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { z } from 'zod'
-import { Engine, key, latestReport, reasonText, type ChannelRef, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, key, latestReport, reasonText, threadKey, type ChannelRef, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import type { ProjectEvent } from '../sources/project-events.ts'
 import { SourceRegistry } from '../sources/registry.ts'
@@ -230,6 +230,14 @@ export class Runtime extends Service implements SourceHost {
           () => setup.configured() && !!setup.deployment.github.cli)
         const tools = this.projectTools = new ProjectTools({ store, issues, reviews: this.projectReviews, communication: this.communication,
           capabilities: channel => this.runtimeCapabilities(channel), knowledgeDir: machine.knowledgeDir,
+          authorizeHistory: ({ channel, actorId }) => {
+            if (!sources.channelAllowed(channel)) return false
+            if (channel.source !== 'feishu') return true
+            const senderId = channel.address.projectSenderId
+            const appId = setup.deployment.feishu?.appId
+            return !!senderId && !!appId && !!allowedSender(store.settings(), { source: 'feishu', id: senderId })
+              && new Projects(store).directoryMemberForAccount('feishu', appId, senderId)?.id === actorId
+          },
           progress: () => this.projectProgress,
           start: (projectId, taskId, revision) => this.runProjectTask(projectId, taskId, revision),
           stop: (projectId, taskId, ticketId) => this.stopProjectTask(projectId, taskId, ticketId),
@@ -321,6 +329,8 @@ export class Runtime extends Service implements SourceHost {
               : githubEventTask(trigger, notificationGroup)
           }
           return store.atomic(() => {
+            const projectMessage = runtime.receiveFeishuProjectMessage(incoming)
+            if (projectMessage) return projectMessage
             const result = passes.receive(incoming)
             if (result === 'stored' && incoming.taskRequest) received?.(incoming)
             if (result === 'stored' && incoming.source === 'request') received?.(incoming)
@@ -392,6 +402,29 @@ export class Runtime extends Service implements SourceHost {
     return ticketEnvironment({ deployment, sources, settings: this.store.settings(), ticket, ...trigger ? { trigger } : {} })
   }
   checkSetup(): void { this.setup.check() }
+  private receiveFeishuProjectMessage(trigger: Trigger): ReceiveResult | undefined {
+    const { channel } = trigger
+    if (!this.projectAgent || !this.configured() || trigger.source !== 'feishu' || !trigger.human || trigger.addressed !== 'mention'
+      || channel?.source !== 'feishu' || channel.address.direct === 'true' || !this.sources.scope(trigger).listened) return
+    const appId = this.deployment.feishu?.appId
+    if (!appId || !allowedSender(this.store.settings(), trigger.actor)) return
+    // Preserve normal intake for messages on a ticket subscription.
+    if (trigger.threads.some(ref => this.store.threads.get(threadKey(ref))?.subscriptions.length)) return
+    const projects = new Projects(this.store)
+    const project = channel.address.chatId && projects.forFeishuChat(channel.address.chatId)
+    if (!project) return
+    const member = projects.memberForAccount(project.id, 'feishu', appId, trigger.actor.id)
+    if (!member) return
+    const text = trigger.text.trim()
+    if (!text || text.length > 26_000) return
+    const result = this.passes.receive({ ...trigger, meta: { ...trigger.meta, projectConversation: true, projectId: project.id } })
+    if (result === 'filtered') this.projectAgent.submit({ projectId: project.id, actorId: member.id, messageId: trigger.id,
+      channel: { ...channel, address: { ...channel.address, projectSenderId: trigger.actor.id } },
+      text, sentAt: trigger.at, nativeMessageId: channel.address.messageId,
+      replyToNativeMessageId: typeof trigger.meta.parentId === 'string' ? trigger.meta.parentId : undefined,
+      sourceUrl: /^https?:\/\//i.test(trigger.url ?? '') ? trigger.url : undefined })
+    return result
+  }
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }
   idle(): Promise<void> { return this.passes.idle() }
   pump(): Promise<void> { return this.passes.pump() }

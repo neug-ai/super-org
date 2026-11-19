@@ -18,6 +18,7 @@ import { KV } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import { type Context } from '@deepseek-ai/cordis'
 import { type SourceRegistry } from './registry.ts'
+import { projectMessageReceived } from './project-message.ts'
 
 // feishu-trigger: provider implementation
 export const SOURCE = 'feishu'
@@ -645,7 +646,9 @@ export const feishuKind: SourceKind<FeishuConfig> = {
       hint: { zh: '查询原消息链接最多等待的时间；超时后智能体改为直接读取原消息。', en: 'How long to wait for an original message\'s link; after that, agents read the message itself.' } },
   ],
   health: ['feishu', 'history'],
+  projectEvents: [projectMessageReceived],
   scope({ meta }, config) {
+    if (meta.projectConversation === true) return { listened: false, reason: 'Feishu project conversation' }
     if (meta.direct === true) return config.directMessages ? { listened: true, observed: false, row: 'direct' } : { listened: false, reason: 'direct_messages_not_allowed' }
     const chat = config.chats.find(item => item.chatId === meta.chatId)
     if (chat) return { listened: true, observed: chat.listen === 'all', row: chat.chatId }

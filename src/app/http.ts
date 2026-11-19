@@ -48,7 +48,7 @@ export interface HttpHost {
   readonly projectRepository?: Pick<ProjectRepositorySync, 'retry'>
   readonly projectProgress?: Pick<ProjectProgress, 'checks'>
   readonly projectEvents?: Pick<ProjectEvents, 'view' | 'save' | 'saveSource' | 'list'>
-  readonly projectAgent?: Pick<ProjectAgent, 'submit' | 'runs'>
+  readonly projectAgent?: Pick<ProjectAgent, 'submit' | 'runs' | 'webConversation'>
   readonly projectTools?: Pick<ProjectTools, 'catalog' | 'snapshot'>
   readonly projectReviews?: Pick<ProjectReviews, 'submit' | 'decide'>
   readonly communication?: Pick<Communication, 'read' | 'update'>
@@ -239,6 +239,10 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
         channel: { source: 'request', thread: params.id, address: { projectId: params.id } } })
     },
     'GET projects/:id/agent-runs': ({ params }) => agent().runs(params.id),
+    'GET projects/:id/conversation': ({ params }) => {
+      projects.detail(params.id)
+      return agent().webConversation(params.id)
+    },
     'GET projects/:id/checks': ({ params }) => { projects.detail(params.id); return host?.projectProgress?.checks(params.id) ?? [] },
     'GET projects/:id/history': ({ params, query }) => {
       projects.detail(params.id)
