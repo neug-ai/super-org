@@ -28,7 +28,7 @@ CODEX_SANDBOX=workspace-write
 
 在钉钉应用中启用机器人和 Stream 接入，发布并把机器人加入群。使用同一机器人时保留一个接收服务。在 `.env` 同时填写 `DINGTALK_CLIENT_ID` 和 `DINGTALK_CLIENT_SECRET`。若要从空群提交首次纪要建项，将 `DINGTALK_OPEN_CONVERSATION_ID` 设为该群会话 ID。已有项目也可在项目设置中绑定会话 ID。
 
-当前机器人处理群内 @ 消息。建项入口群在绑定项目之前，`登记项目成员` 和 `项目会议纪要：…` 走建项流程，其他 @ 消息按钉钉来源准入规则交给通用 Agent。普通问答可直接回复，并延续当前群最近的问答。项目群成员也可直接聊天或查询知识库。配置 `SUPERAGENT_KNOWLEDGE_DIR` 可让项目 Agent 只读查阅该目录下的 Markdown。引用任务、交付或卡片时，客户端需提供可解析的引用字段。可在正文带任务短引用或明确名称。同一项目的后续通知按实际群绑定发送。会话 webhook 过期时由应用群发送接口投递，需要相应权限。项目回复支持会话级 Markdown 偏好。 [沟通事件](events/communication.zh-CN.md)
+当前机器人处理群内 @ 消息。建项入口群在绑定项目之前，`登记项目成员`（也可说「把我登记加入」）和 `项目会议纪要：…` 走建项流程，其他 @ 消息按钉钉来源准入规则交给通用 Agent。普通问答可直接回复，并延续当前群最近的问答。项目群成员也可直接聊天或查询知识库。配置 `SUPERAGENT_KNOWLEDGE_DIR` 可让项目 Agent 只读查阅该目录下的 Markdown。引用任务、交付或卡片时，客户端需提供可解析的引用字段。可在正文带任务短引用或明确名称。同一项目的后续通知按实际群绑定发送。会话 webhook 过期时由应用群发送接口投递，需要相应权限。项目回复支持会话级 Markdown 偏好。 [沟通事件](events/communication.zh-CN.md)
 
 `DINGTALK_CARD_TEMPLATE_ID` 用于可选的回执卡片。 `DINGTALK_GITHUB_NOTIFY_CONVERSATION_ID` 是独立 GitHub 通知与本地通用请求的回复群，不是每个项目的群绑定。 [钉钉卡片配置](../cards/README.md)
 

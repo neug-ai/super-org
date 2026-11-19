@@ -259,8 +259,18 @@ it('continues DingTalk conversation, reads local knowledge, and retains project 
     expect(h.runtime.projectAgent!.runs(id)[0]?.steps[0]?.results[0]?.summary).toBe('已更新「整理首版规则」')
     expect(ack).toHaveBeenCalledTimes(2)
     await say('web-only', '这条网页消息不属于钉钉会话')
-    const ask = (msgId: string, content: string) => receive({ headers: { messageId: msgId },
-      data: JSON.stringify({ ...JSON.parse(frame.data), msgId, text: { content } }) })
+    const ask = (msgId: string, content: string, senderStaffId = 'member') => receive({ headers: { messageId: msgId },
+      data: JSON.stringify({ ...JSON.parse(frame.data), msgId, senderStaffId, text: { content } }) })
+    await ask('enrollment-help', '怎么加入这个项目？', 'new-member')
+    await h.runtime.idle()
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('用发消息的钉钉账号把本人加入这个群绑定的项目'),
+    }))
+    expect(projects.memberForAccount(id, 'dingtalk', 'test-corp', 'new-member')).toBeUndefined()
+    await ask('enrollment-self', '把我登记加入', 'new-member')
+    await h.runtime.idle()
+    expect(projects.memberForAccount(id, 'dingtalk', 'test-corp', 'new-member')).toBeDefined()
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: '已加入「2048 事件验收」项目。' }))
     propose.mockImplementationOnce(async prompt => {
       expect(prompt).toContain('knowledge.read')
       return { calls: [call('knowledge.read', { path: 'README.md' })], reply: '' }
