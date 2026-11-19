@@ -25,7 +25,6 @@ export function dingTalkProjectIntake(projects: Projects, planning?: ProjectPlan
     if (project) return { ...dingTalkProjects(group, project.id, projects, planning, agent), project }
     if (group !== intakeGroup) return
     return {
-      discussion: () => () => '这个群还没有项目。团队讨论确认后，可以提交首次项目纪要。',
       onSender: (trigger: Trigger) => {
         const { corpId, name } = sender(trigger)
         if (!corpId) return
@@ -76,14 +75,16 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
       text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '' })
     return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' : '已收到，正在结合项目现状处理。'
   }
+  const enroll = (trigger: Trigger) => {
+    const { corpId, name } = sender(trigger)
+    if (!corpId) return
+    const { projectName, added } = projects.addDingTalkSender(projectId, corpId, trigger.actor.id, name)
+    return added ? `已加入「${projectName}」项目。` : `你已是「${projectName}」的项目成员。`
+  }
   return {
     conversationId,
-    onSender: trigger => {
-      const { corpId, name } = sender(trigger)
-      if (!corpId) return
-      const { projectName, added } = projects.addDingTalkSender(projectId, corpId, trigger.actor.id, name)
-      return added ? `已加入「${projectName}」项目。` : `你已是「${projectName}」的项目成员。`
-    },
+    onSender: enroll,
+    onStored: enroll,
     onMeeting: trigger => {
       if (agent) return manage(trigger)
       if (trigger.text.length > 26_000) return '会议纪要超过 26,000 字，请缩短后重发。'
@@ -218,6 +219,7 @@ export interface DingTalkIntake {
   forConversation?: (conversationId: string) => DingTalkIntake | undefined
   project?: { id: string; repository: string | null }
   onSender?: (trigger: Trigger) => string | undefined
+  onStored?: (trigger: Trigger) => void
   onMeeting?: (trigger: Trigger) => string
   discussion?: (trigger: Trigger) => (() => string) | undefined
 }
@@ -263,7 +265,7 @@ export class DingTalk {
             const text = discussion ? discussion() : handle?.(trigger)
             if (text) context.notify({ id: key('dingtalk-project-receipt', trigger.id), channel: trigger.channel, kind: 'notice', text })
           } else if (result === 'stored') {
-            handlers?.onSender?.(trigger)
+            handlers?.onStored?.(trigger)
             this.received(trigger)
           }
           return result

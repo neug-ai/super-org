@@ -1,6 +1,8 @@
 import { afterEach, expect, it, vi } from 'vitest'
+import { DWClient } from 'dingtalk-stream'
+import { Projects } from '../src/app/projects.ts'
 import { startRuntime } from './fixtures/host.ts'
-import { dingTalkKind, DingTalk } from '../src/sources/dingtalk.ts'
+import { dingTalkKind, dingTalkProjectIntake, DingTalk } from '../src/sources/dingtalk.ts'
 
 let h: Awaited<ReturnType<typeof startRuntime>> | undefined
 afterEach(async () => { await h?.stop(); h = undefined; vi.restoreAllMocks() })
@@ -51,4 +53,61 @@ it('rejects local requests when the default output is missing', async () => {
   h = await startRuntime()
   expect(await h.api('POST', 'requests', { prompt: 'Check CI' })).toEqual({ status: 500,
     body: { error: 'Default DingTalk output is not configured or enabled' } })
+})
+
+it('answers an admitted DingTalk question in the intake group without creating a project or enrolling the sender', async () => {
+  h = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Test planner', propose: vi.fn() })
+  const store = h.runtime.store
+  const projects = new Projects(store)
+  const send = vi.fn(async () => {})
+  const kind = dingTalkKind(send)
+  h.runtime.sources.register(kind)
+  const settings = store.settings()
+  store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } },
+    policy: { ...settings.policy, sources: { ...settings.policy.sources,
+      dingtalk: { allowed: [], admission: { group: { unlistedAddressed: 'explicit' } } } } } })
+  let receive!: (frame: { headers: { messageId: string }; data: string }) => Promise<void>
+  vi.spyOn(DWClient.prototype, 'registerCallbackListener').mockImplementation(function (this: DWClient, _topic, listener) {
+    receive = listener as typeof receive; return this
+  })
+  vi.spyOn(DWClient.prototype, 'socketCallBackResponse').mockImplementation(() => {})
+  new DingTalk(h.runtime.context(kind), { clientId: 'robot', clientSecret: 'test' }, () => {}, undefined, undefined, undefined,
+    dingTalkProjectIntake(projects, h.runtime.projectPlanning, 'intake-group', h.runtime.projectAgent))
+  const message = { msgId: 'wiki-question', conversationId: 'intake-group', conversationType: '2', isInAtList: true,
+    senderStaffId: 'asker', senderCorpId: 'corp', robotCode: 'robot', msgtype: 'text', text: { content: 'Wiki 里怎么解释序列并行？' },
+    sessionWebhook: 'https://oapi.dingtalk.com/robot/send?fixture', sessionWebhookExpiredTime: Date.now() + 60000 }
+  const deliver = (data: typeof message) => receive({ headers: { messageId: data.msgId }, data: JSON.stringify(data) })
+  await deliver({ ...message, msgId: 'unmentioned', isInAtList: false })
+  await deliver({ ...message, msgId: 'other-group', conversationId: 'other' })
+  await deliver(message)
+  await deliver(message)
+  await h.runtime.idle()
+  const candidates = h.candidates()
+  expect(candidates).toHaveLength(1)
+  const id = String(candidates[0])
+  expect(store.triggers.get(id)).toMatchObject({ source: 'dingtalk', text: message.text.content,
+    channel: { source: 'dingtalk', address: { conversationId: 'intake-group' } } })
+  expect(projects.directoryMemberForAccount('dingtalk', 'corp', 'asker')).toBeUndefined()
+  const answer = '序列并行将部分激活沿序列维度分片。'
+  await h.runTool(h.runtime.masterId, 'orchestrator_reply', { purpose: 'answer', trigger_id: id, text: answer })
+  await h.route({ kind: 'ignore', trigger_id: id, reason: 'Answered directly.' })
+  expect(send).toHaveBeenCalledWith(expect.objectContaining({ kind: 'reply', text: answer,
+    channel: expect.objectContaining({ address: expect.objectContaining({ conversationId: 'intake-group', triggerId: id }) }) }))
+  expect(projects.list()).toEqual([])
+  expect(store.tickets.list()).toEqual([])
+  await deliver({ ...message, msgId: 'register', text: { content: '登记项目成员' } })
+  await h.runtime.idle()
+  expect(projects.directoryMemberForAccount('dingtalk', 'corp', 'asker')).toBeDefined()
+  expect(h.candidates()).toEqual(candidates)
+  await deliver({ ...message, msgId: 'wiki-follow-up', text: { content: '它能缓解什么瓶颈？' } })
+  await h.runtime.idle()
+  expect(h.relays(h.runtime.masterId)).toContainEqual(expect.objectContaining({ kind: 'candidate',
+    text: '它能缓解什么瓶颈？', recent_conversation: [{ text: message.text.content, reply: answer }] }))
+
+  new DingTalk(h.runtime.context(kind), { clientId: 'robot', clientSecret: 'test' }, () => {}, undefined, undefined, undefined,
+    dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, h.runtime.projectAgent))
+  await deliver({ ...message, msgId: 'first-in-other-group', conversationId: 'other', text: { content: '能举个例子吗？' } })
+  await h.runtime.idle()
+  expect(h.relays(h.runtime.masterId)).toContainEqual(expect.objectContaining({ kind: 'candidate',
+    text: '能举个例子吗？', recent_conversation: [] }))
 })

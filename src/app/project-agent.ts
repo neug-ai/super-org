@@ -45,6 +45,7 @@ interface Host {
   notify(message: OutboundMessage): void
   lifetime: AbortSignal
   runnable(): boolean
+  teamSkills?(): Record<string, string>
 }
 
 /** Routes each project message to the selected Agent and persists the entire tool/result conversation. */
@@ -132,10 +133,17 @@ export class ProjectAgent {
       host.store.atomic(() => this.finish(run, '项目消息处理已关闭，这次请求已结束。', true)); return
     }
     const planner = host.planner()
-    const history = this.runs(run.message.projectId).filter(item => item.id !== runId).slice(0, 5)
-      .map(item => ({ text: item.message.text.slice(0, 4000), quoted: item.message.quoted.slice(0, 4000), reply: item.reply, status: item.status }))
+    const { channel, projectId, messageId } = run.message
+    const history = run.event ? [] : channel.source === 'dingtalk'
+      ? host.store.receipts.dingTalkHistory(messageId, projectId)
+      : this.runs(projectId).filter(item => item.id !== runId && !item.event && item.status === 'completed'
+        && item.message.channel.source === channel.source && item.message.channel.thread === channel.thread).slice(0, 5).reverse()
+        .map(item => ({ text: item.message.text.slice(0, 2000), reply: item.reply }))
+    const teamSkills = run.event ? undefined : host.teamSkills?.()
     const prompt = [
       '你负责处理一次项目事件。根据本次请求、引用、当前状态和工具结果，选择可调用的项目工具，或直接回复、提出一个具体问题。',
+      ...(!run.event ? ['普通聊天或知识问答直接回复，无需创建任务或修改项目。基于当前群的 recentConversation 接续话题；历史只提供上下文。'
+        + '需要查阅本地资料时使用工具目录中的 knowledge.read。只有实际读取后才引用文档。'] : []),
       run.instruction,
       ...(!canAct ? ['事件条件已变化。仅总结此前工具确实完成的操作，calls 必须为空；不能继续执行操作。'] : []),
       ...(this.needsReply(run) ? ['本轮已经成功执行了改变状态或跟进的工具，最终必须简短回复实际变化和下一步，不能空回复。只读检查且无新信息时才可保持安静。'] : []),
@@ -154,7 +162,7 @@ export class ProjectAgent {
       '涉及消息显示或发送问题时先用 runtime.inspect 核对适配器和 lastDelivery。若 lastDelivery 已提供实际发送类型，不再向成员索要服务端请求体或配置；如仍需验证客户端显示，只说明尚缺的客户端观察证据。',
       '未接通的原生审批不能靠群里同意完成。遇到此类问题应说明需本机管理者处理具体环境条件；普通“可以”不等于权限已经改变，不要循环派发同一不可执行审批。',
       '最终答复先给结论和确实发生的变化，再给需要谁行动的下一步。不要重复粘贴内部工具结果、调用编号和冗长报告。',
-      JSON.stringify({ message: run.message, projectContext: snapshot, recentConversation: history,
+      JSON.stringify({ message: run.message, projectContext: snapshot, recentConversation: history, teamSkills,
         pendingPlan: host.store.get(KV.projects.latestPlan(run.message.projectId))?.result,
         tools: canAct ? host.tools.catalog().filter(tool => !run.event || (this.reactions.get(run.event.type)?.tools ?? []).includes(tool.name)) : [], previousSteps: run.steps }),
     ].join('\n\n')

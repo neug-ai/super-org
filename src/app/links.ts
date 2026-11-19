@@ -10,7 +10,7 @@ import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 
 export interface LinkHost {
-  readonly store: Pick<Store, 'settings' | 'triggers' | 'threads' | 'tickets'>
+  readonly store: Pick<Store, 'settings' | 'triggers' | 'threads' | 'tickets' | 'receipts'>
   readonly links: TextCache
   readonly commands: Commands
   readonly sources: SourceRegistry
@@ -62,7 +62,11 @@ export async function candidateCard(host: LinkHost, candidate: Candidate) {
     .map(item => ({ trigger_id: trigger.id, ticket_id: item.ticketId, reason: item.reason })))
   // Format the primary trigger like a worker input (including the message it replies to) and summarize earlier batch triggers as cards.
   const others = candidate.triggers.filter(trigger => trigger.id !== primary.id)
+  const directDingTalk = candidate.strength === 'explicit' && primary.source === 'dingtalk' && !primary.meta.projectId
+  const conversation = directDingTalk ? host.store.receipts.dingTalkHistory(primary.id) : []
+  const quote = directDingTalk && typeof primary.meta.replyToBotText === 'string' ? primary.meta.replyToBotText.slice(0, 4000) : ''
   return { ...triggerMessage(primary, await sourceLink(host, primary), undefined, repliedTo(host, primary)), strength: candidate.strength,
+    ...(directDingTalk ? { recent_conversation: conversation, ...(quote ? { quoted_bot_reply: quote } : {}) } : {}),
     mode: settings.eval.mode, ...others.length ? { batch: others.map(trigger => triggerCard(trigger)) } : {},
     ...handedBack.length ? { handed_back: handedBack } : {}, ...relatedTickets(candidate.tickets),
     ...(delivered.length ? { delivered_to: delivered } : {}), ...(referenced.length ? { referenced_tickets: referenced.map(ticketCard) } : {}),

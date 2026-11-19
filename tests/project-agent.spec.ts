@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { afterEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { DWClient } from 'dingtalk-stream'
@@ -16,9 +17,9 @@ let host: Host | undefined
 afterEach(async () => { await host?.stop(); host = undefined })
 const call = (tool: string, args: unknown) => ({ tool, arguments: JSON.stringify(args) })
 const done = (reply = '已处理，请查看任务。') => ({ calls: [], reply })
-async function pilot() {
+async function pilot(knowledgeDir?: string) {
   const propose = vi.fn(async (_prompt: string, _schema: object, _signal: AbortSignal): Promise<unknown> => done())
-  const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Test Agent', propose })
+  const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Test Agent', propose }, knowledgeDir)
   const projects = new Projects(h.runtime.store)
   const { id } = projects.create(ProjectInput.parse({ name: '2048 事件验收', status: 'planning', dingTalkGroup: 'test-group', autoAdvance: false }))
   projects.addDingTalkSender(id, 'test-corp', 'member', 'Robin')
@@ -224,8 +225,8 @@ it('can disable project message handling with JSON and stops proposals disabled 
   expect(h.runtime.projectEvents.list({ projectId: id })[0]).toMatchObject({ status: 'ignored' })
 })
 
-it('routes real DingTalk messages and native quotes into the same Agent entry without keyword filtering', async () => {
-  const { h, projects, id, task, propose } = await pilot()
+it('continues DingTalk conversation, reads local knowledge, and retains project commands and native quotes', async () => {
+  const { h, projects, id, task, propose, say } = await pilot(fileURLToPath(new URL('../docs/', import.meta.url)))
   const send = vi.fn(async () => {})
   const kind = dingTalkKind(send)
   h.runtime.sources.register(kind)
@@ -257,6 +258,34 @@ it('routes real DingTalk messages and native quotes into the same Agent entry wi
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: '已处理，请查看任务。' }))
     expect(h.runtime.projectAgent!.runs(id)[0]?.steps[0]?.results[0]?.summary).toBe('已更新「整理首版规则」')
     expect(ack).toHaveBeenCalledTimes(2)
+    await say('web-only', '这条网页消息不属于钉钉会话')
+    const ask = (msgId: string, content: string) => receive({ headers: { messageId: msgId },
+      data: JSON.stringify({ ...JSON.parse(frame.data), msgId, text: { content } }) })
+    propose.mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('knowledge.read')
+      return { calls: [call('knowledge.read', { path: 'README.md' })], reply: '' }
+    }).mockImplementationOnce(async prompt => {
+      expect(prompt).toContain(readFileSync(new URL('../docs/README.md', import.meta.url), 'utf8').split('\n')[0])
+      return done('知识库入口是 README。')
+    })
+    await ask('knowledge-question', '知识库从哪开始读？')
+    await h.runtime.idle()
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: '知识库入口是 README。' }))
+    propose.mockImplementationOnce(async prompt => {
+      const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+      expect(context.recentConversation).toContainEqual({ text: '知识库从哪开始读？', reply: '知识库入口是 README。' })
+      expect(context.recentConversation.map((turn: { text: string }) => turn.text)).not.toContain('这条网页消息不属于钉钉会话')
+      return done('你可以先读目录。')
+    })
+    await ask('knowledge-followup', '然后呢？')
+    await h.runtime.idle()
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: '你可以先读目录。' }))
+    expect(projects.detail(id).tasks).toHaveLength(1)
+    expect(projects.detail(id).tickets).toEqual([])
+    expect(() => h.runtime.projectTools!.execute('knowledge.read', { path: '../README.md' }, {
+      projectId: id, actorId: null, messageId: 'traversal', operationId: 'traversal',
+      channel: { source: 'request', thread: id, address: {} },
+    })).toThrow('不在配置目录内')
   } finally { callback.mockRestore(); ack.mockRestore() }
 })
 

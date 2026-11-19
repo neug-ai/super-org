@@ -27,6 +27,7 @@ export interface Machine {
   stateDir: string
   /** Headless project hosts can operate independently of a watched GitHub repository. */
   githubOptional?: boolean
+  knowledgeDir?: string
   promptMaxChars: Volatile<number>
   admissionContextMaxPages: Volatile<number>
   admissionContextTimeoutMs: Volatile<number>
