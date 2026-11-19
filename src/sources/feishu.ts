@@ -8,7 +8,7 @@ import { type ImageAttachmentRef, type ImageMediaType } from '@deepseek-ai/dsh-a
 import type {} from '@deepseek-ai/dsh-llm'
 import { type Commands, validItems, CliError, type Tally } from '../infra/commands.ts'
 import { type ContextMessage, type ThreadContext, type ChannelLink, type ChannelLinks, type Localized, type SourceKind } from './kind.ts'
-import { checkedImText } from '../infra/text.ts'
+import { checkedImText, escapeRegExp } from '../infra/text.ts'
 import { type SourceContext, health, sourceContext } from './host.ts'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
@@ -33,8 +33,18 @@ export type FeishuEvent = z.infer<typeof EventSchema>
 export const feishuThreadId = (chatId: string, rootId: string | undefined, messageId: string): string => `${chatId}:${rootId ?? messageId}`
 /** Deterministic trigger ID for a Feishu message; every read path for this message produces the same ID. */
 export const feishuTriggerId = (messageId: string): string => key('feishu', messageId)
-export const withMentionNames = (text: string, mentions: { key?: string | undefined; name?: string | undefined }[]): string =>
-  mentions.reduce((result, mention) => mention.key && mention.name ? result.replaceAll(mention.key, `@${mention.name}`) : result, text)
+/** Replaces only original mention tokens, keeping unresolved numbered placeholders intact. */
+export function withMentionNames(text: string, mentions: { key?: string | undefined; name?: string | undefined }[]): string {
+  const names = new Map<string, string>()
+  for (const { key, name } of mentions) {
+    if (key && name && !names.has(key)) names.set(key, name)
+  }
+  if (!names.size) return text
+  // Match longer literal keys first. A numbered prefix cannot match before another digit.
+  const keys = [...names.keys()].sort((a, b) => b.length - a.length)
+  const alternatives = keys.map(key => escapeRegExp(key) + (/^@_user_\d+$/.test(key) ? '(?!\\d)' : ''))
+  return text.replace(new RegExp(alternatives.join('|'), 'g'), key => `@${names.get(key)}`)
+}
 /**
  * Parses a Feishu message timestamp into an ISO-8601 string: live events and the history API return epoch milliseconds as a
  * string, whereas topic/thread pages return a local timestamp string such as `2026-09-11 12:00`.
