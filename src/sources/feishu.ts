@@ -548,43 +548,53 @@ async function pollThread(ctx: SourceContext, thread: Thread, signal?: AbortSign
   const commands = ctx.commands.withSignal(signal)
   const pageSize = config.readPageSize
   const checkpoint = KV.feishu.seen(thread.key)
-  const known = new Set(ctx.state.get(checkpoint) ?? [])
+  // Only a completed scan can establish a stopping point for the next poll.
+  const committed = new Set(ctx.state.get(checkpoint) ?? [])
+  const seen = new Set(committed)
   const initialized = ctx.state.get(KV.feishu.initialized(thread.key))
   if (!initialized) {
     // Mark root and parent messages as seen on first poll so historical context is not ingested as new triggers.
     for (const section of ['root', 'parent']) {
+      signal?.throwIfAborted()
       const result = await readFeishu(commands, ref, `feishu/${ref.triggerId}/${section}`, pageSize)
-      if ('message' in result && result.message) known.add(result.message.message_id)
+      if ('message' in result && result.message) seen.add(result.message.message_id)
     }
-    ctx.state.set(checkpoint, [...known])
   }
   const direct = ctx.state.get(KV.feishu.chats)?.[ref.chatId] === true
   const since = Date.parse(thread.createdAt)
   const root = thread.ref.id.slice(thread.ref.id.indexOf(':') + 1)
+  const pages = new Set<string>()
   let resource: string | null = `feishu/${ref.triggerId}/thread`
   while (resource) {
-    if (signal?.aborted) return
+    signal?.throwIfAborted()
+    if (pages.has(resource)) throw new Error('Feishu thread pagination did not advance; history is incomplete')
+    pages.add(resource)
     const result = await readFeishu(commands, ref, resource, pageSize, 'desc')
     if (!('messages' in result)) throw new Error('Expected Feishu thread messages')
     if (tally && 'skipped' in result) tally.skipped += result.skipped ?? 0
     if ('thread_id' in result && result.thread_id && thread.meta.threadId !== result.thread_id) {
       ctx.threads.patch(thread.key, { threadId: result.thread_id })
     }
-    const encounteredKnown = result.messages.some(message => known.has(message.message_id))
     const { botId, appId } = bot(ctx)
-    for (const message of result.messages.filter(item => !known.has(item.message_id) && !item.deleted).reverse()) {
-      if (signal?.aborted) return
+    for (const message of result.messages.toReversed()) {
+      signal?.throwIfAborted()
+      if (seen.has(message.message_id)) continue
+      seen.add(message.message_id)
+      if (message.deleted) continue
       const trigger = feishuTrigger(topicEvent(message, ref.chatId, direct, root), botId, appId)
       // Ignore messages older than the thread subscription on initial poll.
       if (!trigger || (!initialized && Date.parse(trigger.at) < since)) continue
-      await receive(ctx, trigger)
+      // Earlier pages can already have reached intake even if their scan failed.
+      if (!ctx.triggers.get(trigger.id)) await receive(ctx, trigger)
     }
-    result.messages.forEach(message => known.add(message.message_id))
-    ctx.state.set(checkpoint, [...known])
-    if (initialized && encounteredKnown) break
+    if (initialized && result.messages.some(message => committed.has(message.message_id))) break
     resource = result.next_resource
   }
-  ctx.state.set(KV.feishu.initialized(thread.key), true)
+  signal?.throwIfAborted()
+  ctx.atomic(() => {
+    ctx.state.set(checkpoint, [...seen])
+    ctx.state.set(KV.feishu.initialized(thread.key), true)
+  })
 }
 
 // feishu: provider implementation
