@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { Store, SCHEMA_VERSION } from '../src/app/store.ts'
+import { searchConversation } from '../src/app/project-conversation-history.ts'
 import { MemoryRepositories, key, type Assignment, type Decision, type Repositories, type Thread, type Ticket } from '../src/core/index.ts'
 import { threadFacts } from '../src/app/views/records.ts'
 import { KV } from '../src/kv.ts'
@@ -22,6 +23,39 @@ it('refuses databases newer than this build and rolls back failed atomic work', 
   expect(store.get('a')).toBeUndefined()
   store.set('schema', SCHEMA_VERSION + 1); store.close()
   expect(() => new Store(path)).toThrow('Unsupported')
+})
+it('keeps indexed conversation evidence in sync with delivery, database rebuilds, and record deletion', () => {
+  const path = join(directory, 'history.sqlite')
+  let store = new Store(path)
+  try {
+    const scope = { projectId: 'p1', channel: { source: 'request', thread: 'p1', address: {} } }
+    const at = '2026-11-01T00:00:00.000Z'
+    const record = { id: 'old', status: 'completed' as const, at, instruction: '', turn: 0, conflicts: 0, steps: [],
+      message: { ...scope, messageId: 'old-msg', actorId: null, quoted: '', text: 'OverPipe 分享暂缓，原因是改期。' } }
+    store.set('unused', '')
+    store.set(KV.projects.agentRun('old'), record)
+    const find = (query: string) => searchConversation(store, scope, { query })
+    expect(find('OverPipe 改期')).toMatchObject([{ messageId: 'old', matches: 'message' }])
+    expect(searchConversation(store, { ...scope, projectId: 'another' }, { query: '改期' })).toEqual([])
+    const reply = { id: 'reply', kind: 'notice' as const, channel: scope.channel, text: '新发布窗口周三。',
+      origin: { projectId: 'p1', runId: 'old' } }
+    store.receipts.add(reply)
+    expect(find('发布窗口')).toEqual([])
+    store.receipts.settle(reply, 'sent')
+    expect(find('发布窗口')).toMatchObject([{ messageId: 'old', matches: 'reply' }])
+    store.delete('unused')
+    store.db.exec('VACUUM')
+    expect(find('OverPipe 改期')).toMatchObject([{ messageId: 'old' }])
+
+    store.db.exec('DROP TRIGGER project_conversation_fts_delete; DROP TABLE project_conversation_fts; DROP TABLE project_conversation_search_key;')
+    store.close()
+    store = new Store(path)
+    expect(find('OverPipe 改期')).toMatchObject([{ messageId: 'old' }])
+    expect(find('发布窗口')).toMatchObject([{ messageId: 'old', matches: 'reply' }])
+    store.delete(KV.projects.agentRun('old'))
+    expect(find('改期')).toEqual([])
+    expect(store.db.prepare('SELECT count(*) AS count FROM project_conversation_fts').get()).toEqual({ count: 0 })
+  } finally { store.close() }
 })
 it('finds triggers by thread', () => {
   const store = new Store(join(directory, 'orchestrator.sqlite'))

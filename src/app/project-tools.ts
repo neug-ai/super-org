@@ -14,6 +14,7 @@ import { taskRemoteFacts } from './repository-delivery.ts'
 import type { ProjectEvent } from '../sources/project-events.ts'
 import { RepositoryFeedback } from '../sources/repository-events.ts'
 import { projectChannel } from './project-notifications.ts'
+import { readConversation, searchConversation } from './project-conversation-history.ts'
 
 const id = z.string().min(1).max(128)
 const editable = TaskInput.omit({ status: true, ticketId: true })
@@ -45,6 +46,7 @@ export interface ProjectToolsHost {
   communication: Communication
   capabilities(channel?: ChannelRef): unknown
   knowledgeDir?: string
+  authorizeHistory?(context: ProjectToolContext): boolean
   progress?(): ProjectProgress | undefined
   start(projectId: string, taskId: string, revision: number): ProjectDetail
   stop(projectId: string, taskId: string, ticketId: string): ProjectDetail
@@ -90,6 +92,27 @@ export class ProjectTools {
         } catch { throw new ProjectError(404, '知识库页面不存在、不在配置目录内，或超过读取大小限制。') }
       }))
     }
+    const authorizeHistory = (context: ProjectToolContext) => {
+      if (host.authorizeHistory && !host.authorizeHistory(context)) throw new ProjectError(403, '无法读取当前会话的历史。')
+    }
+    const historyAuthor = (actorId: string | null) => actorId === null ? '本地操作者' : host.store.get(KV.projects.member(actorId))?.name ?? null
+    this.register(operation('conversation.history.search', '按关键词和可选 UTC 时间范围检索（结巴分词与 BM25 排序）当前项目会话中已保存的消息与已送达回复，最多五条。', z.strictObject({
+      query: z.string().trim().min(1).max(120), after: z.iso.datetime().optional(), before: z.iso.datetime().optional(),
+    }).refine(({ after, before }) => !after || !before || Date.parse(after) < Date.parse(before), 'after must be earlier than before'), (context, args) => {
+      authorizeHistory(context)
+      const candidates = searchConversation(host.store, context, args)
+      return { summary: `找到 ${candidates.length} 条会话记录`, data: candidates.map(({ actorId, ...entry }) =>
+        ({ ...entry, author: historyAuthor(actorId) })) }
+    }))
+    this.register(operation('conversation.history.read', '按候选消息 ID 或原生引用读取当前会话的原文和相关回复。使用 nextOffset 继续长消息。', z.strictObject({
+      messageId: z.string().min(1).max(300), offset: z.number().int().min(0).max(26000).default(0),
+    }), (context, { messageId, offset }) => {
+      authorizeHistory(context)
+      const message = readConversation(host.store, context, messageId, offset)
+      if (!message) return { summary: '当前会话未找到该消息', data: null }
+      const { actorId, ...entry } = message
+      return { summary: '已读取会话原文', data: { ...entry, author: historyAuthor(actorId) } }
+    }))
     this.register(operation('runtime.inspect', '读取真实运行能力、消息通道、格式支持、最近成功发送的实际格式和原生审批限制；不能修改权限或假装已查阅外部文档。', z.strictObject({}), context => ({
       summary: '已读取运行能力', data: host.capabilities(context.channel),
     })))
@@ -221,7 +244,8 @@ export class ProjectTools {
     const project = this.projects.detail(context.projectId)
     if (context.actorId === null && context.channel.source === 'request') return
     if (!context.actorId || !project.memberIds.includes(context.actorId)) throw new ProjectError(403, '请先登记为这个项目的成员。')
-    if (context.channel.source === 'dingtalk' && context.channel.address.conversationId !== project.dingTalkGroup)
+    if ((context.channel.source === 'dingtalk' && context.channel.address.conversationId !== project.dingTalkGroup)
+      || (context.channel.source === 'feishu' && context.channel.address.chatId !== project.feishuChatId))
       throw new ProjectError(403, '这条消息来自另一个项目群。')
   }
 

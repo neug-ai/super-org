@@ -6,11 +6,12 @@ import { DWClient } from 'dingtalk-stream'
 import { KV } from '../src/kv.ts'
 import { Commands } from '../src/infra/commands.ts'
 import type { ProjectAgentRun } from '../src/app/project-agent.ts'
-import { ProjectChange, ProjectInput, Projects } from '../src/app/projects.ts'
+import { MemberInput, ProjectChange, ProjectInput, Projects } from '../src/app/projects.ts'
 import { projectMessageReceived } from '../src/sources/project-message.ts'
+import { feishuKind } from '../src/sources/feishu.ts'
 import { DingTalk, dingTalkKind } from '../src/sources/dingtalk.ts'
 import { dingTalkProjectIntake } from '../src/sources/dingtalk.ts'
-import { startRuntime, type Host } from './fixtures/host.ts'
+import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { deferred } from './fixtures/async.ts'
 
 let host: Host | undefined
@@ -292,11 +293,121 @@ it('continues DingTalk conversation, reads local knowledge, and retains project 
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: '你可以先读目录。' }))
     expect(projects.detail(id).tasks).toHaveLength(1)
     expect(projects.detail(id).tickets).toEqual([])
+    const deliver = (msgId: string, data: Record<string, unknown>) => receive({ headers: { messageId: msgId },
+      data: JSON.stringify({ ...JSON.parse(frame.data), msgId, ...data }) })
+    await deliver('observe-new-member', { senderStaffId: 'new-member', senderId: 'opaque-new-member',
+      text: { content: '登记项目成员' } })
+    await h.runtime.idle()
+    const newMember = projects.memberForAccount(id, 'dingtalk', 'test-corp', 'new-member')!
+    propose.mockImplementationOnce(async prompt => {
+      const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+      expect(context.message.text).toBe('任务1负责人')
+      expect(context.message.mentions).toEqual({ members: [{ memberId: newMember.id, name: newMember.name }], unresolvedCount: 0 })
+      return { calls: [call('task.update', { taskId: task.id, changes: { ownerId: newMember.id } })], reply: '' }
+    })
+    await deliver('mention-assignment', { senderId: 'opaque-member',
+      atUsers: [{ dingtalkId: 'bot' }, { dingtalkId: 'opaque-new-member' }], text: { content: '任务1负责人  ' } })
+    await h.runtime.idle()
+    expect(projects.detail(id).tasks[0]?.ownerId).toBe(newMember.id)
+    propose.mockImplementationOnce(async prompt => {
+      const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+      expect(context.message.mentions).toMatchObject({ members: [{ memberId: newMember.id }], unresolvedCount: 1 })
+      expect(prompt).toContain('勿按列表顺序猜测')
+      return done('请说明这两位分别对应哪项任务。')
+    })
+    await deliver('ambiguous-mentions', { senderId: 'opaque-member',
+      atUsers: [{ dingtalkId: 'bot' }, { dingtalkId: 'opaque-new-member' }, { dingtalkId: 'opaque-unknown' }],
+      text: { content: '任务1负责人  ，任务2负责人  ' } })
+    await h.runtime.idle()
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: '请说明这两位分别对应哪项任务。' }))
+    const historyTools = h.runtime.projectTools!
+    const { message } = h.runtime.projectAgent!.runs(id).find(run => run.message.text === '知识库从哪开始读？')!
+    const turn = historyTools.execute('conversation.history.read', { messageId: 'no-keywords' },
+      { ...message, operationId: 'dingtalk-history' })
+    expect(turn.data).toMatchObject({ text: '四个一样的也算一下', reply: '已处理，请查看任务。' })
+    expect(historyTools.execute('conversation.history.read', { messageId: 'no-keywords' }, {
+      projectId: id, actorId: null, messageId: 'web', operationId: 'web-read', channel: { source: 'request', thread: id, address: {} },
+    }).data).toBeNull()
     expect(() => h.runtime.projectTools!.execute('knowledge.read', { path: '../README.md' }, {
       projectId: id, actorId: null, messageId: 'traversal', operationId: 'traversal',
       channel: { source: 'request', thread: id, address: {} },
     })).toThrow('不在配置目录内')
   } finally { callback.mockRestore(); ack.mockRestore() }
+})
+
+it('loads older web project conversation only through the history tools', async () => {
+  const { h, id, projects, propose, say } = await pilot()
+  const oldText = '决定：灰度发布先覆盖一个小组。' + '资料'.repeat(2200)
+  propose.mockImplementationOnce(async () => done('已记录灰度决定，由首批团队试用。'))
+  const older = await say('older-web-history', oldText)
+  for (let i = 0; i < 6; i++) await say(`recent-web-${i}`, `近期对话 ${i}`)
+  propose.mockImplementationOnce(async prompt => {
+    expect(prompt).not.toContain('灰度发布先覆盖')
+    return done('你好。')
+  })
+  expect((await say('routine-web', '你好')).steps).toEqual([])
+  propose.mockImplementationOnce(async prompt => {
+    expect(prompt).not.toContain('灰度发布先覆盖')
+    return { calls: [call('conversation.history.search', { query: '灰度' })], reply: '' }
+  }).mockImplementationOnce(async prompt => {
+    expect(prompt).toContain(older.id)
+    return { calls: [call('conversation.history.read', { messageId: older.id })], reply: '' }
+  }).mockImplementationOnce(async prompt => {
+    expect(prompt).toContain('灰度发布先覆盖一个小组')
+    return done('当时决定先覆盖一个小组。')
+  })
+  const recalled = await say('web-history-query', '之前确定的灰度发布范围是什么？')
+  expect(recalled.reply).toBe('当时决定先覆盖一个小组。')
+  const web = await h.api('GET', `projects/${id}/conversation`)
+  expect(web).toMatchObject({ status: 200, body: expect.arrayContaining([
+    { id: recalled.id, at: expect.any(String), text: '之前确定的灰度发布范围是什么？', reply: '当时决定先覆盖一个小组。', status: 'completed' },
+  ]) })
+  expect(recalled.steps[0]?.results[0]?.data).toEqual([expect.objectContaining({ messageId: older.id, author: '本地操作者' })])
+  expect(recalled.steps[1]?.results[0]?.data).toMatchObject({ text: oldText.slice(0, 4000), nextOffset: 4000 })
+  const tools = h.runtime.projectTools!
+  const context = { ...recalled.message, operationId: 'history-page' }
+  expect(tools.execute('conversation.history.read', { messageId: older.id, offset: 4000 }, context).data)
+    .toMatchObject({ text: oldText.slice(4000), nextOffset: null })
+  expect(tools.execute('conversation.history.search', { query: '灰度', after: '2100-01-01T00:00:00Z' }, context).data).toEqual([])
+  const other = projects.create(ProjectInput.parse({ name: 'Another project' }))
+  expect(tools.execute('conversation.history.read', { messageId: older.id }, {
+    ...context, projectId: other.id, channel: { source: 'request', thread: other.id, address: {} },
+  }).data).toBeNull()
+})
+
+it('routes a bound Feishu project conversation and retrieves a retained message by native reference', async () => {
+  const { h, projects, propose } = await pilot()
+  const project = projects.create(ProjectInput.parse({ name: 'Feishu project', feishuChatId: CHAT }))
+  const member = projects.saveMember(MemberInput.parse({
+    name: 'Alice', accounts: [{ provider: 'feishu', scope: 'cli_bot', accountId: MEMBER }],
+  }))
+  projects.change(project.id, ProjectChange.parse({ revision: project.revision, change: { kind: 'add-member', memberId: member.id } }))
+  const source = h.runtime.context(feishuKind)
+  const route = (id: string, message: string, overrides: Record<string, unknown> = {}) =>
+    source.receive(feishu(id, message, overrides))
+  propose.mockImplementationOnce(async () => done('已登记测试窗口。'))
+  expect(await route('history1', '发布窗口是下周三', { message_app_link: 'https://example.com/old-decision' })).toBe('filtered')
+  await h.runtime.idle()
+  const old = h.runtime.projectAgent!.runs(project.id)[0]!
+  expect(old.message).toMatchObject({ nativeMessageId: 'om_history1', channel: { source: 'feishu' } })
+  propose.mockImplementationOnce(async prompt => {
+    expect(prompt).toContain('"replyToNativeMessageId":"om_history1"')
+    return { calls: [call('conversation.history.search', { query: '发布窗口', after: '2026-09-09T00:00:01Z', before: '2026-09-09T00:00:02Z' }),
+      call('conversation.history.read', { messageId: 'om_history1' })], reply: '' }
+  }).mockImplementationOnce(async () => done('原文记录是下周三。'))
+  await route('history2', '回顾一下原来是哪天？', { parent_id: 'om_history1', root_id: 'om_history1' })
+  await h.runtime.idle()
+  const recent = h.runtime.projectAgent!.runs(project.id).find(run => run.message.nativeMessageId === 'om_history2')!
+  expect(recent.reply).toBe('原文记录是下周三。')
+  expect(recent.steps[0]?.results[0]?.data).toEqual([expect.objectContaining({ messageId: old.id, author: 'Alice', url: 'https://example.com/old-decision' })])
+  expect(recent.steps[0]?.results[1]?.data).toMatchObject({ text: '发布窗口是下周三', reply: '已登记测试窗口。' })
+  expect(h.candidates()).toEqual([])
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy, sources: {
+    ...settings.policy.sources, feishu: { allowed: [] },
+  } } })
+  expect(() => h.runtime.projectTools!.execute('conversation.history.read', { messageId: old.id },
+    { ...recent.message, operationId: 'history-after-revocation' })).toThrow('无法读取当前会话的历史')
 })
 
 it('rejects membership spoofing, cross-project tools and stale group membership', async () => {

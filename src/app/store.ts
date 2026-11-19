@@ -9,6 +9,7 @@ import { SettingsSchema, type Settings, type SettingsOrigin, type SettingsSave }
 import { OLDEST_SCHEMA, SCHEMA_VERSION, migrateTo11, tooOld } from './migration.ts'
 import { Versions } from './versions.ts'
 import { storeReads } from './store-read.ts'
+import { initializeProjectConversationSearch, PROJECT_CONVERSATION_INDEXES, refreshProjectConversationSearch } from './project-conversation-history.ts'
 
 /** A Trigger's position on its thread timeline, ordered by timestamp and then `id` as tie-breaker. */
 export interface TimelinePlace { at: string; id: string }
@@ -89,7 +90,9 @@ export class Store implements Repositories {
             CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);
           `)
           this.addColumns()
+          this.db.exec(PROJECT_CONVERSATION_INDEXES)
           if (migrating) migrateTo11(this)
+          initializeProjectConversationSearch(this)
           if (version !== SCHEMA_VERSION) this.set(KV.store.schema, SCHEMA_VERSION)
         })
       } catch (error) {
@@ -319,10 +322,18 @@ export class Store implements Repositories {
     settle: (message: OutboundMessage, outcome: 'sent' | DropReason): void => {
       const settled = outcome === 'sent' ? { status: 'sent' } : { status: 'dropped', dropped: { at: new Date().toISOString(), reason: outcome } }
       const { id } = message
-      const updated = this.db.prepare("UPDATE outbox SET value = json_patch(value, ?) WHERE id = ? AND value ->> '$.status' = 'pending'")
-        .run(JSON.stringify(settled), id)
-      if (!Number(updated.changes)) this.db.prepare('INSERT OR IGNORE INTO outbox (id, value) VALUES (?, ?)')
-        .run(id, JSON.stringify({ ...message, ...settled }))
+      const settle = () => {
+        const updated = this.db.prepare("UPDATE outbox SET value = json_patch(value, ?) WHERE id = ? AND value ->> '$.status' = 'pending'")
+          .run(JSON.stringify(settled), id)
+        if (!Number(updated.changes)) this.db.prepare('INSERT OR IGNORE INTO outbox (id, value) VALUES (?, ?)')
+          .run(id, JSON.stringify({ ...message, ...settled }))
+      }
+      const runId = message.origin?.runId
+      if (runId && outcome === 'sent') this.atomic(() => {
+        settle()
+        refreshProjectConversationSearch(this, runId)
+      })
+      else settle()
     },
     /**
      * Withdraws a pending message that has not yet been sent.
