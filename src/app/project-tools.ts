@@ -1,4 +1,6 @@
 /** Project operations exposed to the management Agent, using the same domain methods as the board. */
+import { readFileSync, realpathSync, statSync } from 'node:fs'
+import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
 import { KV } from '../kv.ts'
 import type { ChannelRef } from '../core/index.ts'
@@ -42,6 +44,7 @@ export interface ProjectToolsHost {
   reviews: ProjectReviews
   communication: Communication
   capabilities(channel?: ChannelRef): unknown
+  knowledgeDir?: string
   progress?(): ProjectProgress | undefined
   start(projectId: string, taskId: string, revision: number): ProjectDetail
   stop(projectId: string, taskId: string, ticketId: string): ProjectDetail
@@ -70,6 +73,23 @@ export class ProjectTools {
     this.register(operation('project.inspect', '读取当前项目、任务、执行报告、成员及团队目录。', z.strictObject({}), context => ({
       summary: '已读取项目现状', data: this.snapshot(context.projectId, context.channel),
     })))
+    if (host.knowledgeDir) {
+      const directory = host.knowledgeDir
+      this.register(operation('knowledge.read', '读取已配置的本地知识库 Markdown。先读 index.md，再按索引读取页面。path 相对于知识库目录。', z.strictObject({
+        path: z.string().min(1).max(500).default('index.md'),
+      }), (_context, { path }) => {
+        try {
+          if (isAbsolute(path) || extname(path) !== '.md') throw new Error()
+          const root = realpathSync(directory)
+          const file = realpathSync(resolve(root, path))
+          const entry = relative(root, file)
+          if (entry === '..' || entry.startsWith(`..${sep}`) || isAbsolute(entry) || extname(entry) !== '.md') throw new Error()
+          const stat = statSync(file)
+          if (!stat.isFile() || stat.size > 32_768) throw new Error()
+          return { summary: `已读取知识库页面 ${entry}`, data: { path: file, text: readFileSync(file, 'utf8') } }
+        } catch { throw new ProjectError(404, '知识库页面不存在、不在配置目录内，或超过读取大小限制。') }
+      }))
+    }
     this.register(operation('runtime.inspect', '读取真实运行能力、消息通道、格式支持、最近成功发送的实际格式和原生审批限制；不能修改权限或假装已查阅外部文档。', z.strictObject({}), context => ({
       summary: '已读取运行能力', data: host.capabilities(context.channel),
     })))

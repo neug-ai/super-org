@@ -17,7 +17,7 @@ For a GitHub message that mentions the agent, the host also delivers the explici
 The GitHub mirror uses one comment per card/processing round: the initial confirmation creates it, and later replies append to its content by editing that same comment.
 Do not separately copy those confirmations or summaries through gh; detailed review deliverables still use Comment reviews when required by the request.
 
-The reply tool enforces a purpose: result requires ticket readiness; attention requires the ticket's current structured request (ticket_id plus its exact question in human_action), even while running; answer must reference an original human question.
+The reply tool enforces a purpose: result requires ticket readiness; attention requires the ticket's current structured request (ticket_id plus its exact question in human_action), even while running; answer must reference the original human question or an explicit DingTalk conversational message covered by dispatch.
 For a structured request, pass ticket_id and copy the current ticket.attention.question into human_action.
 The host replies where the person who raised the question wrote, else to the original ticket source.
 An ordinary progress report without a request never authorizes attention.

@@ -229,7 +229,7 @@ export class Runtime extends Service implements SourceHost {
         const issues = new ProjectIssues(store, effects, commands, message => outbox.send(message),
           () => setup.configured() && !!setup.deployment.github.cli)
         const tools = this.projectTools = new ProjectTools({ store, issues, reviews: this.projectReviews, communication: this.communication,
-          capabilities: channel => this.runtimeCapabilities(channel),
+          capabilities: channel => this.runtimeCapabilities(channel), knowledgeDir: machine.knowledgeDir,
           progress: () => this.projectProgress,
           start: (projectId, taskId, revision) => this.runProjectTask(projectId, taskId, revision),
           stop: (projectId, taskId, ticketId) => this.stopProjectTask(projectId, taskId, ticketId),
@@ -237,6 +237,7 @@ export class Runtime extends Service implements SourceHost {
           reply: (context, taskId, url, text) => this.projectRepository.reply(context, taskId, url, text) })
         this.projectAgent = new ProjectAgent({ store, events: projectEvents, effects, tools, planner: () => planning.planner,
           notify: message => this.communication.notify(message), lifetime: this.lifetime,
+          teamSkills: () => prompts.current().config.skills,
           runnable: () => setup.configured() && !this.paused() && !this.closing() })
         this.projectProgress = new ProjectProgress({ store, events: projectEvents, agent: this.projectAgent, lifetime: this.lifetime })
         this.projectRepository.connect(this.projectAgent)

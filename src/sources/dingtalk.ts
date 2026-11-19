@@ -17,6 +17,16 @@ function sender(trigger: Trigger) {
   const name = typeof trigger.meta.senderNick === 'string' ? trigger.meta.senderNick : `钉钉成员 ${trigger.actor.id.slice(-6)}`
   return { corpId: typeof corpId === 'string' && corpId.length <= 128 && trigger.actor.id.length <= 128 ? corpId : undefined, name }
 }
+function enrollmentIntent(text: string): 'self' | 'help' | undefined {
+  const message = text.replace(/[。！？!?]+$/u, '').trim()
+  if (/^(?:登记项目成员|(?:请)?(?:帮我|给我|把我|将我)\s*(?:登记(?:加入(?:项目)?|为(?:本|这个)?项目成员)?|加入(?:本|这个)?项目)|我要(?:登记(?:为)?项目成员|加入(?:本|这个)?项目))$/u.test(message)) return 'self'
+  if (/^(?:请问[，,：:\s]*)?(?:(?:这个群|本群|群里)的?成员|项目成员|群成员)?\s*(?:如何|怎么|怎样)(?:登记(?:为?项目成员)?(?:上来)?|加入(?:本|这个)?项目)(?:呢|呀|吗)?$/u.test(message)) return 'help'
+}
+function enrollmentHelp(project?: DingTalkIntake['project']): string {
+  const action = '每位群成员可以 @ 我发「登记项目成员」，也可以发「把我登记加入」。'
+  return action + (project ? '我会用发消息的钉钉账号把本人加入这个群绑定的项目。'
+    : '这个群还没有绑定项目，我会先把本人登记到成员目录，之后可提交首次项目纪要。')
+}
 /** Only a designated intake group may open a project before it has a saved binding. */
 export function dingTalkProjectIntake(projects: Projects, planning?: ProjectPlanning, intakeGroup?: string, agent?: ProjectAgent): DingTalkIntake {
   return { conversationId: intakeGroup, forConversation: group => {
@@ -25,7 +35,6 @@ export function dingTalkProjectIntake(projects: Projects, planning?: ProjectPlan
     if (project) return { ...dingTalkProjects(group, project.id, projects, planning, agent), project }
     if (group !== intakeGroup) return
     return {
-      discussion: () => () => '这个群还没有项目。团队讨论确认后，可以提交首次项目纪要。',
       onSender: (trigger: Trigger) => {
         const { corpId, name } = sender(trigger)
         if (!corpId) return
@@ -76,14 +85,16 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
       text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '' })
     return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' : '已收到，正在结合项目现状处理。'
   }
+  const enroll = (trigger: Trigger) => {
+    const { corpId, name } = sender(trigger)
+    if (!corpId) return
+    const { projectName, added } = projects.addDingTalkSender(projectId, corpId, trigger.actor.id, name)
+    return added ? `已加入「${projectName}」项目。` : `你已是「${projectName}」的项目成员。`
+  }
   return {
     conversationId,
-    onSender: trigger => {
-      const { corpId, name } = sender(trigger)
-      if (!corpId) return
-      const { projectName, added } = projects.addDingTalkSender(projectId, corpId, trigger.actor.id, name)
-      return added ? `已加入「${projectName}」项目。` : `你已是「${projectName}」的项目成员。`
-    },
+    onSender: enroll,
+    onStored: enroll,
     onMeeting: trigger => {
       if (agent) return manage(trigger)
       if (trigger.text.length > 26_000) return '会议纪要超过 26,000 字，请缩短后重发。'
@@ -218,6 +229,7 @@ export interface DingTalkIntake {
   forConversation?: (conversationId: string) => DingTalkIntake | undefined
   project?: { id: string; repository: string | null }
   onSender?: (trigger: Trigger) => string | undefined
+  onStored?: (trigger: Trigger) => void
   onMeeting?: (trigger: Trigger) => string
   discussion?: (trigger: Trigger) => (() => string) | undefined
 }
@@ -247,9 +259,10 @@ export class DingTalk {
           }
           const textCommand = (trigger.meta.messageType === 'text' || trigger.meta.messageType === 'richText')
             && context.config('dingtalk') !== undefined
-          const enrollment = textCommand && handlers?.onSender && /^登记项目成员[。！!]?$/u.test(trigger.text)
+          const enrollment = textCommand && handlers?.onSender ? enrollmentIntent(trigger.text) : undefined
           const meeting = textCommand && handlers?.onMeeting && /^项目会议纪要(?:[：:]|\r?\n)/u.test(trigger.text)
-          const handle = enrollment ? handlers?.onSender : meeting ? handlers?.onMeeting : undefined
+          const handle = enrollment === 'self' ? handlers?.onSender : enrollment === 'help' ? () => enrollmentHelp(handlers?.project)
+            : meeting ? handlers?.onMeeting : undefined
           const discussion = context.config('dingtalk') !== undefined && !handle ? handlers?.discussion?.(trigger) : undefined
           if (enrollment) trigger.meta.projectEnrollment = true
           if (meeting) trigger.meta.projectMeeting = true
@@ -263,7 +276,7 @@ export class DingTalk {
             const text = discussion ? discussion() : handle?.(trigger)
             if (text) context.notify({ id: key('dingtalk-project-receipt', trigger.id), channel: trigger.channel, kind: 'notice', text })
           } else if (result === 'stored') {
-            handlers?.onSender?.(trigger)
+            handlers?.onStored?.(trigger)
             this.received(trigger)
           }
           return result

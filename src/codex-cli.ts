@@ -219,7 +219,8 @@ async function main(): Promise<void> {
       }
     }) } finally { store.close() }
   } finally { release() }
-  const machine: Machine = { stateDir, githubOptional: true, promptMaxChars: reference(100000), admissionContextMaxPages: reference(10),
+  const knowledgeDir = process.env.SUPERAGENT_KNOWLEDGE_DIR?.trim()
+  const machine: Machine = { stateDir, githubOptional: true, ...(knowledgeDir ? { knowledgeDir: resolve(knowledgeDir) } : {}), promptMaxChars: reference(100000), admissionContextMaxPages: reference(10),
     admissionContextTimeoutMs: reference(15000) }
   const ctx = new Context()
   const model = process.env.CODEX_MODEL

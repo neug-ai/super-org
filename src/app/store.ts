@@ -282,6 +282,22 @@ export class Store implements Repositories {
     correlated: (id: string): Receipt | undefined => this.values<Receipt>("SELECT value FROM outbox WHERE value ->> '$.correlation' = ? ORDER BY rowid DESC LIMIT 1", id)[0],
     /** Explicit origin correlation keeps project audit independent of conversation sharing and message-ID conventions. */
     forProject: (projectId: string): Receipt[] => this.values("SELECT value FROM outbox WHERE value ->> '$.origin.projectId' = ? ORDER BY rowid DESC LIMIT 100", projectId),
+    /** Previous delivered Q&A from the current DingTalk group and project scope. */
+    dingTalkHistory: (triggerId: string, projectId?: string): { text: string; reply: string }[] => this.values<{ text: string; reply: string }>(`
+      SELECT json_object('text', substr(earlier.value ->> '$.text', 1, 2000),
+        'reply', substr(outbox.value ->> '$.text', 1, 1800)) AS value
+      FROM trigger current
+      JOIN trigger earlier ON earlier.rowid < current.rowid
+        AND earlier.value ->> '$.source' = 'dingtalk'
+        AND earlier.value ->> '$.channel.address.conversationId' = current.value ->> '$.channel.address.conversationId'
+      JOIN outbox ON outbox.value ->> '$.channel.address.triggerId' = earlier.id
+        AND outbox.value ->> '$.channel.source' = 'dingtalk'
+        AND outbox.value ->> '$.channel.address.conversationId' = current.value ->> '$.channel.address.conversationId'
+      WHERE current.id = ? AND current.value ->> '$.source' = 'dingtalk'
+        AND outbox.value ->> '$.status' = 'sent' AND outbox.value ->> '$.ticketId' IS NULL
+        AND ((outbox.value ->> '$.kind' = 'reply' AND earlier.value ->> '$.meta.projectId' IS NULL)
+          OR (outbox.value ->> '$.origin.projectId' = ? AND outbox.value ->> '$.origin.runId' IS NOT NULL))
+      ORDER BY outbox.rowid DESC LIMIT 5`, triggerId, projectId ?? null).reverse(),
     /** Pending message receipts, oldest first. */
     waiting: (): Receipt[] => this.values("SELECT value FROM outbox WHERE value ->> '$.status' = 'pending' ORDER BY rowid"),
     /** True if an earlier message for the same ticket and conversation is still pending with fewer than `failures` consecutive failed `reply` effect attempts. */
