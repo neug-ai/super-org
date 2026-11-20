@@ -131,16 +131,20 @@ const ticketOrder = (ticket: ProjectTicket) => ({ person: 0, working: 1, idle: 2
 export function ProjectTickets({ t, project, inspect, openTicket }: {
   t: T; project: ProjectDetail; inspect: (task: ProjectTask) => void; openTicket?: (id: string) => void
 }) {
-  const tickets = [...project.tickets].sort((a, b) => ticketOrder(a) - ticketOrder(b))
-  const needsHuman = tickets.filter(ticket => ticket.stage === 'person').length
+  const needsHuman = project.tickets.filter(ticket => ticket.stage === 'person').length
   return <section className="dt-card dt-project-panel">
     <div className="dt-project-heading"><h3>{t('project.tickets')}</h3>
       {needsHuman > 0 && <Tag tone="warning">{t('project.needsHuman', { count: needsHuman })}</Tag>}</div>
     <p className="dt-hint">{t('project.ticketsHelp')}</p>
-    {!tickets.length && <p className="dt-hint">{t('project.ticketsEmpty')}</p>}
-    {!!tickets.length && <ul className="dt-project-records">{tickets.map(ticket => {
-      const linked = project.tasks.filter(task => task.ticketId === ticket.id || task.id === ticket.taskId)
-      const suggested = !linked.length && ticket.issueUrl ? project.tasks.find(task => task.issueUrl === ticket.issueUrl) : undefined
+    <TicketRecords t={t} tickets={project.tickets} tasks={project.tasks} inspect={inspect} openTicket={openTicket} />
+  </section>
+}
+
+export function TicketRecords({ t, tickets, tasks = [], inspect, openTicket }: { t: T; tickets: ProjectTicket[];
+  tasks?: ProjectTask[]; inspect?: (task: ProjectTask) => void; openTicket?: (id: string) => void }) {
+  if (!tickets.length) return <p className="dt-hint">{t('project.ticketsEmpty')}</p>
+  return <ul className="dt-project-records">{[...tickets].sort((a, b) => ticketOrder(a) - ticketOrder(b)).map(ticket => {
+      const linked = tasks.filter(task => task.ticketId === ticket.id || task.id === ticket.taskId)
       return <li key={ticket.id} className="dt-project-record">
         <div className="dt-project-record-head">
           <div className="dt-project-record-main"><h4>{ticket.title || t('project.untitledTicket')}</h4><div className="dt-project-meta">
@@ -153,11 +157,9 @@ export function ProjectTickets({ t, project, inspect, openTicket }: {
           </div></div>
           {openTicket && <Button size="sm" variant="outline" onClick={() => openTicket(ticket.id)}>{t('project.openTicket')}</Button>}
         </div>
-        {(linked.length > 0 || suggested) && <div className="dt-project-meta">
-          {linked.length > 0 && <span>{t('project.relatedTask')}</span>}
+        {inspect && linked.length > 0 && <div className="dt-project-meta">
+          <span>{t('project.relatedTask')}</span>
           {linked.map(task => <button key={task.id} type="button" className="dt-project-task-title" onClick={() => inspect(task)}>{task.title}</button>)}
-          {suggested && <><span>{t('project.ticketIssueMatch')}</span>
-            <button type="button" className="dt-project-task-title" onClick={() => inspect(suggested)}>{suggested.title}</button></>}
         </div>}
         {ticket.question && <div className="dt-project-answer"><strong>{t('project.agentQuestion')}</strong>
           <MarkdownContent t={t} text={ticket.question} /></div>}
@@ -165,6 +167,5 @@ export function ProjectTickets({ t, project, inspect, openTicket }: {
           <MarkdownContent t={t} text={ticket.summary} /></details> : <p className="dt-hint">{t('project.reportPending')}</p>}
         {ticket.pullUrls.length > 0 && <div className="dt-project-meta">{ticket.pullUrls.map(url => <Issue key={url} url={url} />)}</div>}
       </li>
-    })}</ul>}
-  </section>
+    })}</ul>
 }

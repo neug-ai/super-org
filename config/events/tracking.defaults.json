@@ -1,0 +1,16 @@
+{
+  "sources": {
+    "tracking": {
+      "on": {
+        "tracking.ping.requested": {
+          "enabled": true,
+          "description": "按成员要求判断指定任务是否值得跟进。"
+        },
+        "tracking.check.due": {
+          "enabled": true,
+          "description": "按项目时间表检查一次当前未完成的任务。"
+        }
+      }
+    }
+  }
+}

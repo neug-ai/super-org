@@ -15,6 +15,13 @@ export interface ProjectReview {
 export const reviewReference = (review: ProjectReview) => `〔交付第 ${review.version} 版 · 验收 ${review.id.slice(0, 8)}〕`
 export const currentReview = (task: ProjectTask) => task.reviews?.findLast(review => review.version === task.deliveryVersion)
 
+/** Distinguishes the configured reviewer from a review actually requested for this delivery. */
+export function deliveryReviewState(task: ProjectTask) {
+  const review = currentReview(task)
+  return review ? { status: review.status, reviewId: review.id, version: review.version, reviewerId: review.requirements.ownerId }
+    : { status: 'not-requested' as const, reviewerId: task.executionMode === 'agent' ? task.ownerId : null }
+}
+
 /** Invalidates the old review before beginning a new execution or changing its acceptance scope. */
 export function nextDelivery(task: ProjectTask): void {
   const review = currentReview(task)

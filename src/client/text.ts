@@ -61,3 +61,9 @@ export function fullTime(value: string | undefined, lang: string): string {
   const date = new Date(value ?? '')
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString(timeLocale(lang))
 }
+export function formatBytes(bytes: number | null): string {
+  if (bytes === null) return '—'
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  const unit = Math.min(units.length - 1, Math.floor(Math.log2(Math.max(bytes, 1)) / 10))
+  return `${(bytes / 1024 ** unit).toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unit]}`
+}

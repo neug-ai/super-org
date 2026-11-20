@@ -7,5 +7,6 @@
 - [事件源适配](source-adapters.zh-CN.md)说明 GitHub、钉钉、飞书和本地请求如何接入，以及怎样扩展新的来源。
 - [2048 图文教程](tutorials/2048.zh-CN.md)展示从群聊纪要到自动推进的完整操作。
 - [2048 人工验收](2048-manual-acceptance.zh-CN.md)提供可复用的端到端试验，[验证记录](events/acceptance.zh-CN.md)区分自动测试、隔离验证和真实环境证据。
+- [任务进展与自动追踪](events/task-tracking.zh-CN.md)说明项目时间表、进展记录和两种跟进触发。[设计提案与验收场景](proposals/task-progress-tracking.zh-CN.md)
 
 DSH 原型的授权、通用执行器、Prompt 和配置文件设计见[上游文档](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/main/docs)。

@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
+import { z } from 'zod'
 import { KV } from '../src/kv.ts'
 import { Projects, ProjectInput, ProjectChange } from '../src/app/projects.ts'
 import { ProjectHistory } from '../src/app/project-history.ts'
@@ -29,6 +30,11 @@ it('joins an original message, Agent decision and confirmed task changes through
     projectId: project.id, runId: incoming.decisions[0]!.id, eventId: 'meeting-message' }) }))
   expect(history.notifications[0]).not.toHaveProperty('channel')
   expect(await h.api('GET', `projects/${project.id}/history`)).toMatchObject({ status: 200, body: { next: null } })
+  const taskId = projects.detail(project.id).tasks[0]!.id
+  const filtered = await h.api('GET', `projects/${project.id}/history?activityOnly=true&taskId=${taskId}`)
+  expect(filtered).toMatchObject({ status: 200, body: { entries: [{ event: { type: 'project.changed', data: { tasks: [taskId] } } }], next: null } })
+  const activity = await h.api('GET', `projects/${project.id}/history?activityOnly=true`)
+  expect(activity.body).toMatchObject({ entries: [{ event: { type: 'project.changed' } }, { event: { type: 'project.changed' } }] })
   expect(await h.api('GET', 'projects/missing/history')).toMatchObject({ status: 404 })
 })
 it('paginates history with a stable sequence cursor without skipping equal timestamps', async () => {
@@ -43,6 +49,39 @@ it('paginates history with a stable sequence cursor without skipping equal times
   expect(first.entries).toHaveLength(100)
   expect(second.entries).toHaveLength(11)
   expect(new Set([...first.entries, ...second.entries].map(item => item.event.seq)).size).toBe(111)
+})
+
+it('measures per-project event growth and shared SQLite storage without returning message content', async () => {
+  const h = host = await startRuntime()
+  const { store, projectHistory } = h.runtime
+  const projects = new Projects(store)
+  const project = projects.create(ProjectInput.parse({ name: 'Measured project' }))
+  const other = projects.create(ProjectInput.parse({ name: 'Other project' }))
+  const workspaceEvent = { type: 'sample.received', category: 'sample', description: 'A workspace-scoped event',
+    schema: z.object({}), defaults: { enabled: true }, documentation: '' }
+  h.runtime.projectEvents.register('sample', [workspaceEvent])
+  h.runtime.projectEvents.handle(workspaceEvent.type, () => ({ status: 'applied' }))
+  h.runtime.projectEvents.publisher('sample').publish({ id: 'workspace-record', type: workspaceEvent.type, data: {} })
+  await h.runtime.idle()
+  expect(await h.api('GET', 'projects/events?workspaceOnly=true&limit=50')).toMatchObject({
+    status: 200, body: [{ id: 'workspace-record', type: 'sample.received', status: 'applied' }],
+  })
+  const message = { id: 'notice-statistics', channel: { source: 'request', thread: project.id, address: {} }, kind: 'notice' as const,
+    origin: { projectId: project.id }, text: 'Only the count belongs in statistics' }
+  store.receipts.add(message)
+  store.receipts.add({ ...message, id: 'other-notice-statistics', origin: { projectId: other.id } })
+  const path = `projects/${project.id}/history/statistics`
+  const response = await h.api('GET', path)
+  expect(response).toMatchObject({ status: 200, body: { totalEvents: 1, recent: { count: 1, payloadBytes: expect.any(Number) },
+    types: [{ type: 'project.changed', count: 1 }], receipts: { total: 1, pending: 1, dropped: 0 } } })
+  expect(JSON.stringify(response.body)).not.toContain(message.text)
+  expect(response.body).not.toHaveProperty('storage')
+  const storage = await h.api('GET', 'projects/workspace/storage')
+  expect(storage).toMatchObject({ status: 200, body: { databaseBytes: expect.any(Number), walBytes: expect.any(Number),
+    diskAvailableBytes: expect.any(Number) } })
+  expect(storage.body.databaseBytes).toBeGreaterThan(0)
+  expect(projectHistory.statistics(project.id, new Date(Date.now() + 8 * 86_400_000))).toMatchObject({ totalEvents: 1, recent: { count: 0, payloadBytes: 0 }, types: [] })
+  expect(await h.api('GET', 'projects/missing/history/statistics')).toMatchObject({ status: 404 })
 })
 it('links only explicit event and run identities when unrelated messages have no cause ID', async () => {
   const propose = vi.fn().mockResolvedValue({ calls: [], reply: '已读取，未修改任务。' })

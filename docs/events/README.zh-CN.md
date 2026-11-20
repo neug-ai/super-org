@@ -13,14 +13,16 @@ Super-Org 按**已注册事件源**组织项目事件。每个来源维护自己
 | `github` | [GitHub 默认值](../../config/events/github.defaults.json) | Issue / PR 观察、评论与 Review，[仓库事件](repository.zh-CN.md) |
 | `repository` | [仓库同步默认值](../../config/events/repository.defaults.json) | 验收后关闭负责解决的 Issue、关联事实，[仓库事件](repository.zh-CN.md) |
 | `dingtalk` | [钉钉默认值](../../config/events/dingtalk.defaults.json) | 群消息驱动 Agent，[沟通事件](communication.zh-CN.md) |
+| `feishu` | [飞书默认值](../../config/events/feishu.defaults.json) | 项目群消息驱动 Agent，[沟通事件](communication.zh-CN.md) |
 | `request` | [本地请求默认值](../../config/events/request.defaults.json) | 网页与本地消息驱动 Agent，[沟通事件](communication.zh-CN.md) |
 | `communication` | [沟通偏好默认值](../../config/events/communication.defaults.json) | 保存格式与风格，[沟通事件](communication.zh-CN.md) |
 | `execution` | [执行默认值](../../config/events/execution.defaults.json) | 交付、阻塞与通知，[交付](delivery.zh-CN.md)及[跟进](follow-up.zh-CN.md) |
 | `review` | [验收默认值](../../config/events/review.defaults.json) | 提交、通过、退回，[交付与验收](delivery.zh-CN.md) |
 | `project` | [项目默认值](../../config/events/project.defaults.json) | 任务就绪与依赖解除，[自主跟进](follow-up.zh-CN.md) |
 | `clock` | [时钟默认值](../../config/events/clock.defaults.json) | 一次检查到期，[自主跟进](follow-up.zh-CN.md) |
+| `tracking` | [进展追踪默认值](../../config/events/tracking.defaults.json) | 成员跟进和项目定期检查，[任务进展](task-tracking.zh-CN.md) |
 
-这些文件对应当前注册表中的面向项目事件，自动测试检查文件与注册默认值一致。飞书当前提供消息和工单能力，待注册项目事件后再生成自己的项目事件模板。新增来源注册后，查询接口立即返回该来源的独立配置模板，不需要修改配置解析器或增加事件名判断。
+这些文件对应当前注册表中的面向项目事件，自动测试检查文件与注册默认值一致。新增来源注册后，查询接口立即返回该来源的独立配置模板，不需要修改配置解析器或增加事件名判断。
 
 例如 GitHub 的一项配置：
 

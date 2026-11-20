@@ -14,6 +14,7 @@ export interface OutboxHost {
   paused(): boolean
   /** Fix transport correlations before delivery can race with another incoming event. */
   prepare?(message: OutboundMessage): OutboundMessage
+  obsolete?(message: OutboundMessage): boolean
   /** Additional destinations for the same explicit reply, persisted atomically with independent retry receipts. */
   mirrors?(message: OutboundMessage): OutboundMessage[]
   acknowledgementId?(ticketId: string, trigger: Trigger): string | undefined
@@ -60,6 +61,7 @@ export class Outbox implements OutboxPort {
     const { store, sources, commands } = this.host
     const receipt = store.receipts.get(id)
     if (receipt?.status !== 'pending') return
+    if (this.host.obsolete?.(receipt)) { store.receipts.settle(receipt, 'obsolete'); return }
     if (!sources.instance(receipt.channel.source)?.enabled) throw new Later('The Source is off or not installed')
     // Hold later messages for the same ticket and conversation behind an earlier pending message until it exceeds the failure threshold.
     if (store.receipts.behind(id, FAILURES_BEFORE_ERROR)) throw new Later('An earlier message of this ticket to this conversation waits')

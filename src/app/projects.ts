@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { latestReport, type ReportState, type Ticket } from '../core/model.ts'
+import { key } from '../core/ids.ts'
 import { ticketStage, type TicketStage } from '../core/stage.ts'
 import { workerSessionId } from '../executor/dsh.ts'
 import { KV, type Family } from '../kv.ts'
@@ -9,6 +10,7 @@ import type { Health } from '../sources/host.ts'
 import type { Store } from './store.ts'
 import type { ExecutorLoad } from './views/tickets.ts'
 import { currentReview, deliveryScopeChanged, nextDelivery, type DeliveryEvidence, type ProjectReview } from './project-deliveries.ts'
+import { TrackingSchedule } from './tracking-schedule.ts'
 
 const title = z.string().trim().min(1).max(200)
 const description = z.string().trim().max(8000)
@@ -50,6 +52,7 @@ export const ProjectInput = z.strictObject({
   dingTalkGroup: z.string().trim().min(1).max(300).nullable().optional(),
   feishuChatId: z.string().trim().max(300).regex(/^oc_[a-zA-Z0-9]+$/).nullable().optional(),
   autoAdvance: z.boolean().optional(),
+  tracking: TrackingSchedule.nullable().optional(),
 })
 export type ProjectInput = z.input<typeof ProjectInput>
 const Priority = z.enum(['do', 'schedule', 'delegate', 'eliminate'])
@@ -88,11 +91,21 @@ export const ProjectChange = z.strictObject({
   ]),
 })
 export type ProjectChange = z.input<typeof ProjectChange>
+export const ProgressInput = z.strictObject({
+  summary: z.string().trim().min(1).max(4000),
+  blocker: z.string().trim().min(1).max(2000).optional(),
+  links: z.array(z.url({ protocol: /^https?$/ }).max(2000)).max(10).default([]),
+  corrects: id.optional(),
+})
+export type ProgressInput = z.input<typeof ProgressInput>
+export interface ProgressOrigin { actorId: string | null; source: string; messageId: string; original?: string }
+export type TaskProgress = z.output<typeof ProgressInput> & ProgressOrigin & { id: string; author: string; at: string }
 export type ProjectTask = Omit<z.output<typeof TaskInput>, 'executionMode'> & {
   id: string; createdAt: string; updatedAt: string; completedAt: string | null; executionMode?: 'manual' | 'agent' | null
   executionStartedAt?: string
   deliveryVersion?: number
   reviews?: ProjectReview[]
+  progress?: TaskProgress[]
 }
 export type ProjectMilestone = z.output<typeof MilestoneInput> & { id: string }
 export type ProjectEvidence = { triggerId: string; source?: string; messageId?: string; memberId?: string; name: string; at: string }
@@ -116,7 +129,7 @@ export type ProjectDetail = Project & {
 }
 export type ProjectTicket = TicketStage & { id: string; title: string; updatedAt: string; ended: boolean; issueUrl: string | null;
   taskId: string | null; summary: string; reportState: ReportState | null;
-  question: string | null; pullUrls: string[]; runner?: string }
+  question: string | null; answerSubmitted?: boolean; pullUrls: string[]; runner?: string }
 export type ProjectExecution = {
   state: 'planning' | 'setup' | 'paused' | 'source-off' | 'ready'; repository?: string
   agent?: { main: 'idle' | 'running' | 'unavailable'; health?: Health; load: ExecutorLoad & { maxWorkers: number } }
@@ -328,6 +341,33 @@ export class Projects {
     return this.detail(project.id)
   }
 
+  /** Append evidence without altering execution, acceptance, or dependency state. */
+  recordProgress(projectId: string, taskId: string, input: ProgressInput, origin: ProgressOrigin): TaskProgress {
+    return this.store.atomic(() => {
+      const project = this.require(projectId)
+      const task = requireRecord(project.tasks, taskId, 'Task')
+      const member = origin.actorId && project.memberIds.includes(origin.actorId) && this.store.get(KV.projects.member(origin.actorId))
+      if (!member && !(origin.actorId === null && origin.source === 'request')) throw new ProjectError(403, 'Only a project member can record progress')
+      const history = task.progress ??= []
+      const id = key('task-progress', projectId, taskId, origin.source, origin.messageId)
+      const existing = history.find(item => item.id === id)
+      if (existing) {
+        if (existing.actorId !== origin.actorId) throw new ProjectError(409, 'This progress message ID already belongs to another author')
+        return existing
+      }
+      const value = ProgressInput.parse(input)
+      if (value.corrects) {
+        const prior = requireRecord(history, value.corrects, 'Progress entry')
+        if (prior.actorId !== origin.actorId) throw new ProjectError(403, 'Only the original author can correct this progress')
+        if (history.some(item => item.corrects === prior.id)) throw new ProjectError(409, 'Correct the latest version of this progress entry')
+      }
+      const record: TaskProgress = { ...value, ...origin, id, author: member ? member.name : '本地操作者', at: isoNow() }
+      history.push(record)
+      this.save(project)
+      return record
+    })
+  }
+
   /** Associate an Issue without changing task progress or replacing a person’s existing link. */
   linkIssue(projectId: string, taskId: string, repository: string, url: string, role: 'reference' | 'resolve' = 'reference'): boolean {
     return this.store.atomic(() => {
@@ -355,10 +395,13 @@ export class Projects {
     })
     const report = latestReport(ticket)
     const runner = this.store.get(KV.sessions.external(workerSessionId(ticket.id)))?.runner ?? trigger?.meta.runner
+    const answerSubmitted = !!ticket.attention && ticket.inputs.some(input => input.kind === 'trigger' && input.human &&
+      this.store.triggers.get(input.triggerId)?.meta.projectAttentionId === ticket.attention?.id)
     return { id: ticket.id, title: ticket.title, updatedAt: ticket.updatedAt, ended: !!ticket.ended, ...ticketStage(ticket), issueUrl: url || null,
       taskId: local && typeof trigger?.meta.projectTaskId === 'string' ? trigger.meta.projectTaskId : null,
       ...(typeof runner === 'string' && { runner }),
-      summary: report?.summary ?? '', reportState: report?.state ?? null, question: ticket.attention?.question ?? null, pullUrls: [...new Set(pullUrls)] }
+      summary: report?.summary ?? '', reportState: report?.state ?? null, question: ticket.attention?.question ?? null,
+      ...(answerSubmitted && { answerSubmitted }), pullUrls: [...new Set(pullUrls)] }
   }
 
   recentTickets(): ProjectTicket[] { return this.store.tickets.list().slice(0, 50).map(ticket => this.ticketView(ticket)) }
@@ -366,12 +409,10 @@ export class Projects {
   detail(projectId: string): ProjectDetail {
     const project = this.require(projectId)
     const members = project.memberIds.flatMap(memberId => this.store.get(KV.projects.member(memberId)) ?? []).sort(byName)
-    const issues = new Set(project.tasks.flatMap(task => task.issueUrl ?? []))
     const linkedTickets = new Set(project.tasks.flatMap(task => task.ticketId ?? []))
     return { ...project, members, tickets: this.store.tickets.list().flatMap(ticket => {
       const origin = this.store.triggers.get(ticket.origin.triggerId)
-      const issue = origin?.url && githubIssueUrl(origin.url)
-      if (!linkedTickets.has(ticket.id) && origin?.meta.projectId !== project.id && !(issue && issues.has(issue))) return []
+      if (!linkedTickets.has(ticket.id) && origin?.meta.projectId !== project.id) return []
       return [this.ticketView(ticket, project)]
     }) }
   }

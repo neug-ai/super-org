@@ -25,3 +25,18 @@
 `GET /orchestrator/api/projects/:id/history?before=<seq>` 返回 entries、next、notifications、synchronization、remote、checks。每页最多 100 条，next 为下一页游标；同一项目的 agent-runs 与 events 查询接口保持兼容。
 
 通知从当前事件或 Agent run 显式携带项目因果标识，并展示 Outbox 的实际 pending/sent/dropped 回执；不以群 ID 猜测归属。sent 只表示发送接口接受，不能证明客户端已读。迁移不会根据旧消息补造这些关联。
+
+## 日常查看和容量维护
+
+打开「推进记录」，点顶部的待人工答复、待验收、待发送或同步失败可直接查看对应记录。「活动时间线」按日期排列，按任务筛选后仍可翻阅较早的匹配记录。点开一条事件，查看实际状态、判断依据和来源。需要排查群消息或模型提案时，勾选「显示消息原文和 Agent 提案事件」。原始证据可能包含聊天文字、内部链接和工单证据，适合授权的管理者阅读。
+
+「推进记录 → 项目统计」每分钟读取一次数据。`GET /orchestrator/api/projects/:id/history/statistics` 提供当前项目的事件总量、过去 7 天新增的数量和 JSON 字节数、各类型增量以及通知回执统计。JSON 字节数可用于查找主要增量来源。
+
+在左侧总菜单打开「工作区记录」，可查看最近 50 条工单与最近 50 条未归属项目的事件。项目的「执行记录」显示从该项目发起或已关联到其任务的工单。
+
+「工作区记录 → 存储」通过 `GET /orchestrator/api/projects/workspace/storage` 显示共享的 SQLite 主库、WAL、可复用页和磁盘可用空间。磁盘剩余小于 1 GiB 或 WAL 达到 64 MiB 时显示预警。
+
+1. 磁盘紧张时，先腾出存储或扩容。确认热点事件类型后再评估是否要控制来源频率或归档。保持投递回执、未完成事件和去重依据可用。
+2. WAL 持续增长时，先检查长时间读取和事务。安排维护窗口并正常停服务后，再核对 checkpoint 状态。由 SQLite 管理 `-wal` 和 `-shm` 文件。 [SQLite WAL 维护](https://sqlite.org/wal.html#avoiding_excessively_large_wal_files)
+3. 主库持续增长时，先用 SQLite 在线备份生成可恢复副本并对副本运行 `PRAGMA quick_check`。只有在可复用页明显且确需回收文件空间时，才安排离线 `VACUUM`。它需要额外空间，最坏可达原主库大小的两倍。 [SQLite 备份](https://sqlite.org/backup.html) · [VACUUM](https://sqlite.org/lang_vacuum.html)
+4. 需要长期设上限时，由团队先选保留周期和审计字段。保留事件 ID、序号、因果、业务结果和未完成状态，再把历史大正文移到受控归档。现有版本提供保留量统计，历史归档和清除需另行确认策略。

@@ -41,6 +41,8 @@ import { ProjectPlanning, type ProjectPlanner } from './project-planning.ts'
 import { ProjectIssues } from './project-issues.ts'
 import { resumeProjectActions } from './project-actions.ts'
 import { ProjectProgress } from './project-progress.ts'
+import { ProjectTracking } from './project-tracking.ts'
+import { projectChannel } from './project-notifications.ts'
 import { ProjectRepository as ProjectRepositorySync } from './project-repository.ts'
 import { projectResources } from './repository-delivery.ts'
 import { ProjectHistory } from './project-history.ts'
@@ -100,6 +102,7 @@ export class Runtime extends Service implements SourceHost {
   readonly projectPlanning?: ProjectPlanning
   readonly projectAgent?: ProjectAgent
   readonly projectProgress?: ProjectProgress
+  readonly projectTracking: ProjectTracking
   readonly projectRepository: ProjectRepositorySync
   readonly projectHistory: ProjectHistory
   readonly projectTools?: ProjectTools
@@ -203,6 +206,7 @@ export class Runtime extends Service implements SourceHost {
       let communication: Communication | undefined
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused(),
         prepare: message => bindDingTalkReply(runtime.context({ kind: 'dingtalk', health: [] }), communication?.prepare(message) ?? message),
+        obsolete: message => this.projectTracking.obsolete(message),
         acknowledgementId: (ticketId, trigger) => cardAcknowledgementId(runtime.context({ kind: 'dingtalk', health: [] }), ticketId, trigger),
         mirrors: message => githubMentionReplies(runtime.context({ kind: 'dingtalk', health: [] }), message) })
       communication = this.communication = new Communication({ store, events: projectEvents, effects, outbox,
@@ -224,6 +228,21 @@ export class Runtime extends Service implements SourceHost {
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const planner = robotAgents ? () => robotAgents.planner(robotAgents.active(store.get(KV.runtime.robotPlanner))) : projectPlanner
+      this.projectTracking = new ProjectTracking({ store, effects, events: projectEvents, planner: () => this.projectPlanning?.planner,
+        recipient: (project, owner, preferredSource) => {
+          if (!preferredSource || preferredSource === 'request' || preferredSource === 'dingtalk') {
+            const channel = projectChannel(store, project, owner)
+            if (channel.address.mentionUserId && (preferredSource === 'dingtalk' || sources.channelAllowed(channel))) return channel
+          }
+          if (!preferredSource || preferredSource === 'request' || preferredSource === 'feishu') {
+            const chatId = project.feishuChatId
+            const appId = setup.deployment.feishu?.appId
+            const account = appId && owner.accounts.find(item => item.provider === 'feishu' && item.scope === appId && /^ou_[\w-]+$/.test(item.accountId))
+            if (chatId && account) return { source: 'feishu', thread: `feishu:${chatId}`, address: { chatId, mentionUserId: account.accountId } }
+          }
+        },
+        channelAllowed: channel => sources.channelAllowed(channel), notify: message => this.communication.notify(message),
+        lifetime: this.lifetime, runnable: () => setup.configured() && !this.paused() && !this.closing() })
       if (planner) {
         const planning = this.projectPlanning = new ProjectPlanning(store, effects, planner, message => outbox.send(message), this.lifetime)
         const issues = new ProjectIssues(store, effects, commands, message => outbox.send(message),
@@ -239,6 +258,7 @@ export class Runtime extends Service implements SourceHost {
               && new Projects(store).directoryMemberForAccount('feishu', appId, senderId)?.id === actorId
           },
           progress: () => this.projectProgress,
+          tracking: () => this.projectTracking,
           start: (projectId, taskId, revision) => this.runProjectTask(projectId, taskId, revision),
           stop: (projectId, taskId, ticketId) => this.stopProjectTask(projectId, taskId, ticketId),
           follow: (projectId, taskId, ticketId, text, origin) => this.followProjectTask(projectId, taskId, ticketId, text, origin),
@@ -452,6 +472,7 @@ export class Runtime extends Service implements SourceHost {
     this.projectReviews.recover()
     this.projectRepository.recover()
     this.projectProgress?.recover()
+    this.projectTracking.recover()
     this.projectEvents.recover()
     this.passes.start()
     this.effects.start()
@@ -462,7 +483,7 @@ export class Runtime extends Service implements SourceHost {
     const { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks, setup, passes } = this
     return { store, sources, prompts, sessions, settings, engine, executor, health, machine, masterId, ready, sourceLinks,
       projectEvents: this.projectEvents, projectAgent: this.projectAgent, projectTools: this.projectTools, projectReviews: this.projectReviews, communication: this.communication,
-      projectProgress: this.projectProgress,
+      projectProgress: this.projectProgress, projectTracking: this.projectTracking,
       projectHistory: this.projectHistory, projectRepository: this.projectRepository,
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
@@ -581,7 +602,9 @@ export class Runtime extends Service implements SourceHost {
     const projects = new Projects(this.store)
     const result = this.store.atomic(() => {
       projects.openTaskTicket(id, taskId, ticketId)
+      const attentionId = this.store.tickets.get(ticketId)?.attention?.id
       let trigger = requestTrigger(text)
+      if (attentionId) trigger.meta.projectAttentionId = attentionId
       if (origin) {
         const feedback = this.projectRepository.followOrigin(origin)
         const inputId = key('project-feedback-input', origin.id, text)

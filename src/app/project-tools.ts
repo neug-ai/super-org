@@ -4,10 +4,12 @@ import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { z } from 'zod'
 import { KV } from '../kv.ts'
 import type { ChannelRef } from '../core/index.ts'
-import { ProjectChange, ProjectError, Projects, TaskInput, type ProjectDetail } from './projects.ts'
+import { ProgressInput, ProjectChange, ProjectError, Projects, TaskInput, type ProjectDetail } from './projects.ts'
+import type { ProjectTracking } from './project-tracking.ts'
 import type { ProjectIssues } from './project-issues.ts'
 import type { Store } from './store.ts'
 import { ReviewEvidence, type ProjectReviews } from './project-reviews.ts'
+import { deliveryReviewState } from './project-deliveries.ts'
 import { CommunicationPreference, type Communication } from './communication.ts'
 import type { ProjectProgress } from './project-progress.ts'
 import { taskRemoteFacts } from './repository-delivery.ts'
@@ -30,6 +32,7 @@ export interface ProjectToolContext {
   operationId: string
   channel: ChannelRef
   reviewId?: string
+  text?: string
   event?: ProjectEvent
 }
 export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef }
@@ -48,6 +51,7 @@ export interface ProjectToolsHost {
   knowledgeDir?: string
   authorizeHistory?(context: ProjectToolContext): boolean
   progress?(): ProjectProgress | undefined
+  tracking?(): ProjectTracking
   start(projectId: string, taskId: string, revision: number): ProjectDetail
   stop(projectId: string, taskId: string, ticketId: string): ProjectDetail
   follow(projectId: string, taskId: string, ticketId: string, text: string, origin?: ProjectEvent): ProjectDetail
@@ -116,6 +120,19 @@ export class ProjectTools {
     this.register(operation('runtime.inspect', '读取真实运行能力、消息通道、格式支持、最近成功发送的实际格式和原生审批限制；不能修改权限或假装已查阅外部文档。', z.strictObject({}), context => ({
       summary: '已读取运行能力', data: host.capabilities(context.channel),
     })))
+    this.register(operation('progress.record', '把成员明确报告的实际任务进展追加到指定任务。可记录卡点、证据和本人上次报告的 corrects。等待依赖或未分配的任务也能记录。此操作不改状态、派工或验收。只引用明确任务，不把计划或猜测写成已完成。',
+      ProgressInput.extend({ taskId: id }), (context, { taskId, ...input }) => ({
+        summary: '已记录任务进展。', data: this.projects.recordProgress(context.projectId, taskId, input, {
+          actorId: context.actorId, messageId: context.messageId, source: context.channel.source,
+          ...(context.text ? { original: context.text } : {}),
+        }),
+      })))
+    this.register(operation('tracking.request', '成员明确要求联系负责人、追一下进度时，发起指定任务的进展检查。只查状态直接回答；任务指代不清楚时追问。只登记检查，不能承诺提醒已送达。不要为了提醒而开工或提交验收。',
+      z.strictObject({ taskId: id, focus: z.string().trim().max(2000).default('') }), (context, { taskId, focus }) => {
+        if (!host.tracking) throw new ProjectError(409, '进展跟进服务尚未启动。')
+        const event = host.tracking().request(context, taskId, focus)
+        return { summary: '已登记进展检查，是否跟进以实际记录为准。', data: { eventId: event.id, taskId } }
+      }))
     this.register(operation('follow_up.schedule', '为当前任务预约一次后续检查；到时由事件唤起 Agent，而非持续扫描。每个任务保留一个预约，新预约替换旧预约；自动推进须已授权。',
       z.strictObject({ taskId: id, at: z.iso.datetime(), reason: z.string().trim().min(1).max(2000) }), (context, args) => {
         task(context, args.taskId)
@@ -229,7 +246,10 @@ export class ProjectTools {
 
   snapshot(projectId: string, channel?: ChannelRef) {
     const project = this.projects.detail(projectId)
-    return { now: new Date().toISOString(), project, directory: this.projects.members().map(({ id, name }) => ({ id, name })), capabilities: this.host.capabilities(channel),
+    const tasks = project.tasks.map(({ progress, ...task }) => ({ ...task, deliveryReview: deliveryReviewState(task),
+      ...(progress?.length ? { progress: progress.slice(-5)
+        .map(({ original: _original, ...record }) => ({ ...record, summary: record.summary.slice(0, 1000) })) } : {}) }))
+    return { now: new Date().toISOString(), project: { ...project, tasks }, directory: this.projects.members().map(({ id, name }) => ({ id, name })), capabilities: this.host.capabilities(channel),
       conversationPreference: channel ? this.host.communication.read(channel) : undefined,
       scheduledChecks: this.host.progress?.()?.checks(projectId) ?? [],
       repositoryFacts: project.tasks.flatMap(task => taskRemoteFacts(this.host.store, project, task).map(fact => ({ taskId: task.id, ...fact }))),

@@ -183,11 +183,22 @@ export class ProjectEvents {
     this.store.afterCommit(() => { this.effects.kick() })
   }
 
-  list(query: { projectId?: string; limit?: number; before?: number } = {}): ProjectEvent[] {
+  list(query: { projectId?: string; workspaceOnly?: boolean; limit?: number; before?: number; taskId?: string; excludeTypes?: readonly string[] } = {}): ProjectEvent[] {
     const limit = z.number().int().min(1).max(200).parse(query.limit ?? 50)
     const before = z.number().int().positive().optional().parse(query.before)
-    const rows = this.store.db.prepare("SELECT * FROM project_event WHERE (? IS NULL OR value ->> '$.projectId'=?) AND (? IS NULL OR seq<?) ORDER BY seq DESC LIMIT ?")
-      .all(query.projectId ?? null, query.projectId ?? null, before ?? null, before ?? null, limit)
+    const where = [query.projectId === undefined ? undefined : "value ->> '$.projectId' = ?", before === undefined ? undefined : 'seq < ?'].filter(Boolean)
+    const params = [query.projectId, before].filter(value => value !== undefined)
+    if (query.workspaceOnly) where.push("(value ->> '$.projectId') IS NULL")
+    if (query.taskId) {
+      where.push(`(value ->> '$.taskId' = ? OR EXISTS (SELECT 1 FROM json_each(project_event.value, '$.data.tasks') AS related
+        WHERE CASE related.type WHEN 'text' THEN related.atom WHEN 'object' THEN related.value ->> '$.id' END = ?))`)
+      params.push(query.taskId, query.taskId)
+    }
+    if (query.excludeTypes?.length) {
+      where.push("value ->> '$.type' NOT IN (SELECT value FROM json_each(?))")
+      params.push(JSON.stringify(query.excludeTypes))
+    }
+    const rows = this.store.db.prepare(`SELECT * FROM project_event ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY seq DESC LIMIT ?`).all(...params, limit)
     return rows.map(row => this.record(row))
   }
 
