@@ -8,7 +8,7 @@ import type { SettingsView } from './views/settings.ts'
 import type { SourceStatusView } from './views/sources.ts'
 import type { DecisionListView, SearchView, ThreadDetailView, ThreadListView } from './views/threads.ts'
 import type { TicketListView } from './views/tickets.ts'
-import type { Member, MemberInput, ProjectChange, ProjectDetail, ProjectExecution, ProjectInput, ProjectSummary, ProjectTicket } from './projects.ts'
+import type { Member, MemberInput, ProgressInput, ProjectChange, ProjectDetail, ProjectExecution, ProjectInput, ProjectSummary, ProjectTicket, TaskProgress } from './projects.ts'
 import type { ProjectPlanResult } from './project-planning.ts'
 import type { RobotAgentSettings } from '../harness/robot-agents.ts'
 import type { ProjectEvents, ProjectWorkflowConfig } from './project-events.ts'
@@ -38,14 +38,18 @@ export interface Api {
   'GET projects/:id/agent-runs': { response: ProjectAgentRun[] }
   'GET projects/:id/conversation': { response: ReturnType<ProjectAgent['webConversation']> }
   'GET projects/:id/checks': { response: import('./project-progress.ts').ProjectCheck[] }
-  'GET projects/:id/history': { query?: { before?: number }; response: ReturnType<import('./project-history.ts').ProjectHistory['view']> }
+  'GET projects/:id/history': { query?: { before?: number; taskId?: string; activityOnly?: boolean }; response: ReturnType<import('./project-history.ts').ProjectHistory['view']> }
+  'GET projects/:id/history/statistics': { response: ReturnType<import('./project-history.ts').ProjectHistory['statistics']> }
+  'GET projects/workspace/storage': { response: ReturnType<typeof import('./project-history.ts').databaseStorage> }
   'POST projects/:id/synchronization/:operationId/retry': { response: { status: 'queued' } }
   'POST projects/:id/tasks/:taskId/deliveries': { body: { messageId: string; summary: string; links?: string[] }; response: ReturnType<ProjectReviews['submit']> }
+  'POST projects/:id/tasks/:taskId/progress': { body: ProgressInput & { messageId: string }; response: TaskProgress }
+  'POST projects/:id/tasks/:taskId/tracking': { body: { messageId: string; focus?: string }; response: ProjectEvent }
   'POST projects/:id/tasks/:taskId/reviews/:reviewId': { body: { messageId: string; outcome: 'accepted' | 'rejected'; reason: string }; response: ReturnType<ProjectReviews['decide']> }
   'GET projects/workflow': { response: ReturnType<ProjectEvents['view']> }
   'PUT projects/workflow': { body: { revision: number; config: Partial<ProjectWorkflowConfig> }; response: ReturnType<ProjectEvents['view']> }
   'PUT projects/workflow/sources/:source': { body: { revision: number; config: ProjectWorkflowConfig['sources'][string] }; response: ReturnType<ProjectEvents['view']> }
-  'GET projects/events': { query: { projectId?: string; limit?: number }; response: ProjectEvent[] }
+  'GET projects/events': { query: { projectId?: string; workspaceOnly?: boolean; limit?: number }; response: ProjectEvent[] }
   'POST projects': { body: ProjectInput; response: ProjectDetail }
   'GET projects/issue': { query: { url: string; projectId?: string }; response: { url: string; title: string } }
   'GET projects/execution': { response: ProjectExecution }

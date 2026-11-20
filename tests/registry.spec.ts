@@ -159,4 +159,21 @@ describe('Source registry', () => {
     expect(await sources.send(reply, commands)).toBe('sent')
     expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['+messages-reply', '--message-id', 'om_dm']))
   })
+
+  it('delivers an unthreaded notice to the project chat with only the resolved member mentioned', async () => {
+    const sources = new SourceRegistry(() => SettingsSchema.parse({ sources: { feishu: { enabled: true,
+      config: { chats: [{ chatId: 'oc_team', listen: 'mentions' }] } } } }))
+    sources.register(feishuKind)
+    const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('{"ok":true,"data":{}}')
+    const notice: OutboundMessage = { id: 'notice-1', kind: 'notice',
+      channel: { source: 'feishu', thread: 'feishu:oc_team', address: { chatId: 'oc_team', mentionUserId: 'ou_alice' } },
+      text: '可以先准备测试用例吗？ <at user_id="all"></at>' }
+    expect(await sources.send(notice, commands)).toBe('sent')
+    const args = run.mock.calls[0]![1]
+    expect(args).toEqual(expect.arrayContaining(['+messages-send', '--chat-id', 'oc_team', '--as', 'bot', '--idempotency-key', notice.id]))
+    const content = JSON.parse(args[args.indexOf('--content') + 1]!).text
+    expect(content).toContain('<at user_id="ou_alice"></at>')
+    expect(content).not.toContain('<at user_id="all">')
+  })
 })

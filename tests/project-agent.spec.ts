@@ -140,6 +140,49 @@ it('preserves dependency gates and rolls back kickoff when dispatch fails', asyn
   expect(projects.detail(id)).toMatchObject({ status: 'planning', tickets: [] })
 })
 
+it('tells the Agent whether a reviewer is designated or a real delivery is awaiting review', async () => {
+  const { h, projects, id, member, assignee, change, propose, say } = await pilot()
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy,
+    sources: { ...settings.policy.sources, request: { allowed: [{ id: 'local' }] } } } })
+  change({ kind: 'project', value: { name: projects.detail(id).name, status: 'active' } })
+  change({ kind: 'add-member', memberId: assignee.id })
+  const upstream = change({ kind: 'task', value: { title: '交付候选版本', executionMode: 'agent', ownerId: assignee.id } }).tasks[1]!
+  const downstream = change({ kind: 'task', value: { title: '人工试用', executionMode: 'manual', ownerId: member.id, blockedBy: [upstream.id] } }).tasks[2]!
+  const revision = projects.detail(id).revision
+  const started = await h.api('POST', `projects/${id}/tasks/${upstream.id}/run`, { revision })
+  expect(started.status).toBe(200)
+  await h.runtime.idle()
+  const ticketId = projects.detail(id).tasks[1]!.ticketId!
+  const question = '请 Robin 在真机上验证并提供截图。'
+  await h.runTool(`worker-${ticketId}`, 'orchestrator_report', { state: 'blocked', summary: '规则测试已通过', human_action: question })
+  await h.runtime.idle()
+
+  propose.mockImplementationOnce(async prompt => {
+    const context = JSON.parse(prompt.split('\n\n').at(-1)!).projectContext.project
+    expect(context.tasks[2]).toMatchObject({ id: downstream.id, blockedBy: [upstream.id], status: 'todo' })
+    expect(context.tasks[1]).toMatchObject({ status: 'in-progress', deliveryReview: { status: 'not-requested', reviewerId: assignee.id } })
+    expect(context.tickets).toContainEqual(expect.objectContaining({ id: ticketId, stage: 'person', action: 'answer', question }))
+    expect(prompt).toContain('只有 deliveryReview.status=pending 才说正在等该版验收')
+    return done('当前等 Robin 回传真机验证，交付尚未发起验收。')
+  })
+  const blocked = await say('wait-for-evidence', '人工试用目前具体在等谁？只查询。')
+  expect(blocked).toMatchObject({ status: 'completed', steps: [], reply: '当前等 Robin 回传真机验证，交付尚未发起验收。' })
+
+  await h.api('POST', `projects/${id}/tasks/${upstream.id}/follow-up`, { ticketId, text: '已补充真机验证和截图' })
+  await h.runtime.idle()
+  await h.runTool(`worker-${ticketId}`, 'orchestrator_report', { state: 'ready', summary: '已收到验证证据，可以验收' })
+  await h.runtime.idle()
+  const review = projects.detail(id).tasks[1]!.reviews!.at(-1)!
+  propose.mockImplementationOnce(async prompt => {
+    const context = JSON.parse(prompt.split('\n\n').at(-1)!).projectContext.project
+    expect(context.tasks[1]).toMatchObject({ status: 'in-review', deliveryReview: { status: 'pending', reviewId: review.id, reviewerId: assignee.id } })
+    expect(context.tasks[2]).toMatchObject({ status: 'todo', blockedBy: [upstream.id] })
+    return done('交付已提交，等李顺阳验收。')
+  })
+  expect(await say('wait-for-review', '人工试用现在还在等什么？')).toMatchObject({ status: 'completed', steps: [], reply: '交付已提交，等李顺阳验收。' })
+})
+
 it('uses the selected task repository and links the Issue without dispatching a worker', async () => {
   const { projects, id, task, change, propose, say } = await pilot()
   change({ kind: 'project', value: { name: projects.detail(id).name, repository: 'acme/pilot' } })

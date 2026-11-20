@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { BlockList } from 'node:net'
 import { z } from 'zod'
-import { MemberInput, ProjectChange, ProjectError, ProjectInput, Projects, type ProjectDetail, type ProjectExecution } from './projects.ts'
+import { MemberInput, ProgressInput, ProjectChange, ProjectError, ProjectInput, Projects, type ProjectDetail, type ProjectExecution } from './projects.ts'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
@@ -40,13 +40,15 @@ import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
 import type { ProjectProgress } from './project-progress.ts'
-import type { ProjectHistory } from './project-history.ts'
+import type { ProjectTracking } from './project-tracking.ts'
+import { databaseStorage, type ProjectHistory } from './project-history.ts'
 import type { ProjectRepository as ProjectRepositorySync } from './project-repository.ts'
 
 export interface HttpHost {
-  readonly projectHistory?: Pick<ProjectHistory, 'view'>
+  readonly projectHistory?: Pick<ProjectHistory, 'view' | 'statistics'>
   readonly projectRepository?: Pick<ProjectRepositorySync, 'retry'>
   readonly projectProgress?: Pick<ProjectProgress, 'checks'>
+  readonly projectTracking?: Pick<ProjectTracking, 'request'>
   readonly projectEvents?: Pick<ProjectEvents, 'view' | 'save' | 'saveSource' | 'list'>
   readonly projectAgent?: Pick<ProjectAgent, 'submit' | 'runs' | 'webConversation'>
   readonly projectTools?: Pick<ProjectTools, 'catalog' | 'snapshot'>
@@ -186,7 +188,7 @@ const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().no
 
 type ProjectRoute = Extract<keyof Routes, `${string} projects${string}` | `${string} members${string}`>
 function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 'projectIssue' | 'updateProjectPlan' | 'robotAgentSettings' |
-  'selectRobotPlanner' | 'runProjectTask' | 'followProjectTask' | 'stopProjectTask' | 'projectEvents' | 'projectAgent' | 'projectTools' | 'projectReviews' | 'communication' | 'projectProgress' | 'projectHistory' | 'projectRepository'>): Pick<Routes, ProjectRoute> {
+  'selectRobotPlanner' | 'runProjectTask' | 'followProjectTask' | 'stopProjectTask' | 'projectEvents' | 'projectAgent' | 'projectTools' | 'projectReviews' | 'communication' | 'projectProgress' | 'projectTracking' | 'projectHistory' | 'projectRepository'>): Pick<Routes, ProjectRoute> {
   const projects = new Projects(store)
   const runtime = () => {
     if (!host) throw new ProjectError(409, 'Start the full Super-Org service to run project tasks')
@@ -221,6 +223,16 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
       return host.projectReviews.submit({ projectId: params.id, actorId: null, operationId: messageId,
         channel: { source: 'request', thread: params.id, address: { projectId: params.id } } }, params.taskId, evidence)
     },
+    'POST projects/:id/tasks/:taskId/progress': async ({ params, body }) => {
+      const { messageId, ...input } = ProgressInput.extend({ messageId: ticketId }).parse(await body())
+      return projects.recordProgress(params.id, params.taskId, input, { actorId: null, source: 'request', messageId })
+    },
+    'POST projects/:id/tasks/:taskId/tracking': async ({ params, body }) => {
+      if (!host?.projectTracking) throw new ProjectError(409, '进展跟进服务尚未启动。')
+      const { messageId, focus } = z.strictObject({ messageId: ticketId, focus: z.string().trim().max(2000).optional() }).parse(await body())
+      return host.projectTracking.request({ projectId: params.id, actorId: null, messageId,
+        channel: { source: 'request', thread: params.id, address: {} } }, params.taskId, focus)
+    },
     'POST projects/:id/tasks/:taskId/reviews/:reviewId': async ({ params, body }) => {
       if (!host?.projectReviews) throw new ProjectError(409, '验收服务尚未启动。')
       const value = z.strictObject({ messageId: ticketId, outcome: z.enum(['accepted', 'rejected']), reason: z.string().trim().min(1).max(8000) }).parse(await body())
@@ -247,9 +259,15 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     'GET projects/:id/history': ({ params, query }) => {
       projects.detail(params.id)
       if (!host?.projectHistory) throw new ProjectError(409, 'Project history is unavailable')
-      const { before } = z.strictObject({ before: z.coerce.number().int().positive().optional() }).parse(query)
-      return host.projectHistory.view(params.id, before)
+      const { before, taskId, activityOnly } = z.strictObject({ before: z.coerce.number().int().positive().optional(), taskId: ticketId.optional(),
+        activityOnly: z.enum(['true', 'false']).optional() }).parse(query)
+      return host.projectHistory.view(params.id, before, { taskId, activityOnly: activityOnly === 'true' })
     },
+    'GET projects/:id/history/statistics': ({ params }) => {
+      if (!host?.projectHistory) throw new ProjectError(409, 'Project history is unavailable')
+      return host.projectHistory.statistics(params.id)
+    },
+    'GET projects/workspace/storage': () => { runtime(); return databaseStorage(store.db) },
     'POST projects/:id/synchronization/:operationId/retry': ({ params }) => {
       projects.detail(params.id)
       const operation = store.get(KV.projects.issueSync(params.operationId))
@@ -267,8 +285,11 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
       const update = z.strictObject({ revision: z.number().int().nonnegative(), config: z.unknown() }).parse(await body())
       return events().saveSource(params.source, update.revision, update.config)
     },
-    'GET projects/events': ({ query }) => events().list(z.strictObject({ projectId: ticketId.optional(),
-      limit: z.coerce.number().int().min(1).max(200).optional() }).parse(query)),
+    'GET projects/events': ({ query }) => {
+      const { workspaceOnly, ...options } = z.strictObject({ projectId: ticketId.optional(), workspaceOnly: z.enum(['true', 'false']).optional(),
+        limit: z.coerce.number().int().min(1).max(200).optional() }).parse(query)
+      return events().list({ ...options, workspaceOnly: workspaceOnly === 'true' })
+    },
     'GET projects': () => projects.list(),
     'POST projects': async ({ body }) => projects.create(ProjectInput.parse(await body())),
     'GET projects/issue': ({ query }) => runtime().projectIssue(z.string().trim().min(1).max(512).parse(query.url),

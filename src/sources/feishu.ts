@@ -332,11 +332,15 @@ const gone = (error: unknown): boolean => error instanceof CliError && error.cod
   || /withdrawn/i.test(error.message) || (Math.floor(error.code / 100) === 2300 && /not found/i.test(error.message)))
 /** Replies in the topic of the target message; Feishu keeps at most one reply per idempotency key (the outgoing message's `message.id`). */
 export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
-  const messageId = message.channel.address.messageId
-  if (!messageId) throw new Error('Missing Feishu reply target')
+  const { messageId, chatId, mentionUserId } = message.channel.address
   const text = checkedImText(message.text)
-  const reply = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text, '--reply-in-thread', '--idempotency-key', message.id]
-  try { await host.commands.lark(reply) }
+  let args: string[]
+  if (messageId) args = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text, '--reply-in-thread']
+  else if (message.kind === 'notice' && /^oc_[\w-]+$/.test(chatId ?? '') && /^ou_[\w-]+$/.test(mentionUserId ?? '')) {
+    const content = `<at user_id="${mentionUserId}"></at> ${text.replaceAll('<', '＜')}`
+    args = ['im', '+messages-send', '--chat-id', chatId!, '--msg-type', 'text', '--content', JSON.stringify({ text: content })]
+  } else throw new Error('Missing Feishu message target')
+  try { await host.commands.lark([...args, '--idempotency-key', message.id]) }
   catch (error) {
     if (gone(error)) return 'gone'
     throw error

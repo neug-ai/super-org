@@ -16,6 +16,7 @@ export interface EffectPayloads {
   'message-compose': { id: string }
   'project-events': Record<string, never>
   'project-agent': { runId: string }
+  'project-tracking': Record<string, never>
   'project-plan': ProjectPlanRequest
   'project-issue': ProjectIssueRequest
   'project-issue-intent': ProjectActionMessage

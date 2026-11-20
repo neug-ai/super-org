@@ -13,6 +13,7 @@ import type { ProjectAgentRun } from './app/project-agent.ts'
 import type { ComposedNotice, ConversationPreference } from './app/communication.ts'
 import type { ProjectBlockage } from './app/events/task-blocked.ts'
 import type { ProjectCheck } from './app/project-progress.ts'
+import type { TrackingCursor, TrackingReminder } from './app/project-tracking.ts'
 import type { RepositoryFact } from './sources/repository-events.ts'
 import type { IssueSync } from './app/project-repository.ts'
 import type { AgentSessionRef } from './app/session-binding.ts'
@@ -56,6 +57,9 @@ export const KV = {
     blockage: family<ProjectBlockage>('project-blockage:'),
     readiness: family<{ signature: string; episode: string }>('project-readiness:'),
     check: family<ProjectCheck>('project-check:'),
+    trackingClock: family<TrackingCursor>('tracking-clock:'),
+    trackingLast: family<string>('tracking-last:'),
+    trackingReminder: family<TrackingReminder>('tracking-reminder:'),
     remoteFact: family<RepositoryFact & { projectId: string; taskId: string }>('project-remote-fact:'),
     feedback: family<import('./sources/repository-events.ts').RepositoryFeedback & { source: string; eventId: string; projectId: string; taskId: string }>('project-feedback:'),
     issueSync: family<IssueSync>('project-issue-sync:'),

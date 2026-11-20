@@ -221,8 +221,16 @@ it('plans work in the existing database and reads linked GitHub tickets without 
     html_url: legacy, created_at: '2026-11-16T00:00:00Z', user: { login: 'alice', type: 'User' } }, 'agent-bot'))
   const detail = await h.api('GET', path)
   expect(detail.body.issueUrl).toBe(legacy)
-  expect(detail.body.tickets).toEqual([expect.objectContaining({ id: ticket.id, issueUrl: upstream.issueUrl })])
+  expect(detail.body.tickets).toEqual([])
+  expect((await h.api('GET', 'projects/recent-tickets')).body).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: ticket.id, issueUrl: upstream.issueUrl }),
+    expect.objectContaining({ issueUrl: legacy }),
+  ]))
   expect(detail.body.tasks).toEqual(project.tasks)
+  await apply({ kind: 'task-ticket', id: upstream.id, ticketId: ticket.id })
+  expect(project.tickets).toEqual([expect.objectContaining({ id: ticket.id, issueUrl: upstream.issueUrl })])
+  expect(project.tasks.find(task => task.id === upstream.id)?.ticketId).toBe(ticket.id)
+  await apply({ kind: 'task-ticket', id: upstream.id, ticketId: null })
   expect(await h.api('POST', `${path}/tasks/${upstream.id}/deliveries`, { messageId: 'upstream-evidence', summary: 'Collected evidence with the supporting sample' })).toMatchObject({ status: 200 })
   await h.runtime.idle()
   project = await decideCurrent(h, project.id, upstream.id)

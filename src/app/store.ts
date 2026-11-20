@@ -14,7 +14,7 @@ import { initializeProjectConversationSearch, PROJECT_CONVERSATION_INDEXES, refr
 /** A Trigger's position on its thread timeline, ordered by timestamp and then `id` as tie-breaker. */
 export interface TimelinePlace { at: string; id: string }
 /** Why a message was dropped: its conversation can never receive it (`channelGone`), or its Source no longer listens to it (`channelIgnored`). */
-export type DropReason = 'channelGone' | 'channelIgnored'
+export type DropReason = 'channelGone' | 'channelIgnored' | 'obsolete'
 /** Outbound message receipt tracked in the outbox from the moment it is queued (`pending`, `sent`, or `dropped`); delivery attempt counts live on its `reply` effect. */
 export interface Receipt extends OutboundMessage { status: ReplyStatus; dropped?: { at: string; reason: DropReason } }
 /** A dropped outbound message receipt, with the timestamp and reason it was dropped. */
@@ -84,6 +84,9 @@ export class Store implements Repositories {
             CREATE TABLE IF NOT EXISTS project_event (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
               value TEXT NOT NULL, recorded_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS project_event_pending ON project_event(seq) WHERE status='pending';
+            CREATE INDEX IF NOT EXISTS project_event_project_seq ON project_event((value ->> '$.projectId'), seq);
+            CREATE INDEX IF NOT EXISTS project_event_project_time ON project_event((value ->> '$.projectId'), recorded_at);
+            CREATE INDEX IF NOT EXISTS outbox_project ON outbox((value ->> '$.origin.projectId'));
             CREATE INDEX IF NOT EXISTS trigger_at ON trigger(at);
             CREATE INDEX IF NOT EXISTS trigger_thread_at ON trigger_thread(thread, at);
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);
@@ -282,6 +285,8 @@ export class Store implements Repositories {
   /** Outbox message receipts for channel delivery; only `Outbox` writes to `receipts`. */
   readonly receipts = {
     get: (id: string): Receipt | undefined => this.values<Receipt>('SELECT value FROM outbox WHERE id = ?', id)[0],
+    failure: (id: string): string | undefined => this.db.prepare("SELECT error FROM effect WHERE kind = 'reply' AND key = ? AND attempts > 0")
+      .get(id)?.error as string | undefined,
     correlated: (id: string): Receipt | undefined => this.values<Receipt>("SELECT value FROM outbox WHERE value ->> '$.correlation' = ? ORDER BY rowid DESC LIMIT 1", id)[0],
     /** Explicit origin correlation keeps project audit independent of conversation sharing and message-ID conventions. */
     forProject: (projectId: string): Receipt[] => this.values("SELECT value FROM outbox WHERE value ->> '$.origin.projectId' = ? ORDER BY rowid DESC LIMIT 100", projectId),

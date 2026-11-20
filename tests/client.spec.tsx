@@ -105,6 +105,11 @@ it('opens one project section at a time and saves an internal task without an is
       connections: { github: { state: 'paused', detail: 'Off', code: 'sourceOff' } },
       agent: { main: 'running', load: { running: 2, queued: 1, maxWorkers: 4 } } }
     if (route === 'GET projects/agents') return { ...agents }
+    if (route === 'GET projects/recent-tickets') return [{ ...project.tickets[0], id: 'external-run', title: 'Standalone ticket' }]
+    if (route === 'GET projects/events') return [{ seq: 1, type: 'workspace.event.test', source: 'test',
+      status: 'applied', recordedAt: '2026-11-16T00:00:00Z', data: {} }]
+    if (route === 'GET projects/workspace/storage') return { databaseBytes: 1024, walBytes: 512, reusableBytes: 0,
+      diskAvailableBytes: 1024 ** 3, diskLow: false, walLarge: false }
     if (route === 'GET projects/:id/conversation') return [{ id: 'turn-1', at: '2026-11-16T00:00:00Z',
       status: 'completed', text: 'What did we decide about the rollout?', reply: 'Start with the pilot group.' }]
     if (route === 'POST projects/:id/changes') {
@@ -147,11 +152,24 @@ it('opens one project section at a time and saves an internal task without an is
     expect(content()).not.toContain('acme/research')
     expect(content()).not.toContain(zh['project.needsHuman'])
     expect(content()).not.toContain(zh['project.connectionState.paused'])
+    await act(async () => { nav(zh['project.workspaceRecords']).click() })
+    expect(page.container.querySelector('.dt-work-sections')).toBeNull()
+    expect(page.container.querySelector('.dt-work-global')?.contains(nav(zh['project.workspaceRecords']))).toBe(true)
+    expect(content()).toContain('Standalone ticket')
+    const recordsTab = (key: 'events' | 'storage') => [...page.container.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+      .find(item => item.textContent === zh[`project.workspaceRecords.${key}`])!
+    await act(async () => { recordsTab('events').click() })
+    expect(call).toHaveBeenCalledWith('GET projects/events', { query: { workspaceOnly: true, limit: 50 } })
+    expect(content()).toContain('workspace.event.test')
+    await act(async () => { recordsTab('storage').click() })
+    expect(content()).toContain(zh['project.history.storageShared'])
+    expect(content()).toContain('1 KiB')
     await act(async () => { page.container.querySelector<HTMLButtonElement>('.dt-work-nav-item')!.click() })
     expect(content()).toContain('Use the latest stable commit.')
     await act(async () => { nav(zh['project.tickets']).click() })
     expect(content()).toContain(zh['project.needsHuman'])
     expect(content()).toContain('Awaiting approval')
+    expect(content()).not.toContain('Standalone ticket')
     await act(async () => { nav(zh['project.tasks']).click() })
     expect(content()).toContain('acme/research')
     const add = [...page.container.querySelectorAll('button')].find(button => button.textContent === zh['project.addTask'])!
@@ -164,6 +182,51 @@ it('opens one project section at a time and saves an internal task without an is
       change: expect.objectContaining({ value: expect.objectContaining({ title: 'Meeting follow-up', issueUrl: null }) }),
     }) }))
     expect(document.querySelector('[role="dialog"]')?.textContent).toContain(zh['project.noIssue'])
+  } finally { page.dispose() }
+})
+
+it('saves automatic checks in project settings and records progress from a waiting task', async () => {
+  const task: ProjectTask = { id: 'task', title: '试玩准备', status: 'todo', priority: 'do', description: '', ownerId: null,
+    milestoneId: null, blockedBy: [], dueDate: null, acceptance: '', ticketId: null, issueUrl: null, createdAt: '', updatedAt: '', completedAt: null }
+  const project: ProjectDetail = { id: 'project', name: 'Tracking', status: 'active', objective: '', description: '',
+    revision: 1, createdAt: '', updatedAt: '', issueUrl: null, memberIds: [], members: [], tasks: [task], milestones: [], decisions: [], tickets: [] }
+  const call = vi.fn(async (route: string, request?: { body: Record<string, unknown> }) => {
+    if (route === 'GET projects') return [project]
+    if (route === 'GET members') return []
+    if (route === 'GET projects/agents') return null
+    if (route === 'GET projects/execution') return { state: 'ready', planner: 'Codex' }
+    if (route === 'POST projects/:id/tasks/:taskId/progress') {
+      task.progress = [{ ...request!.body, id: 'entry', summary: String(request!.body.summary), links: [],
+        messageId: 'web-1', author: '本地操作者', actorId: null, source: 'request', at: '2026-11-19T08:00:00Z' }]
+      return task.progress[0]
+    }
+    return project
+  })
+  const page = await render({ options: { name: 'tracking' }, component: () => <ProjectsPage t={t} call={call as unknown as Call} /> }, {})
+  const button = (label: string) => [...document.querySelectorAll('button')].find(button => button.textContent === label)!
+  const form = () => document.querySelector<HTMLFormElement>('[role="dialog"] form')!
+  try {
+    await act(async () => { button(zh['project.settings']).click() })
+    expect(form()).toBeNull()
+    const settings = page.container.querySelector<HTMLFormElement>('[aria-label="项目设置"] form')!
+    const toggle = settings.querySelector<HTMLInputElement>('[name="tracking"]')!
+    expect(toggle.checked).toBe(false)
+    await act(async () => { toggle.click() })
+    settings.querySelector<HTMLInputElement>('[name="trackingZone"]')!.value = 'Asia/Shanghai'
+    settings.querySelector<HTMLInputElement>('[name="trackingTimes"]')!.value = '10:30, 16:30'
+    await act(async () => { settings.requestSubmit() })
+    expect(call).toHaveBeenCalledWith('POST projects/:id/changes', expect.objectContaining({ body: { revision: 1,
+      change: { kind: 'project', value: expect.objectContaining({ autoAdvance: false,
+        tracking: { timeZone: 'Asia/Shanghai', times: ['10:30', '16:30'], workHours: { start: '09:00', end: '18:00' } } }) } } }))
+    expect(settings.textContent).toContain(zh['project.settings.saved'])
+    await act(async () => { button(zh['project.tasks']).click() })
+    await act(async () => { page.container.querySelector<HTMLButtonElement>('.dt-kanban-task')!.click() })
+    await act(async () => { button(zh['project.tracking.record']).click() })
+    form().querySelector<HTMLTextAreaElement>('[name="summary"]')!.value = '已准备触屏用例'
+    await act(async () => { form().requestSubmit() })
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('已准备触屏用例')
+    expect(call).toHaveBeenCalledWith('POST projects/:id/tasks/:taskId/progress', expect.objectContaining({ taskId: task.id,
+      body: expect.objectContaining({ summary: '已准备触屏用例' }) }))
   } finally { page.dispose() }
 })
 
@@ -324,24 +387,50 @@ it('tells a dsh-superagent that does not answer from a record it does not have, 
 })
 
 it('shows causal history and confirmed Agent results, retains sync failure, and retries the original operation', async () => {
-  const project = { id: 'history-project', tasks: [{ id: 'b', title: '实现 2048' }] } as ProjectDetail
+  const project = { id: 'history-project', tasks: [{ id: 'b', title: '实现 2048', ticketId: 'ticket' }], members: [],
+    tickets: [{ id: 'ticket', taskId: 'b', stage: 'person', action: 'answer', question: '请补充真机验证证据' }] } as unknown as ProjectDetail
   let retried = false
+  const openTask = vi.fn()
   const call = vi.fn(async (route: string, input: Record<string, unknown>) => {
     if (route.startsWith('POST')) { expect(input).toEqual({ id: project.id, operationId: 'close-1' }); retried = true; return { status: 'queued' } }
+    if (route.endsWith('/statistics')) return { recent: { count: 7, payloadBytes: 24_576 }, totalEvents: 10, types: [],
+      receipts: { total: 2, pending: 1 } }
     return { entries: [{ event: { seq: 12, type: 'project.changed', source: 'history', status: 'applied', recordedAt: '2026-11-18T04:00:00Z',
       causeId: 'message-1', data: { tasks: ['b'] } }, label: '项目变更已提交', reason: '已保存真实修改', decisions: [{ id: 'run-1', status: 'completed',
       reply: '已保存交付要求。', steps: [{ provider: 'Codex', calls: [{ tool: 'task.update' }], results: [{ summary: '已更新原任务' }] }] }] }], next: null,
       notifications: [{ id: 'notice-1', origin: { projectId: project.id, eventId: 'message-1' }, source: 'dingtalk', format: 'markdown', status: 'sent', text: '已发送真实结果' }], remote: [], checks: [], synchronization: [{ id: 'close-1', taskId: 'b', url: 'https://github.com/acme/widgets/issues/1', status: retried ? 'pending' : 'failed',
         reason: retried ? '已登记重新核对' : 'GitHub 权限不足', attempts: 1, updatedAt: '2026-11-18T04:00:00Z' }] }
   }) as unknown as Call
-  const page = await render({ options: { name: 'History' }, component: () => <ProjectHistory call={call} t={t} project={project} /> }, {})
+  const page = await render({ options: { name: 'History' }, component: () => <ProjectHistory call={call} t={t} project={project} openTask={openTask} /> }, {})
+  const clickLabel = async (label: string, selector = 'button') => {
+    const element = [...page.container.querySelectorAll<HTMLElement>(selector)].find(item => item.textContent?.trim() === label)!
+    expect(element).toBeDefined()
+    await act(async () => { element.click() })
+  }
   try {
+    expect(page.container.querySelector('[aria-label="当前需要关注"]')).not.toBeNull()
+    expect(page.container.querySelector('.dt-history-event[aria-pressed="true"]')?.textContent).toContain('项目变更已提交')
+    expect(page.container.querySelector('article')?.textContent).toContain('已保存交付要求。')
+    expect(page.container.querySelector('article')?.textContent).toContain('已更新原任务')
+    expect(page.container.querySelector('details[open]')).toBeNull()
+    await clickLabel(zh['project.eventEvidence'], 'summary')
+    expect(page.container.querySelector('pre')?.textContent).toContain('b')
+
+    await clickLabel(zh['project.history.view.work'], '[role="tab"]')
+    expect(page.container.textContent).toContain('请补充真机验证证据')
+    await clickLabel(zh['project.history.openTask'])
+    expect(openTask).toHaveBeenCalledWith(project.tasks[0])
+
+    await clickLabel(zh['project.history.view.notifications'], '[role="tab"]')
     expect(page.container.textContent).toContain('已发送真实结果')
     expect(page.container.textContent).toContain('接口已接受')
+
+    await clickLabel(zh['project.history.view.statistics'], '[role="tab"]')
+    expect(page.container.textContent).toContain('24 KiB')
+    expect(page.container.textContent).not.toContain(zh['project.history.storageShared'])
+
+    await clickLabel(zh['project.history.view.repository'], '[role="tab"]')
     expect(page.container.textContent).toContain('GitHub 权限不足')
-    expect(page.container.textContent).toContain('已保存交付要求。')
-    expect(page.container.textContent).toContain('已更新原任务')
-    expect(page.container.querySelector('pre')?.textContent).toContain('b')
     const retry = [...page.container.querySelectorAll('button')].find(button => button.textContent === zh['project.retrySync'])!
     await act(async () => { retry.click() })
     expect(retried).toBe(true)
