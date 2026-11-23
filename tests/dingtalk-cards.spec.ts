@@ -59,7 +59,7 @@ it('delivers an unthreaded project notice to the group when cards are enabled', 
     'https://api.dingtalk.com/v1.0/robot/groupMessages/send',
   ])
 })
-it.each([true, false])('mentions the reviewer through a group route with a live webhook: %s', async active => {
+it.each([true, false])('uses a native mention only while the group webhook is active: %s', async active => {
   const route = dingTalkTrigger(raw, context)!.route
   context.state.set(dingTalkRoute(route.conversationId), { ...route, expires: active ? Date.now() + 60_000 : 0 })
   const request = vi.fn(async (url: string | URL, _options: RequestInit) => new Response(JSON.stringify(
@@ -73,9 +73,10 @@ it.each([true, false])('mentions the reviewer through a group route with a live 
   expect(String(url)).toBe(active ? route.webhook : 'https://api.dingtalk.com/v1.0/robot/groupMessages/send')
   const body = JSON.parse(String(options.body))
   if (active) expect(body).toEqual({ msgtype: 'text', text: { content: '@reviewer 任务待验收' }, at: { atUserIds: ['reviewer'] } })
-  else expect(body).toMatchObject({ openConversationId: 'group', atUserIds: ['reviewer'], msgParam: JSON.stringify({ content: '@reviewer 任务待验收' }) })
+  else expect(body).toEqual({ robotCode: route.robotCode, openConversationId: 'group', msgKey: 'sampleText',
+    msgParam: JSON.stringify({ content: '任务待验收' }) })
 })
-it.each([true, false])('sends actual Markdown through both DingTalk transports while retaining mention metadata: %s', async active => {
+it.each([true, false])('sends Markdown with a native mention or a readable recipient name: %s', async active => {
   const route = dingTalkTrigger(raw, context)!.route
   context.state.set(dingTalkRoute(route.conversationId), { ...route, expires: active ? Date.now() + 60_000 : 0 })
   const request = vi.fn(async (_url: unknown, _options?: RequestInit) => Response.json(
@@ -83,12 +84,36 @@ it.each([true, false])('sends actual Markdown through both DingTalk transports w
   ))
   const bot = new DingTalk(context, { clientId: 'client', clientSecret: 'secret' }, () => {}, request as typeof fetch)
   await bot.send({ id: 'markdown', kind: 'notice', format: 'markdown', title: '执行受阻', text: '**需要处理**：核对环境',
-    channel: { source: 'dingtalk', thread: 'dingtalk:group', address: { conversationId: 'group', mentionUserId: 'reviewer' } } })
+    channel: { source: 'dingtalk', thread: 'dingtalk:group', address: { conversationId: 'group', mentionUserId: 'reviewer', mentionUserName: 'Reviewer' } } })
   const body = JSON.parse(String(request.mock.calls[1]![1]!.body))
   if (active) expect(body).toEqual({ msgtype: 'markdown', markdown: { title: '执行受阻', text: '@reviewer **需要处理**：核对环境' }, at: { atUserIds: ['reviewer'] } })
-  else expect(body).toMatchObject({ msgKey: 'sampleMarkdown', atUserIds: ['reviewer'], msgParam: JSON.stringify({ title: '执行受阻', text: '@reviewer **需要处理**：核对环境' }) })
+  else expect(body).toEqual({ robotCode: route.robotCode, openConversationId: 'group', msgKey: 'sampleMarkdown',
+    msgParam: JSON.stringify({ title: '执行受阻', text: '请 Reviewer 查看\n\n**需要处理**：核对环境' }) })
   expect(dingTalkKind(async () => {}).channel!.deliveryInfo?.(context, { source: 'dingtalk', thread: 'dingtalk:group', address: { conversationId: 'group' } }))
     .toMatchObject({ format: 'markdown', transport: active ? 'session-webhook' : 'application-group-api', messageType: active ? 'markdown' : 'sampleMarkdown' })
+})
+it.each([true, false])('sends a standalone native mention and checks the group delivery result: %s', async accepted => {
+  const route = dingTalkTrigger(raw, context)!.route
+  context.state.set(dingTalkRoute(route.conversationId), { ...route, expires: 0 })
+  const request = vi.fn(async (url: string, _init?: RequestInit) => Response.json(
+    url.endsWith('/accessToken') ? { accessToken: 'token' }
+      : { success: true, result: { deliverResults: [{ spaceId: 'group', success: accepted }] } },
+  ))
+  const bot = new DingTalk(context, { clientId: 'client', clientSecret: 'secret' }, () => {}, request as typeof fetch, 'template.schema')
+  const notice: OutboundMessage = { id: 'reminder', kind: 'notice', text: '请更新任务进度',
+    channel: { source: 'dingtalk', thread: 'dingtalk:group', address: {
+      conversationId: 'group', mentionUserId: 'reviewer', mentionUserName: 'Reviewer',
+    } } }
+  if (accepted) await bot.send(notice)
+  else await expect(bot.send(notice)).rejects.toThrow('DingTalk did not accept the mention card')
+  const [url, init] = request.mock.calls[1]!
+  expect(url).toBe('https://api.dingtalk.com/v1.0/card/instances/createAndDeliver')
+  expect(JSON.parse(String(init?.body))).toMatchObject({ openSpaceId: 'dtv1.card//IM_GROUP.group',
+    imGroupOpenDeliverModel: { robotCode: route.robotCode, atUserIds: { reviewer: 'Reviewer' } },
+    cardData: { cardParamMap: { markdown: notice.text, flowStatus: '3' } } })
+  const info = dingTalkKind(async () => {}).channel!.deliveryInfo?.(context, notice.channel)
+  if (accepted) expect(info).toMatchObject({ transport: 'ai-card' })
+  else expect(info).toBeUndefined()
 })
 it.each([
   { source: 'dingtalk', eventLabel: 'GitHub Main CI', label: 'GitHub Main CI' },

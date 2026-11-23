@@ -143,9 +143,9 @@ Agent 的每轮项目快照包含当前会话偏好和真实运行能力。`runt
 
 ## 钉钉呈现
 
-钉钉有两种发送路径，均按 format 选择真正的消息类型：有效会话 Webhook 使用 markdown 的 title/text；过期后应用群发送使用 sampleMarkdown 的 JSON 字符串参数。真实 @ 的正文与人员字段同时保留，不能以正文含星号作为已启用 Markdown 的证据。
+有效会话 Webhook 按消息格式发送文本或 Markdown，并用正文标记和 `at.atUserIds` 触发原生 @。会话 Webhook 不可用时，需要 @ 成员的主动通知会使用已配置的卡片模板，通过群投放接口提交成员 ID 和姓名。未配置卡片模板时，应用群发接口发送普通文本或 Markdown，并在有姓名时把它写入正文。这一路径仅显示收件人姓名。
 
-参考：[钉钉机器人消息类型](https://open.dingtalk.com/document/orgapp/types-of-messages-sent-by-robots)、[自定义机器人接入](https://open.dingtalk.com/document/robots/custom-robot-access)、[DingTalk Channel SDK 契约](https://github.com/DingTalk-Real-AI/dingtalk-channel-sdk-python/blob/main/SPEC.zh-CN.md)。发送接口接受不代表所有客户端视觉效果已经人工核验，仍需在实际群观察标题、加粗和 @。
+在实际群中验收标题、加粗和 @ 的呈现。 [卡片配置](../../cards/README.md) [应用群发接口](https://dingtalk.apifox.cn/api-140274320) [钉钉卡片投放接口](https://open.dingtalk.com/document/orgapp/create-and-deliver-cards)
 
 ## 本机管理接口
 

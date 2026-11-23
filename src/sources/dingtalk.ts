@@ -382,10 +382,9 @@ export class DingTalk {
     const heading = [message.ticketId ? label(message.ticketId) : '', eventLabel ?? ''].filter(Boolean).join(' · ')
     const mention = message.channel.address.mentionUserId
     const body = heading ? `${heading}${eventLabel ? '\n' : ' '}${message.text}` : message.text
-    const text = mention ? `@${mention} ${body}` : body
     const markdown = message.format === 'markdown'
     const title = message.title ?? '项目更新'
-    if (text.length > 4000) throw new Error('DingTalk result exceeds 4000 characters; provide a brief result and a link')
+    if (body.length > 4000) throw new Error('DingTalk result exceeds 4000 characters; provide a brief result and a link')
     // Project lifecycle notices are sent to the group without threading them under an old request card.
     if (this.cards && (message.kind !== 'notice' || message.channel.address.triggerId || message.channel.address.cardId || message.ticketId)) {
       await this.cards.send(message)
@@ -394,15 +393,26 @@ export class DingTalk {
     }
     const url = route ? new URL(route.webhook) : undefined
     if (url && (url.protocol !== 'https:' || url.hostname !== 'oapi.dingtalk.com')) throw new Error('Invalid DingTalk session webhook')
-    const token = await this.accessToken()
     // A long coding task can outlive the session webhook. Use the application group-send API after expiry.
     const active = !!route && route.expires > Date.now() + 5000
+    const mentionName = message.channel.address.mentionUserName
+    if (!active && mention && mentionName && this.cards) {
+      await this.cards.sendMentionNotice(message.id, {
+        conversationId: conversation, robotCode: route?.robotCode ?? this.credentials.clientId, userId: mention, name: mentionName,
+      }, { title, text: body })
+      this.context.state.set(deliveries(conversation), { messageId: message.id, format: 'markdown', transport: 'ai-card', messageType: 'card', at: new Date().toISOString() })
+      return
+    }
+    // The application group-send API does not render mentions. Display the recipient's name as ordinary text.
+    const text = active && mention ? `@${mention} ${body}` : mention && mentionName ? `请 ${mentionName} 查看\n\n${body}` : body
+    if (text.length > 4000) throw new Error('DingTalk result exceeds 4000 characters; provide a brief result and a link')
+    const token = await this.accessToken()
     const response = await this.http(active ? url! : 'https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-acs-dingtalk-access-token': token },
       signal: AbortSignal.timeout(15000), body: JSON.stringify(active
         ? { ...(markdown ? { msgtype: 'markdown', markdown: { title, text } } : { msgtype: 'text', text: { content: text } }), ...(mention && { at: { atUserIds: [mention] } }) }
         : { robotCode: route?.robotCode ?? this.credentials.clientId, openConversationId: conversation,
-          msgKey: markdown ? 'sampleMarkdown' : 'sampleText', msgParam: JSON.stringify(markdown ? { title, text } : { content: text }), ...(mention && { atUserIds: [mention] }) }),
+          msgKey: markdown ? 'sampleMarkdown' : 'sampleText', msgParam: JSON.stringify(markdown ? { title, text } : { content: text }) }),
     })
     const data = await response.json() as { errcode?: number; code?: string; processQueryKey?: string }
     if (!response.ok || (active ? data.errcode !== 0 : !!data.code || !data.processQueryKey)) {
