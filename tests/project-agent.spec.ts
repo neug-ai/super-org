@@ -418,6 +418,71 @@ it('loads older web project conversation only through the history tools', async 
   }).data).toBeNull()
 })
 
+it('reads a quoted DingTalk attachment in a separate read-only step and replies once', async () => {
+  const { h, projects, id, propose } = await pilot()
+  const send = vi.fn()
+  const kind = dingTalkKind(async message => { send(message) })
+  h.runtime.sources.register(kind)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } } })
+  let receive!: (frame: { headers: { messageId: string }; data: string }) => Promise<void>
+  const callback = vi.spyOn(DWClient.prototype, 'registerCallbackListener').mockImplementation(function (this: DWClient, _topic, fn) {
+    receive = fn as typeof receive; return this
+  })
+  const ack = vi.spyOn(DWClient.prototype, 'socketCallBackResponse').mockImplementation(() => {})
+  const fetchFile = vi.fn(async (url: URL | string, init?: RequestInit) => {
+    if (String(url).endsWith('/accessToken')) return Response.json({ accessToken: 'auth-token' })
+    if (String(url).endsWith('/messageFiles/download')) {
+      const request = JSON.parse(String(init?.body))
+      if (request.downloadCode === 'expired-code') return Response.json({ code: 'invalidParameter.robotCode.downloadCode' }, { status: 400 })
+      expect(request).toEqual({ robotCode: 'robot', downloadCode: 'temporary-file-secret' })
+      return Response.json({ downloadUrl: 'https://files.dingtalk.com/handout' })
+    }
+    expect(String(url)).toBe('https://files.dingtalk.com/handout')
+    expect(init?.headers).toBeUndefined()
+    return new Response('<script>malicious script</script><h1>Slide handout</h1><p>Execution evidence by section.</p>')
+  })
+  try {
+    const agent = h.runtime.projectAgent!
+    const bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, fetchFile as typeof fetch,
+      undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, agent))
+    agent.registerAttachmentReader('dingtalk', (message, attachment, signal) => bot.readProjectAttachment(message, attachment, signal))
+    const post = async (msgId: string, options: { sender?: string; name?: string; code?: string } = {}) => {
+      await receive({ headers: { messageId: msgId }, data: JSON.stringify({ msgId, senderStaffId: options.sender ?? 'member', conversationId: 'test-group',
+        conversationType: '2', isInAtList: true, senderCorpId: 'test-corp', robotCode: 'robot', msgtype: 'text',
+        text: { content: '请看看这份材料', isReplyMsg: true, repliedMsg: { msgId: 'original-file-not-stored', msgType: 'file',
+          content: { fileId: 'attachment-one', fileName: options.name ?? 'handout.html', downloadCode: options.code ?? 'temporary-file-secret' } } },
+        sessionWebhook: 'https://oapi.dingtalk.com/robot/send?fixture', sessionWebhookExpiredTime: Date.now() + 60_000 }) })
+      await h.runtime.idle()
+      return agent.runs(id).find(run => run.message.nativeMessageId === msgId)
+    }
+    propose.mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('Execution evidence by section')
+      expect(prompt).not.toMatch(/malicious script|temporary-file-secret/)
+      return { summary: '材料按章节列出了执行证据。' }
+    }).mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('handout.html')
+      expect(prompt).not.toContain('Execution evidence by section')
+      return done('收到分享。')
+    })
+    const run = (await post('quote-file'))!
+    expect(run.reply).toContain('已读取「handout.html」')
+    expect(run.reply).toContain('按章节列出了执行证据')
+    expect(JSON.stringify(run)).not.toContain('temporary-file-secret')
+    await post('quote-file')
+    expect(send.mock.calls.filter(([message]) => message.text === run.reply)).toHaveLength(1)
+    expect(fetchFile).toHaveBeenCalledTimes(3)
+    await post('outsider-file', { sender: 'outsider' })
+    expect(fetchFile).toHaveBeenCalledTimes(3)
+    const unsupported = await post('unsupported-file', { name: 'attachment.zip' })
+    expect(unsupported?.reply).toContain('当前不支持这个文件格式')
+    expect(fetchFile).toHaveBeenCalledTimes(3)
+    const expired = await post('expired-file', { code: 'expired-code' })
+    expect(expired?.reply).toContain('钉钉附件下载码无效或已过期')
+    expect(fetchFile).toHaveBeenCalledTimes(4)
+  } finally { callback.mockRestore(); ack.mockRestore() }
+})
+
 it('routes a bound Feishu project conversation and retrieves a retained message by native reference', async () => {
   const { h, projects, propose } = await pilot()
   const project = projects.create(ProjectInput.parse({ name: 'Feishu project', feishuChatId: CHAT }))

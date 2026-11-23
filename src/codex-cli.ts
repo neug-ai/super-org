@@ -258,6 +258,7 @@ async function main(): Promise<void> {
       // Construct the transport before startup recovery can submit a worker delivery.
       robot = new DingTalk(runtime.context(kind), { clientId, clientSecret }, log, fetch,
         process.env.DINGTALK_CARD_TEMPLATE_ID, process.env.DINGTALK_ROBOT_NAME, intake)
+      runtime.projectAgent?.registerAttachmentReader(kind.kind, (message, attachment, signal) => robot!.readProjectAttachment(message, attachment, signal))
     }
     await runtime.ready
     if (!runtime.configured()) throw new Error(`Setup: ${runtime.setupProblem?.detail ?? 'not configured'}`)
