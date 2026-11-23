@@ -41,7 +41,7 @@ it('uses the real worker completion event to transition and notify once without 
     { type: 'delivery.ready', source: 'execution', status: 'applied', data: { ticketId } },
   ])
   expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ text: expect.stringContaining('待验收'),
-    channel: expect.objectContaining({ address: { conversationId: 'project-group', mentionUserId: 'reviewer' } }) }))
+    channel: expect.objectContaining({ address: { conversationId: 'project-group', mentionUserId: 'reviewer', mentionUserName: 'Reviewer' } }) }))
   h.runtime.deliveryReady.observe(ticketId)
   await h.runtime.idle()
   expect(send).toHaveBeenCalledOnce()

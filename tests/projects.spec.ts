@@ -542,7 +542,7 @@ it('plans a fresh discussion, notifies the reviewer after a successful run and a
   expect(projects.detail(id)).toMatchObject({ tasks: [{ status: 'in-review' }, { status: 'todo' }, { status: 'todo' }],
     tickets: [{ taskId: design!.id, ended: true }] })
   expect(send).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'notice',
-    channel: expect.objectContaining({ address: { conversationId: 'test-group', mentionUserId: 'group-reviewer' } }),
+    channel: expect.objectContaining({ address: { conversationId: 'test-group', mentionUserId: 'group-reviewer', mentionUserName: 'Reviewer' } }),
     text: expect.stringMatching(/Design[\s\S]*待验收[\s\S]*Reviewer/) }))
   await decideCurrent(h, id, design!.id)
   await h.runtime.pump()

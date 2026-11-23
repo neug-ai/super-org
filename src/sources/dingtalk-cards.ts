@@ -214,6 +214,42 @@ export class DingTalkCards {
     private readonly token: () => Promise<string>, private readonly http: typeof fetch = fetch,
     private readonly robotCode?: string, private readonly robotName = 'Super agent') {}
 
+  private async writeCard(body: object, update = false) {
+    const response = await this.http(`https://api.dingtalk.com/v1.0/card/instances${update ? '' : '/createAndDeliver'}`, {
+      method: update ? 'PUT' : 'POST', signal: AbortSignal.timeout(15000),
+      headers: { 'Content-Type': 'application/json', 'x-acs-dingtalk-access-token': await this.token() },
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) throw new Error(`DingTalk card delivery failed (HTTP ${response.status}); check template and card permissions`)
+    const payload = await response.json() as { code?: string; success?: boolean; result?: { deliverResults?: { success?: boolean }[] } }
+    if (payload.code || payload.success === false) throw new Error('DingTalk card delivery was rejected; check template and card permissions')
+    return payload
+  }
+
+  private createGroupCard(body: object, cardTemplateId: string, conversationId: string, robotCode?: string,
+    atUserIds?: Record<string, string>) {
+    return this.writeCard({
+      ...body, cardTemplateId, userIdType: 1,
+      openSpaceId: `dtv1.card//IM_GROUP.${conversationId}`,
+      imGroupOpenSpaceModel: { supportForward: false },
+      imGroupOpenDeliverModel: { robotCode, atUserIds },
+    })
+  }
+
+  /** Proactive notices have no inbound message to bind to a reply card. */
+  async sendMentionNotice(messageId: string, target: { conversationId: string; robotCode: string; userId: string; name: string },
+    content: { title: string; text: string }): Promise<void> {
+    const payload = await this.createGroupCard({
+      outTrackId: key('dingtalk-mention-notice', messageId),
+      cardData: { cardParamMap: { title: content.title, markdown: content.text, status: '完成', flowStatus: '3', replyHint: '' } },
+    }, this.templateId, target.conversationId, target.robotCode, { [target.userId]: target.name })
+    // The request names one delivery space. HTTP success alone does not confirm group delivery.
+    const results = payload.result?.deliverResults
+    if (!payload.success || results?.length !== 1 || !results[0]?.success) {
+      throw new Error('DingTalk did not accept the mention card for the project group')
+    }
+  }
+
   /** Called in the same transaction as intake; no model call or remote API delays the receive ACK. */
   received(trigger: Trigger): void {
     const conversation = trigger.channel!.address.conversationId!
@@ -298,18 +334,11 @@ export class DingTalkCards {
       replyHint: '---\n\n引用此卡片以回复消息。',
     }
     const body = { outTrackId: id, cardData: { cardParamMap: data } }
-    const response = await this.http(`https://api.dingtalk.com/v1.0/card/instances${card.sent ? '' : '/createAndDeliver'}`, {
-      method: card.sent ? 'PUT' : 'POST', signal: AbortSignal.timeout(15000),
-      headers: { 'Content-Type': 'application/json', 'x-acs-dingtalk-access-token': await this.token() },
-      body: JSON.stringify(card.sent ? { ...body, cardUpdateOptions: { updateCardDataByKey: true } } : {
-        ...body, cardTemplateId: card.templateId, userIdType: 1,
-        openSpaceId: `dtv1.card//IM_GROUP.${conversationId}`,
-        imGroupOpenSpaceModel: { supportForward: false }, imGroupOpenDeliverModel: { robotCode: origin.meta.robotCode ?? this.robotCode },
-      }),
-    })
-    if (!response.ok) throw new Error(`DingTalk card delivery failed (HTTP ${response.status}); check template and card permissions`)
-    const result = await response.json() as { code?: string }
-    if (result.code) throw new Error('DingTalk card delivery was rejected; check template and card permissions')
+    if (card.sent) await this.writeCard({ ...body, cardUpdateOptions: { updateCardDataByKey: true } }, true)
+    else {
+      const robotCode = typeof origin.meta.robotCode === 'string' ? origin.meta.robotCode : this.robotCode
+      await this.createGroupCard(body, card.templateId, conversationId, robotCode)
+    }
     // Intake/reply enqueue may have advanced this round while the HTTP request was in flight.
     // Preserve its newer bindings, completion state and cumulative GitHub snapshot.
     this.context.state.set(cards(id), { ...this.context.state.get(cards(id)) ?? card, sent: true })

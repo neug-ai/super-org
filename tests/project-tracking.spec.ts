@@ -179,7 +179,7 @@ it('uses a configurable project clock with zero inbound messages and reads subse
   await advance('10:01')
   runtime.projectTracking.recover(); runtime.projectTracking.recover(); await runtime.idle()
   expect(events('tracking.check.due')).toHaveLength(1)
-  expect(send()).toEqual([{ mentions: ['carol'], content: expect.stringContaining(question),
+  expect(send()).toEqual([{ mentions: undefined, content: expect.stringContaining(`请 丙 查看\n\n「${task.title}」`),
     url: 'https://api.dingtalk.com/v1.0/robot/groupMessages/send' }])
   await advance('10:20')
   const recorded = await h.api('POST', progressPath, { messageId: 'web-progress', summary: ready, links: ['https://example.test/cases'] })
@@ -230,7 +230,7 @@ it('can follow the missing upstream delivery when the downstream preparation is 
       reason: '试玩准备齐全，仍等上游的可运行版本。', evidenceRefs: [`review:${review.id}`] }] }
   })
   await advance('10:00')
-  expect(send()).toEqual([{ mentions: ['alice'], content: expect.stringContaining('试玩链接可以发给试用负责人了吗？'), url: expect.any(String) }])
+  expect(send()).toEqual([{ mentions: undefined, content: expect.stringContaining('试玩链接可以发给试用负责人了吗？'), url: expect.any(String) }])
   expect(events('tracking.check.resolved')[0]).toMatchObject({ taskId: upstream.id, data: { state: 'queued' } })
   assertions()
 })
@@ -263,7 +263,7 @@ it('checks the current blocker with the member named by the Worker and rejects t
     return suggest(task.id, owner('丙'), ref)
   })
   await advance('10:00')
-  expect(send()).toEqual([{ mentions: ['carol'], content: expect.stringContaining(question), url: expect.any(String) }])
+  expect(send()).toEqual([{ mentions: undefined, content: expect.stringContaining(question), url: expect.any(String) }])
   expect(detail().tasks[2]).toMatchObject({ status: 'in-progress', ownerId: owner('甲') })
 })
 

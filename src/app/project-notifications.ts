@@ -21,7 +21,10 @@ export function projectChannel(store: Store, project: Pick<ProjectDetail, 'id' |
     const origin = meeting && store.triggers.get(meeting.triggerId)
     const corpId = route?.corpId ?? (origin?.meta.conversationId === conversationId ? origin.meta.senderCorpId : undefined)
     const account = recipient.accounts.find(item => item.provider === 'dingtalk' && item.scope === corpId)
-    if (account) address.mentionUserId = account.accountId
+    if (account) {
+      address.mentionUserId = account.accountId
+      address.mentionUserName = recipient.name
+    }
   }
   return { source: 'dingtalk', thread: `dingtalk:${conversationId}`, address }
 }
