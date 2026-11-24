@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, expect, it, vi } from 'vitest'
@@ -19,20 +19,106 @@ afterEach(async () => { await host?.stop(); host = undefined; await cleanup?.();
 const done = (reply = '') => ({ calls: [], reply })
 const call = (tool: string, args: unknown) => ({ tool, arguments: JSON.stringify(args) })
 const input = (prompt: string) => JSON.parse(prompt.split('\n\n').at(-1)!)
-async function pilot() {
+async function pilot(options?: { owner: 'agent' | 'human'; description?: string; knowledgeDir?: string }) {
   const propose = vi.fn(async (_prompt: string): Promise<unknown> => done())
-  const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Event Agent', propose })
+  const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Event Agent', propose }, options?.knowledgeDir)
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy,
     sources: { ...settings.policy.sources, request: { allowed: [{ id: 'local' }] } } } })
   const projects = new Projects(h.runtime.store)
   const { id } = projects.create(ProjectInput.parse({ name: '2048', status: 'planning', autoAdvance: true }))
   const change = (change: ProjectChange['change']) => projects.change(id, ProjectChange.parse({ revision: projects.detail(id).revision, change }))
-  const task = change({ kind: 'task', value: { title: '2048 MVP', acceptance: '可运行并有测试', executionMode: 'agent' } }).tasks[0]!
+  const owner = options?.owner === 'agent' ? change({ kind: 'add-agent' }).members[0]
+    : options?.owner === 'human' ? change({ kind: 'new-member', value: { name: 'Robin' } }).members[0] : undefined
+  const task = change({ kind: 'task', value: { title: '2048 MVP', description: options?.description,
+    acceptance: '提供可核对的结果', ...(owner ? { ownerId: owner.id } : { executionMode: 'agent' as const }) } }).tasks[0]!
   const activate = () => change({ kind: 'project', value: { name: '2048', status: 'active', autoAdvance: true } })
   const ready = () => h.runtime.projectEvents.list({ projectId: id }).filter(event => event.type === taskReady.type)
-  return { h, projects, id, change, task, activate, propose, ready }
+  return { h, projects, id, change, task, activate, propose, ready, owner }
 }
+
+it('uses available evidence to let the assigned Agent report progress and deliver without a Worker', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'project-direct-work-'))
+  cleanup = async () => { rmSync(directory, { recursive: true, force: true }) }
+  writeFileSync(join(directory, 'experiment.md'), '试运行代号青柠 37，键盘与触屏用例均通过。')
+  const { h, projects, id, task, activate, propose, owner, ready } = await pilot({
+    owner: 'agent', description: '根据团队知识库中的 experiment.md 整理实验结果。', knowledgeDir: directory,
+  })
+  propose.mockImplementation(async prompt => {
+    const context = input(prompt)
+    if (JSON.parse(context.message.text).taskId !== task.id) return done()
+    const names = context.tools.map((tool: { name: string }) => tool.name)
+    expect(context.message.actorId).toBe(owner!.id)
+    if (!context.previousSteps.length) {
+      expect(names).toEqual(expect.arrayContaining(['knowledge.read', 'progress.record', 'delivery.submit']))
+      expect(prompt).toContain('直接使用当前资料')
+      return { calls: [call('knowledge.read', { path: 'experiment.md' })], reply: '' }
+    }
+    const result = context.previousSteps[0].results[0].data.text
+    expect(result).toContain('青柠 37')
+    if (context.previousSteps.length === 1) {
+      return { calls: [call('task.start', { taskId: task.id }), call('progress.record', { taskId: task.id, summary: result })], reply: '' }
+    }
+    if (context.previousSteps.length === 2) return { calls: [call('delivery.submit', { taskId: task.id, summary: result })], reply: '已记录测试结果。' }
+    return done('实验结果已保存并提交验收。')
+  })
+  activate()
+  await h.runtime.idle()
+  await h.runtime.pump()
+  await h.runtime.idle()
+  const project = projects.detail(id)
+  expect(project.tickets).toEqual([])
+  expect(project.tasks).toMatchObject([
+    { ownerId: owner!.id, status: 'in-review', progress: [{ actorId: owner!.id, source: 'agent', summary: expect.stringContaining('青柠 37') }],
+      reviews: [{ taskId: project.tasks[1]!.id, evidence: { summary: expect.stringContaining('青柠 37') } }] },
+    { reviewOf: { taskId: task.id }, status: 'todo' },
+  ])
+  expect(ready().filter(event => event.taskId === task.id)).toHaveLength(1)
+  expect(h.runtime.projectEvents.list({ projectId: id })).toContainEqual(expect.objectContaining({
+    type: 'review.requested', status: 'applied', data: expect.objectContaining({ context: expect.objectContaining({ actorId: owner!.id }) }),
+  }))
+})
+
+it('uses one optional Worker for work requiring a checkout and records its report on the same task', async () => {
+  const { h, projects, id, task, activate, propose, owner } = await pilot({
+    owner: 'agent', description: '在工作区实际运行规则测试并提供输出。',
+  })
+  propose.mockImplementation(async prompt => {
+    const context = input(prompt)
+    const event = JSON.parse(context.message.text)
+    if (event.type !== taskReady.type || event.taskId !== task.id) return done()
+    return context.previousSteps.length ? done('已委托后台执行测试。')
+      : { calls: [call('execution.start', { taskId: task.id })], reply: '' }
+  })
+  activate()
+  await h.runtime.idle()
+  const queued = projects.detail(id)
+  expect(queued.tasks[0]).toMatchObject({ ownerId: owner!.id, status: 'todo', ticketId: expect.any(String) })
+  expect(queued.tickets).toHaveLength(1)
+  const ticketId = queued.tickets[0]!.id
+  await h.runTool(`worker-${ticketId}`, 'orchestrator_report', { state: 'ready', summary: '规则测试通过，已核对输出。' })
+  await h.runtime.pump()
+  await h.runtime.idle()
+  const delivered = projects.detail(id)
+  expect(delivered.tasks[0]).toMatchObject({ ownerId: owner!.id, ticketId, status: 'in-review',
+    reviews: [{ taskId: delivered.tasks[1]!.id, evidence: { summary: '规则测试通过，已核对输出。', ticketId } }] })
+  expect(delivered.tickets).toHaveLength(1)
+})
+
+it('does not grant direct progress or delivery writes on tasks assigned to people', async () => {
+  const { h, projects, id, task, activate, propose } = await pilot({ owner: 'human' })
+  propose.mockImplementationOnce(async prompt => {
+    const context = input(prompt)
+    expect(context.message.actorId).toBeNull()
+    expect(context.tools.map((tool: { name: string }) => tool.name)).not.toContain('delivery.submit')
+    return { calls: [call('progress.record', { taskId: task.id, summary: 'Invented progress' }),
+      call('delivery.submit', { taskId: task.id, summary: 'Invented delivery' })], reply: '' }
+  })
+  activate(); await h.runtime.idle()
+  expect(projects.detail(id).tasks[0]).toMatchObject({ status: 'todo' })
+  expect(projects.detail(id).tasks[0]).not.toHaveProperty('progress')
+  expect(h.runtime.projectAgent!.runs(id)[0]?.steps[0]?.error).toContain('limited to the event task')
+})
 
 it('wakes the existing Agent tool loop from readiness and registers only one ticket across repeated passes', async () => {
   const { h, projects, id, task, activate, propose, ready } = await pilot()
@@ -42,7 +128,7 @@ it('wakes the existing Agent tool loop from readiness and registers only one tic
     expect(context.message.actorId).toBeNull()
     expect(context.tools.map((tool: { name: string }) => tool.name)).not.toContain('review.decide')
     expect(prompt).toContain('系统事实唤起')
-    return { calls: [call('task.start', { taskId: task.id })], reply: '' }
+    return { calls: [call('execution.start', { taskId: task.id })], reply: '' }
   })
   activate(); await h.runtime.idle()
   expect(projects.detail(id).tasks[0]).toMatchObject({ status: 'in-progress', ticketId: expect.any(String) })
@@ -67,7 +153,7 @@ it('revokes a proposal when the project pauses while the Agent is thinking', asy
   propose.mockImplementationOnce(() => pending.promise)
   activate(); await vi.waitFor(() => expect(propose).toHaveBeenCalledOnce())
   change({ kind: 'project', value: { name: '2048', status: 'paused' } })
-  pending.resolve({ calls: [call('task.start', { taskId: task.id })], reply: '' })
+  pending.resolve({ calls: [call('execution.start', { taskId: task.id })], reply: '' })
   await h.runtime.idle()
   expect(projects.detail(id).tickets).toEqual([])
   expect(h.runtime.projectAgent!.runs(id)[0]?.status).toBe('failed')
@@ -76,7 +162,7 @@ it('revokes a proposal when the project pauses while the Agent is thinking', asy
 it('rejects system proposals to accept delivery, change objectives or act on another task', async () => {
   const { h, projects, id, task, activate, change, propose } = await pilot()
   const other = change({ kind: 'task', value: { title: 'Other', blockedBy: [task.id] } }).tasks[1]!
-  propose.mockResolvedValueOnce({ calls: [call('task.start', { taskId: other.id }), call('project.update', { objective: 'Injected objective' })], reply: '' })
+  propose.mockResolvedValueOnce({ calls: [call('execution.start', { taskId: other.id }), call('project.update', { objective: 'Injected objective' })], reply: '' })
     .mockResolvedValueOnce(done())
   activate(); await h.runtime.idle()
   expect(projects.detail(id)).toMatchObject({ objective: '', tickets: [] })
@@ -85,7 +171,7 @@ it('rejects system proposals to accept delivery, change objectives or act on ano
 
 it('reacts to a current blocker through the same Agent and continues the original ticket', async () => {
   const { h, projects, id, task, activate, propose } = await pilot()
-  propose.mockResolvedValueOnce({ calls: [call('task.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
+  propose.mockResolvedValueOnce({ calls: [call('execution.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
   activate(); await h.runtime.idle()
   const ticketId = projects.detail(id).tasks[0]!.ticketId!
   propose.mockImplementation(async prompt => {
@@ -110,7 +196,7 @@ it('advances B from the actual acceptance event without a new chat instruction',
     const context = input(prompt)
     const event = JSON.parse(context.message.text)
     return event.taskId === task.id && !context.previousSteps.length
-      ? { calls: [call('task.start', { taskId: task.id })], reply: '' } : done(context.previousSteps.length ? '已登记 B 执行。' : '')
+      ? { calls: [call('execution.start', { taskId: task.id })], reply: '' } : done(context.previousSteps.length ? '已登记 B 执行。' : '')
   })
   activate(); await h.runtime.idle()
   expect(projects.detail(id).tickets).toHaveLength(0)
@@ -127,7 +213,7 @@ it('advances B from the actual acceptance event without a new chat instruction',
 
 it('does not wake another Agent round for repeated reports about one blocked episode', async () => {
   const { h, projects, id, task, activate, propose } = await pilot()
-  propose.mockResolvedValueOnce({ calls: [call('task.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
+  propose.mockResolvedValueOnce({ calls: [call('execution.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
   activate(); await h.runtime.idle()
   const ticketId = projects.detail(id).tasks[0]!.ticketId!
   propose.mockResolvedValue(done())
@@ -140,7 +226,7 @@ it('does not wake another Agent round for repeated reports about one blocked epi
 
 it('allows a blocker reaction to remain silent without dispatch or reminder spam', async () => {
   const { h, projects, id, task, activate, propose } = await pilot()
-  propose.mockResolvedValueOnce({ calls: [call('task.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
+  propose.mockResolvedValueOnce({ calls: [call('execution.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
   activate(); await h.runtime.idle()
   const ticketId = projects.detail(id).tasks[0]!.ticketId!
   propose.mockResolvedValue(done())

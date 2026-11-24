@@ -19,8 +19,10 @@ export type ReviewContext = z.output<typeof Context>
 export const ReviewEvidence = z.strictObject({ summary: z.string().trim().min(1).max(12000),
   links: z.array(z.url({ protocol: /^https?$/ })).max(20).default([]) })
 const Evidence = ReviewEvidence.extend({ ticketId: id.optional(), reportAt: z.iso.datetime().optional() })
-const Request = z.strictObject({ context: Context, evidence: Evidence, basis: z.string(), silent: z.boolean().default(false) })
-const Decision = z.strictObject({ context: Context, reviewId: id, reason: z.string().trim().min(1).max(8000) })
+const Request = z.strictObject({ context: Context, evidence: Evidence, basis: z.string(), silent: z.boolean().default(false),
+  linkedTask: z.literal(true).optional() })
+const Decision = z.strictObject({ context: Context, reviewId: id, reason: z.string().trim().min(1).max(8000), links: ReviewEvidence.shape.links.optional() })
+export const TaskDelivery = ReviewEvidence.extend({ outcome: z.enum(['accepted', 'rejected']).optional() })
 function definition(type: string, description: string, schema: z.ZodType): ProjectEventDefinition {
   return { type, category: 'reviews', description, schema, defaults: { enabled: true }, documentation: 'docs/events/delivery.zh-CN.md' }
 }
@@ -56,22 +58,37 @@ export class ProjectReviews {
     if (replay) return replay
     if (context.channel.source !== 'execution' && task.executionMode === 'agent')
       throw new ProjectError(409, 'Agent 任务使用当前工单的成功交付报告发起验收。')
-    return this.publish(reviewRequested, context, taskId, { ...data, basis: basis(task) })
+    return this.publish(reviewRequested, context, taskId, { ...data, basis: basis(task), ...(silent ? {} : { linkedTask: true }) })
   }
 
-  decide(context: ReviewContext, taskId: string, reviewId: string, outcome: 'accepted' | 'rejected', reason: string, quotedReviewId?: string) {
+  deliver(context: ReviewContext, taskId: string, input: z.input<typeof TaskDelivery>, quotedReviewId?: string) {
+    context = Context.strip().parse(context)
+    const { task } = this.authorize(context, taskId)
+    const { outcome, summary, links } = TaskDelivery.parse(input)
+    if (task.reviewOf) {
+      if (!outcome) throw new ProjectError(400, '请说明当前交付通过验收还是需要修改。')
+      return this.decide(context, task.reviewOf.taskId, task.reviewOf.reviewId, outcome, summary, quotedReviewId, links)
+    }
+    if (outcome) throw new ProjectError(400, '验收结论应提交到对应的验收任务。')
+    if (task.executionMode === undefined && context.actorId !== null && task.ownerId !== context.actorId)
+      throw new ProjectError(403, '请由任务负责人提交结果。')
+    return this.submit(context, taskId, { summary, links })
+  }
+
+  decide(context: ReviewContext, taskId: string, reviewId: string, outcome: 'accepted' | 'rejected', reason: string, quotedReviewId?: string, links?: string[]) {
     context = Context.strip().parse(context)
     if (context.channel.source === 'execution') throw new ProjectError(403, '工单执行不能替代人工验收。')
-    const { task } = this.authorize(context, taskId)
+    const { project, task } = this.authorize(context, taskId)
     const definition = outcome === 'accepted' ? reviewAccepted : reviewRejected
-    const data = { reviewId, reason: z.string().trim().min(1).max(8000).parse(reason) }
+    const data = { reviewId, reason: Decision.shape.reason.parse(reason), ...(links?.length && { links }) }
     const replay = this.replay(definition, context, taskId, data)
     if (replay) return replay
     if (quotedReviewId && quotedReviewId !== reviewId) throw new ProjectError(409, '只能处理本条消息引用的验收，不能自动换成本版。')
     const review = currentReview(task)
     if (!review || task.status !== 'in-review' || review.id !== reviewId || review.status !== 'pending')
       throw new ProjectError(409, '引用的验收已结束或交付已更新，请查看当前交付。')
-    if (context.actorId !== null && context.actorId !== review.requirements.ownerId)
+    const reviewTask = review.taskId ? project.tasks.find(item => item.id === review.taskId) : undefined
+    if (context.actorId !== null && context.actorId !== (review.taskId ? reviewTask?.ownerId : review.requirements.ownerId))
       throw new ProjectError(403, '请由这项任务当前指定的负责人验收。')
     return this.publish(definition, context, taskId, data)
   }
@@ -125,7 +142,7 @@ export class ProjectReviews {
   }
 
   private requested(event: ProjectEvent) {
-    const { context, evidence, basis: expected, silent } = Request.parse(event.data)
+    const { context, evidence, basis: expected, silent, linkedTask } = Request.parse(event.data)
     const { project, task } = this.authorize(context, event.taskId!)
     if (basis(task) !== expected) throw new ProjectError(409, '提交后任务或交付已变化，请基于当前内容重新提交验收。')
     const merged = mergedDelivery(this.host.store, project, task)
@@ -138,16 +155,18 @@ export class ProjectReviews {
         !report || report.state !== 'ready' || report.at !== evidence.reportAt)
         throw new ProjectError(409, '该工单已不是当前有效交付。')
     }
-    const updated = this.projects.requestReview(project.id, task.id, { ...evidence,
-      ...(merged ? { code: { url: merged.url, head: merged.head!, mergeCommit: merged.mergeCommit!, base: merged.base, updatedAt: merged.updatedAt } } : {}) }, event.recordedAt)
+    const code = merged && { url: merged.url, head: merged.head!, mergeCommit: merged.mergeCommit!, base: merged.base, updatedAt: merged.updatedAt }
+    const updated = this.projects.requestReview(project.id, task.id, { ...evidence, ...(code && { code }) }, event.recordedAt, linkedTask === true)
     if (merged) this.host.store.set(repositoryFactKey(project.id, task.id, updated.tasks.find(item => item.id === task.id)!.deliveryVersion!, merged.url),
       { ...merged, deliveryVersion: updated.tasks.find(item => item.id === task.id)!.deliveryVersion!, projectId: project.id, taskId: task.id })
     const review = currentReview(updated.tasks.find(item => item.id === task.id)!)!
-    const owner = updated.members.find(item => item.id === review.requirements.ownerId)
+    const reviewTask = review.taskId && updated.tasks.find(item => item.id === review.taskId)
+    const owner = updated.members.find(item => item.id === (reviewTask ? reviewTask.ownerId : review.requirements.ownerId))
     if (!silent) announce(this.host, updated, event.causeId ?? event.id, {
       title: `「${project.name}」· ${task.title}`, status: `待验收${owner ? ` · ${owner.name}` : ''}`,
-      summary: '本版交付已保存，等待人工检查。',
-      action: owner ? `请 ${owner.name} 检查交付和验收条件，引用本消息说明通过依据或退回原因。` : '尚未指定负责人，请先明确本任务的验收分工。',
+      summary: '本版交付已保存，等待验收。',
+      action: reviewTask ? `请在「${reviewTask.title}」任务中提交检查结论。`
+        : owner ? `请 ${owner.name} 检查交付和验收条件，引用本消息说明通过依据或退回原因。` : '尚未指定负责人，请先明确本任务的验收分工。',
       evidence: JSON.stringify({ result: evidence.summary, acceptance: review.requirements.acceptance, links: evidence.links }),
       reference: reviewReference(review), details: `项目看板 →「${project.name}」→「${task.title}」→ 交付与验收记录。`,
     }, owner)
@@ -155,10 +174,10 @@ export class ProjectReviews {
   }
 
   private decided(event: ProjectEvent, outcome: 'accepted' | 'rejected') {
-    const { context, reviewId, reason } = Decision.parse(event.data)
+    const { context, reviewId, reason, links } = Decision.parse(event.data)
     const { task } = this.authorize(context, event.taskId!)
     const updated = this.projects.decideReview(context.projectId, task.id, reviewId, outcome,
-      { actorId: context.actorId, source: context.channel.source, reason, at: event.recordedAt })
+      { actorId: context.actorId, source: context.channel.source, reason, at: event.recordedAt, ...(links && { links }) })
     const review = currentReview(updated.tasks.find(item => item.id === task.id)!)!
     if (!(context.replyOwner === 'agent' && context.channel.source === 'dingtalk' && context.channel.address.conversationId === updated.dingTalkGroup))
       announce(this.host, updated, event.id, `${reviewReference(review)}「${task.title}」${outcome === 'accepted' ? '验收通过，任务已完成。' : '已退回，任务返回进行中。'}\n原因：${reason.slice(0, 1200)}${outcome === 'rejected' ? '\n请按退回意见修订后再次提交交付。' : ''}`)

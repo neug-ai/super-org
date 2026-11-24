@@ -8,8 +8,9 @@ import type { Projects } from '../app/projects.ts'
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream'
 import { z } from 'zod'
 import { type SourceKind } from './kind.ts'
-import { projectMessageReceived } from './project-message.ts'
+import { projectMessageReceived, type MessageAttachment, type ProjectMessage } from './project-message.ts'
 import { DingTalkCards } from './dingtalk-cards.ts'
+import { AttachmentReadError, maxAttachmentBytes } from '../app/attachment-text.ts'
 
 // dingtalk-projects: provider implementation
 function sender(trigger: Trigger) {
@@ -92,10 +93,12 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
         else unresolvedCount++
       }
     }
+    const attachments = Array.isArray(trigger.meta.attachments) ? trigger.meta.attachments as MessageAttachment[] : undefined
     const result = agent.submit({ projectId, actorId: memberId, messageId: trigger.id, channel: trigger.channel,
       text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '',
       sentAt: trigger.at, nativeMessageId: typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined,
       replyToNativeMessageId: typeof trigger.meta.replyToMessageId === 'string' ? trigger.meta.replyToMessageId : undefined,
+      ...(attachments?.length && { attachments }),
       ...(mentions.size || unresolvedCount ? { mentions: { members: [...mentions.values()], unresolvedCount } } : {}) })
     return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' : '已收到，正在结合项目现状处理。'
   }
@@ -138,6 +141,26 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
 export const dingTalkRoute = family<Route, [string]>('dingtalk-route:')
 const tickets = family<string, [string, string]>('dingtalk-ticket:')
 const bodies = family<{ messageType: string; content: unknown }, [string]>('dingtalk-body:')
+const NativeFile = z.object({ fileName: z.string().trim().min(1).max(300), downloadCode: z.string().min(1).max(4000), fileId: z.string().optional() })
+
+function nativeFile(conversation: string, messageId: string, payload: { messageType: string; content: unknown }) {
+  const content = payload.content
+  const envelope = content && typeof content === 'object' && 'quote' in content
+    ? QuotedMessage.safeParse(content.quote).data : undefined
+  const quote = envelope?.msgType === 'file' && envelope.msgId ? envelope : undefined
+  if (!quote && payload.messageType !== 'file') return
+  let value = quote ? quote.content : envelope && content && typeof content === 'object' && 'content' in content ? content.content : content
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value) } catch { return }
+  }
+  const parsed = NativeFile.safeParse(value)
+  if (!parsed.success) return
+  const { fileName, downloadCode, fileId } = parsed.data
+  const nativeMessageId = (quote?.msgId ?? messageId).trim()
+  if (!nativeMessageId || nativeMessageId.length > 300) return
+  return { descriptor: { id: key('dingtalk-file', conversation, nativeMessageId, fileId ?? fileName),
+    name: fileName, nativeMessageId }, downloadCode }
+}
 const senderIdentities = family<string | null, [string]>('dingtalk-sender-identity:')
 const optionalIdentity = z.string().min(1).max(256).optional()
 const AtUser = z.object({ dingtalkId: optionalIdentity, staffId: z.string().min(1).max(128).optional() })
@@ -316,7 +339,11 @@ export class DingTalk {
           if (discussion) trigger.meta.projectDiscussion = true
           context.state.set(dingTalkRoute(parsed.route.conversationId), parsed.route)
           // Preserve native content/attachment references in the original Source KV, separate from model text.
-          if (parsed.body) context.state.set(bodies(parsed.trigger.id), parsed.body)
+          if (parsed.body) {
+            const attachment = nativeFile(parsed.route.conversationId, String(trigger.meta.messageId), parsed.body)
+            if (attachment) trigger.meta.attachments = [attachment.descriptor]
+            context.state.set(bodies(parsed.trigger.id), parsed.body)
+          }
           const result = context.receive(trigger)
           if (result instanceof Promise) throw new Error('DingTalk intake must commit synchronously')
           if ((handle || discussion) && result === 'filtered' && trigger.channel) {
@@ -373,6 +400,55 @@ export class DingTalk {
     if (!result.ok || !data.accessToken) throw new Error('DingTalk token request failed')
     this.token = { value: data.accessToken, until: Date.now() + Math.max(0, (data.expireIn ?? 7200) - 60) * 1000 }
     return this.token.value
+  }
+
+  async readProjectAttachment(message: ProjectMessage, attachment: MessageAttachment, lifetime: AbortSignal): Promise<Buffer> {
+    const { conversationId, triggerId } = message.channel.address
+    const payload = triggerId && this.context.state.get(bodies(triggerId))
+    const route = conversationId && this.context.state.get(dingTalkRoute(conversationId))
+    const file = payload && conversationId && message.nativeMessageId && nativeFile(conversationId, message.nativeMessageId, payload)
+    if (message.channel.source !== 'dingtalk' || triggerId !== message.messageId || !route || !file || file.descriptor.id !== attachment.id) {
+      throw new AttachmentReadError('无法验证这个钉钉附件的来源，请在项目群重新引用文件。')
+    }
+    const signal = AbortSignal.any([lifetime, AbortSignal.timeout(20_000)])
+    const token = await this.accessToken()
+    const response = await this.http('https://api.dingtalk.com/v1.0/robot/messageFiles/download', {
+      method: 'POST', redirect: 'error', signal,
+      headers: { 'Content-Type': 'application/json', 'x-acs-dingtalk-access-token': token },
+      body: JSON.stringify({ robotCode: route.robotCode, downloadCode: file.downloadCode }),
+    })
+    const result = await response.json() as { downloadUrl?: string; code?: string }
+    if (!response.ok || !result.downloadUrl) {
+      throw new AttachmentReadError(result.code === 'invalidParameter.robotCode.downloadCode'
+        ? '钉钉附件下载码无效或已过期，请重新引用这份文件并 @ 机器人。'
+        : '钉钉未授权下载这份附件，请重新引用文件或提供机器人可访问的副本。')
+    }
+    const url = URL.parse(result.downloadUrl)
+    if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password || url.port ||
+      !['dingtalk.com', 'dingtalkapps.com', 'aliyuncs.com'].some(domain => url.hostname === domain || url.hostname.endsWith(`.${domain}`))) {
+      throw new AttachmentReadError('钉钉返回了不受支持的附件下载地址。')
+    }
+    // DingTalk may issue an HTTP URL for an OSS object that also serves the signed URL over HTTPS.
+    url.protocol = 'https:'
+    const download = await this.http(url, { signal, redirect: 'error' })
+    if (!download.ok || !download.body) throw new AttachmentReadError('附件链接暂时无法下载，请重新引用这份文件。')
+    if (Number(download.headers.get('Content-Length')) > maxAttachmentBytes) {
+      await download.body.cancel()
+      throw new AttachmentReadError('附件超过大小上限。')
+    }
+    const chunks: Uint8Array[] = []
+    let length = 0
+    const stream = download.body.getReader()
+    try {
+      while (true) {
+        const chunk = await stream.read()
+        if (chunk.done) break
+        length += chunk.value.length
+        if (length > maxAttachmentBytes) throw new AttachmentReadError('附件超过大小上限。')
+        chunks.push(chunk.value)
+      }
+      return Buffer.concat(chunks, length)
+    } finally { await stream.cancel() }
   }
   async send(message: OutboundMessage): Promise<void> {
     const conversation = message.channel.address.conversationId!

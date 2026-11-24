@@ -38,7 +38,8 @@ async function pilot(knowledgeDir?: string) {
 }
 
 it('uses the screenshot request and quote to add acceptance criteria and assignment without dispatching work', async () => {
-  const { h, projects, id, assignee, task, propose, say } = await pilot()
+  const { h, projects, id, assignee, task, propose, say, change } = await pilot()
+  const agent = change({ kind: 'add-agent' }).members.find(member => member.accounts.some(account => account.provider === 'agent'))!
   propose.mockImplementationOnce(async prompt => {
     expect(prompt).toContain('请你帮忙梳理 验收通过条件并分派给 李顺阳')
     expect(prompt).toContain('整理开发测试用例')
@@ -46,7 +47,7 @@ it('uses the screenshot request and quote to add acceptance criteria and assignm
     expect(prompt).toContain('task.create')
     return { calls: [call('member.add', { memberId: assignee.id }), call('task.create', { title: '整理开发测试用例',
       description: '整理普通合并、连续相同数字、无效移动、结束与重开的用例', acceptance: '每条列明初始棋盘、操作、预期棋盘和计分变化',
-      ownerId: assignee.id, executionMode: 'agent', blockedBy: [task.id] })], reply: '' }
+      ownerId: agent.id, blockedBy: [task.id] })], reply: '' }
   }).mockImplementationOnce(async prompt => {
     expect(prompt).toContain('已创建「整理开发测试用例」')
     return done('已补充测试用例的验收条件，由李顺阳验收。')
@@ -55,7 +56,7 @@ it('uses the screenshot request and quote to add acceptance criteria and assignm
     '整理开发测试用例由 Agent 执行、李顺阳验收。需要覆盖哪些内容，以什么条件验收？')
   expect(run.status).toBe('completed')
   expect(projects.detail(id)).toMatchObject({ status: 'planning', autoAdvance: false, tickets: [], tasks: [task,
-    { title: '整理开发测试用例', status: 'todo', ownerId: assignee.id, executionMode: 'agent', blockedBy: [task.id] }] })
+    { title: '整理开发测试用例', status: 'todo', ownerId: agent.id, blockedBy: [task.id] }] })
   expect(run.steps[0]?.results).toHaveLength(2)
   expect(h.runtime.projectEvents.list({ projectId: id }).map(event => event.type)).toContain('project.message.received')
   const history = await h.api('GET', `projects/${id}/agent-runs`)
@@ -122,7 +123,7 @@ it('starts work through normal project tools and reuses the same run on request 
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy,
     sources: { ...settings.policy.sources, request: { allowed: [{ id: 'local' }] } } } })
-  propose.mockResolvedValueOnce({ calls: [call('project.update', { status: 'active' }), call('task.start', { taskId: task.id })], reply: '' })
+  propose.mockResolvedValueOnce({ calls: [call('project.update', { status: 'active' }), call('execution.start', { taskId: task.id })], reply: '' })
   const run = await say('start', '项目开工，先让 Agent 做规则整理')
   expect(run.status).toBe('completed')
   expect(projects.detail(id)).toMatchObject({ status: 'active', tasks: [{ status: 'in-progress' }], tickets: [expect.objectContaining({ taskId: task.id })] })
@@ -134,7 +135,7 @@ it('starts work through normal project tools and reuses the same run on request 
 it('preserves dependency gates and rolls back kickoff when dispatch fails', async () => {
   const { projects, id, change, task, propose, say } = await pilot()
   const downstream = change({ kind: 'task', value: { title: 'Dependent work', executionMode: 'agent', blockedBy: [task.id] } }).tasks[1]!
-  propose.mockResolvedValueOnce({ calls: [call('project.update', { status: 'active' }), call('task.start', { taskId: downstream.id })], reply: '' })
+  propose.mockResolvedValueOnce({ calls: [call('project.update', { status: 'active' }), call('execution.start', { taskId: downstream.id })], reply: '' })
   const run = await say('blocked-dispatch', '先开始第二项')
   expect(run.steps[0]?.error).toBeTruthy()
   expect(projects.detail(id)).toMatchObject({ status: 'planning', tickets: [] })
@@ -416,6 +417,104 @@ it('loads older web project conversation only through the history tools', async 
   expect(tools.execute('conversation.history.read', { messageId: older.id }, {
     ...context, projectId: other.id, channel: { source: 'request', thread: other.id, address: {} },
   }).data).toBeNull()
+})
+
+it('uses the summary of a quoted DingTalk attachment to record the owner’s progress and start their task once', async () => {
+  const { h, projects, id, member, change, propose } = await pilot()
+  change({ kind: 'project', value: { name: '2048 事件验收', status: 'active' } })
+  const task = change({ kind: 'task', value: { title: '整理交付材料', ownerId: member.id } }).tasks.at(-1)!
+  const send = vi.fn()
+  const kind = dingTalkKind(async message => { send(message) })
+  h.runtime.sources.register(kind)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } } })
+  let receive!: (frame: { headers: { messageId: string }; data: string }) => Promise<void>
+  const callback = vi.spyOn(DWClient.prototype, 'registerCallbackListener').mockImplementation(function (this: DWClient, _topic, fn) {
+    receive = fn as typeof receive; return this
+  })
+  const ack = vi.spyOn(DWClient.prototype, 'socketCallBackResponse').mockImplementation(() => {})
+  const fetchFile = vi.fn(async (url: URL | string, init?: RequestInit) => {
+    if (String(url).endsWith('/accessToken')) return Response.json({ accessToken: 'auth-token' })
+    if (String(url).endsWith('/messageFiles/download')) {
+      const request = JSON.parse(String(init?.body))
+      if (request.downloadCode === 'expired-code') return Response.json({ code: 'invalidParameter.robotCode.downloadCode' }, { status: 400 })
+      if (request.downloadCode === 'untrusted-code') return Response.json({ downloadUrl: 'http://aliyuncs.com.example.org/handout' })
+      expect(request).toEqual({ robotCode: 'robot', downloadCode: 'temporary-file-secret' })
+      return Response.json({ downloadUrl: 'http://files.oss-cn-zhangjiakou.aliyuncs.com/handout?Signature=fixture%2Btoken' })
+    }
+    expect(String(url)).toBe('https://files.oss-cn-zhangjiakou.aliyuncs.com/handout?Signature=fixture%2Btoken')
+    expect(init?.headers).toBeUndefined()
+    expect(init?.redirect).toBe('error')
+    return new Response('<script>malicious script</script><h1>Slide handout</h1><p>Execution evidence by section.</p>')
+  })
+  try {
+    const agent = h.runtime.projectAgent!
+    const bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, fetchFile as typeof fetch,
+      undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, agent))
+    agent.registerAttachmentReader('dingtalk', (message, attachment, signal) => bot.readProjectAttachment(message, attachment, signal))
+    const post = async (msgId: string, options: { sender?: string; name?: string; code?: string } = {}) => {
+      await receive({ headers: { messageId: msgId }, data: JSON.stringify({ msgId, senderStaffId: options.sender ?? 'member', conversationId: 'test-group',
+        conversationType: '2', isInAtList: true, senderCorpId: 'test-corp', robotCode: 'robot', msgtype: 'text',
+        text: { content: '针对整理交付材料的任务，我做了这份文档，请根据文档更新进展', isReplyMsg: true, repliedMsg: { msgId: 'original-file-not-stored', msgType: 'file',
+          content: { fileId: 'attachment-one', fileName: options.name ?? 'handout.html', downloadCode: options.code ?? 'temporary-file-secret' } } },
+        sessionWebhook: 'https://oapi.dingtalk.com/robot/send?fixture', sessionWebhookExpiredTime: Date.now() + 60_000 }) })
+      await h.runtime.idle()
+      return agent.runs(id).find(run => run.message.nativeMessageId === msgId)
+    }
+    propose.mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('Execution evidence by section')
+      expect(prompt).not.toMatch(/malicious script|temporary-file-secret|task\.begin/)
+      return { summary: '材料按章节列出了执行证据。' }
+    }).mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('"attachments":[{"name":"handout.html","summary":"材料按章节列出了执行证据。"')
+      expect(prompt).not.toContain('Execution evidence by section')
+      return { calls: [call('progress.record', { taskId: task.id, summary: '已整理交付材料。handout.html 按章节列出执行证据。' }),
+        call('task.start', { taskId: task.id })], reply: '' }
+    }).mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('已记录任务进展。')
+      expect(prompt).toContain('「整理交付材料」已在进行中')
+      return done('已记录进展，并将整理交付材料标记为进行中。')
+    })
+    const run = (await post('quote-file'))!
+    expect(run.reply).toContain('已读取「handout.html」')
+    expect(run.reply).toContain('按章节列出了执行证据')
+    expect(JSON.stringify(run)).not.toContain('temporary-file-secret')
+    await post('quote-file')
+    const updated = projects.detail(id)
+    expect(updated.tasks.find(item => item.id === task.id)).toMatchObject({ status: 'in-progress',
+      progress: [{ author: 'Robin', source: 'dingtalk', summary: '已整理交付材料。handout.html 按章节列出执行证据。' }] })
+    expect(updated.tickets).toEqual([])
+    expect(h.runtime.projectEvents.list({ projectId: id }).filter(event => event.type === 'progress.recorded')).toHaveLength(1)
+    expect(send.mock.calls.filter(([message]) => message.text === run.reply)).toHaveLength(1)
+    expect(fetchFile).toHaveBeenCalledTimes(3)
+    await post('outsider-file', { sender: 'outsider' })
+    expect(fetchFile).toHaveBeenCalledTimes(3)
+    const unsupported = await post('unsupported-file', { name: 'attachment.zip' })
+    expect(unsupported?.reply).toContain('当前不支持这个文件格式')
+    expect(fetchFile).toHaveBeenCalledTimes(3)
+    const expired = await post('expired-file', { code: 'expired-code' })
+    expect(expired?.reply).toContain('钉钉附件下载码无效或已过期')
+    expect(fetchFile).toHaveBeenCalledTimes(4)
+    const untrusted = await post('untrusted-file', { code: 'untrusted-code' })
+    expect(untrusted?.reply).toContain('钉钉返回了不受支持的附件下载地址')
+    expect(fetchFile).toHaveBeenCalledTimes(5)
+  } finally { callback.mockRestore(); ack.mockRestore() }
+})
+
+it('keeps task start restricted to the owner and leaves progress available while dependencies are open', async () => {
+  const { h, id, member, assignee, task, change, projects } = await pilot()
+  change({ kind: 'project', value: { name: '2048 事件验收', status: 'active' } })
+  change({ kind: 'add-member', memberId: assignee.id })
+  const downstream = change({ kind: 'task', value: { title: '整理交付材料', ownerId: member.id,
+    blockedBy: [task.id] } }).tasks.at(-1)!
+  const tools = h.runtime.projectTools!
+  const context = { projectId: id, actorId: member.id, messageId: 'waiting-work', operationId: 'waiting-work',
+    channel: { source: 'dingtalk', thread: 'test-group', address: { conversationId: 'test-group' } } }
+  expect(() => tools.execute('task.start', { taskId: downstream.id }, { ...context, actorId: assignee.id })).toThrow('只有任务负责人')
+  expect(() => tools.execute('task.start', { taskId: downstream.id }, context)).toThrow('dependencies')
+  expect(() => tools.execute('task.start', { taskId: task.id }, context)).toThrow('只有任务负责人')
+  tools.execute('progress.record', { taskId: downstream.id, summary: '已列出交付清单' }, context)
+  expect(projects.detail(id).tasks.at(-1)).toMatchObject({ status: 'todo', progress: [{ summary: '已列出交付清单' }] })
 })
 
 it('routes a bound Feishu project conversation and retrieves a retained message by native reference', async () => {

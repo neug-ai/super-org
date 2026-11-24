@@ -5,7 +5,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { KV } from '../src/kv.ts'
 import { importMissionControl } from '../src/app/mission-control-import.ts'
-import { ProjectChange, ProjectInput, Projects, type ProjectDetail, type ProjectExecution } from '../src/app/projects.ts'
+import { ProjectChange, ProjectInput, Projects, TaskInput, type ProjectDetail, type ProjectExecution } from '../src/app/projects.ts'
 import { ProjectPlanning } from '../src/app/project-planning.ts'
 import { ProjectIssues } from '../src/app/project-issues.ts'
 import { taskReference } from '../src/app/project-task-context.ts'
@@ -267,8 +267,8 @@ it('plans from two meetings, discards stale proposals and retains task IDs', asy
     expect(await planner.process('first', request)).toMatchObject({ state: 'applied' })
     const project = projects.detail(id)
     expect(project).toMatchObject({ status: 'planning', tickets: [], tasks: [
-      { title: '实现', status: 'todo', ticketId: null, issueUrl: null, executionMode: 'agent' },
-      { title: '验收', status: 'todo', ticketId: null, blockedBy: [project.tasks[0]!.id], executionMode: 'manual' },
+      { title: '实现', status: 'todo', ticketId: null, issueUrl: null, ownerId: projects.ensureProjectAgent().id },
+      { title: '验收', status: 'todo', ticketId: null, blockedBy: [project.tasks[0]!.id] },
     ] })
     expect(await planner.process('second-command-same-evidence', request)).toMatchObject({ state: 'unchanged' })
     expect(projects.detail(id)).toEqual(project)
@@ -379,7 +379,8 @@ it('dispatches a project task through the runtime and returns the ticket questio
   project = await decideCurrent(h, project.id, taskId, 'rejected')
   await h.runtime.pump()
   await h.runtime.idle()
-  expect((await h.api('GET', path)).body.tasks).toEqual([expect.objectContaining({ status: 'in-progress' })])
+  expect((await h.api('GET', path)).body.tasks).toEqual([expect.objectContaining({ status: 'in-progress' }),
+    expect.objectContaining({ status: 'done', reviewOf: expect.objectContaining({ taskId }) })])
   expect(await run()).toMatchObject({ status: 200 })
   await h.runtime.idle()
   project = new Projects(h.runtime.store).detail(project.id)
@@ -480,7 +481,7 @@ it('uses the same complete Agent for planning and execution, including after a l
   expect(h.runtime.store.get(KV.runtime.robotPlanner)).toBe('codex')
 })
 
-it('plans a fresh discussion, notifies the reviewer after a successful run and advances dependencies after approval', async () => {
+it('plans work for an Agent member, registers a review task for the delivery and advances dependencies after approval', async () => {
   const propose = vi.fn()
   const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Test planner', propose })
   const send = vi.fn(async () => {})
@@ -512,13 +513,14 @@ it('plans a fresh discussion, notifies the reviewer after a successful run and a
     { ...base, ref: 'new:manual', title: 'Manual check', assignee: 'member', dependsOn: ['new:design'] },
   ] })
   expect(await h.api('POST', `${path}/plan`, {})).toMatchObject({ status: 200, body: { state: 'applied' } })
+  const agent = projects.ensureProjectAgent()
   propose.mockImplementation(async (prompt: string) => {
     const context = JSON.parse(prompt.split('\n\n').at(-1)!)
     if (!context.message) return { summary: 'Design evidence is ready' }
     if (context.previousSteps.length) return { calls: [], reply: '已登记执行。' }
     const event = JSON.parse(context.message.text)
     const task = context.projectContext.project.tasks.find((task: { id: string }) => task.id === event.taskId)
-    return task.executionMode === 'agent' ? { calls: [{ tool: 'task.start', arguments: JSON.stringify({ taskId: task.id }) }], reply: '' }
+    return task.ownerId === agent.id ? { calls: ['task.start', 'execution.start'].map(tool => ({ tool, arguments: JSON.stringify({ taskId: task.id }) })), reply: '' }
       : { calls: [], reply: 'Reviewer 可以开始「Manual check」' }
   })
   await change({ kind: 'project', value: { name: 'Review pilot', status: 'planning', autoAdvance: true } })
@@ -529,7 +531,7 @@ it('plans a fresh discussion, notifies the reviewer after a successful run and a
   await h.runtime.idle()
   const [design, implementation, manual] = projects.detail(id).tasks
   expect([design?.status, implementation?.status, manual?.status]).toEqual(['in-progress', 'todo', 'todo'])
-  expect(design?.ownerId).toBe(reviewer.id)
+  expect(design?.ownerId).toBe(agent.id)
   await change({ kind: 'project', value: { name: 'Review pilot', status: 'active', autoAdvance: false } })
   // Restore the legacy shape with a task edit timestamp newer than the execution report.
   const legacy = store.get(KV.projects.project(id))!
@@ -539,21 +541,24 @@ it('plans a fresh discussion, notifies the reviewer after a successful run and a
   await h.runTool(`worker-${design!.ticketId}`, 'orchestrator_report', { state: 'ready', summary: 'Design evidence is ready' })
   await h.runtime.pump()
   await h.runtime.idle()
-  expect(projects.detail(id)).toMatchObject({ tasks: [{ status: 'in-review' }, { status: 'todo' }, { status: 'todo' }],
+  expect(projects.detail(id)).toMatchObject({ tasks: [{ status: 'in-review' }, { status: 'todo' }, { status: 'todo' },
+    { status: 'todo', ownerId: null, reviewOf: { taskId: design!.id } }],
     tickets: [{ taskId: design!.id, ended: true }] })
   expect(send).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'notice',
-    channel: expect.objectContaining({ address: { conversationId: 'test-group', mentionUserId: 'group-reviewer', mentionUserName: 'Reviewer' } }),
-    text: expect.stringMatching(/Design[\s\S]*待验收[\s\S]*Reviewer/) }))
-  await decideCurrent(h, id, design!.id)
+    text: expect.stringMatching(/Design[\s\S]*待验收[\s\S]*任务中提交检查结论/) }))
+  const reviewTask = projects.detail(id).tasks.at(-1)!
+  await change({ kind: 'task', id: reviewTask.id, value: { ...TaskInput.strip().parse(reviewTask), ownerId: reviewer.id } })
+  expect(await h.api('POST', `${path}/tasks/${reviewTask.id}/deliveries`,
+    { messageId: 'accept-design', outcome: 'accepted', summary: 'Checked the design evidence' })).toMatchObject({ status: 200 })
   await h.runtime.pump()
   await h.runtime.idle()
-  expect(projects.detail(id).tasks.map(task => task.status)).toEqual(['done', 'todo', 'todo'])
+  expect(projects.detail(id).tasks.map(task => task.status)).toEqual(['done', 'todo', 'todo', 'done'])
   expect(send).toHaveBeenCalledTimes(3)
   await change({ kind: 'project', value: { name: 'Review pilot', status: 'active', autoAdvance: true } })
   for (let attempt = 0; attempt < 2; attempt++) { await h.runtime.pump(); await h.runtime.idle() }
   const done = projects.detail(id)
   expect(done.tasks.map(task => [task.id, task.status])).toEqual([
-    [design!.id, 'done'], [implementation!.id, 'in-progress'], [manual!.id, 'todo'],
+    [design!.id, 'done'], [implementation!.id, 'in-progress'], [manual!.id, 'todo'], [reviewTask.id, 'done'],
   ])
   expect(done.tickets).toHaveLength(2)
   const assignment = store.tickets.get(done.tasks[1]!.ticketId!)!

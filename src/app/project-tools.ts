@@ -8,7 +8,8 @@ import { ProgressInput, ProjectChange, ProjectError, Projects, TaskInput, type P
 import type { ProjectTracking } from './project-tracking.ts'
 import type { ProjectIssues } from './project-issues.ts'
 import type { Store } from './store.ts'
-import { ReviewEvidence, type ProjectReviews } from './project-reviews.ts'
+import { TaskDelivery, type ProjectReviews } from './project-reviews.ts'
+import { isProjectAgent } from './project-member.ts'
 import { deliveryReviewState } from './project-deliveries.ts'
 import { CommunicationPreference, type Communication } from './communication.ts'
 import type { ProjectProgress } from './project-progress.ts'
@@ -19,7 +20,7 @@ import { projectChannel } from './project-notifications.ts'
 import { readConversation, searchConversation } from './project-conversation-history.ts'
 
 const id = z.string().min(1).max(128)
-const editable = TaskInput.omit({ status: true, ticketId: true })
+const editable = TaskInput.omit({ status: true, ticketId: true, executionMode: true })
 const patch = z.strictObject(Object.fromEntries(Object.entries(editable.shape)
   .map(([key, value]) => [key, (value instanceof z.ZodDefault ? value.removeDefault() : value).optional()])) as Record<string, z.ZodType>)
   .refine(value => Object.values(value).some(item => item !== undefined), 'Supply at least one task field')
@@ -120,11 +121,11 @@ export class ProjectTools {
     this.register(operation('runtime.inspect', '读取真实运行能力、消息通道、格式支持、最近成功发送的实际格式和原生审批限制；不能修改权限或假装已查阅外部文档。', z.strictObject({}), context => ({
       summary: '已读取运行能力', data: host.capabilities(context.channel),
     })))
-    this.register(operation('progress.record', '把成员明确报告的实际任务进展追加到指定任务。可记录卡点、证据和本人上次报告的 corrects。等待依赖或未分配的任务也能记录。此操作不改状态、派工或验收。只引用明确任务，不把计划或猜测写成已完成。',
+    this.register(operation('progress.record', '追加成员报告或当前项目 Agent 实际完成的任务进展。可记录卡点、证据和本人上次报告的 corrects。等待依赖时也能记录准备工作。计划或猜测不能当成成果。',
       ProgressInput.extend({ taskId: id }), (context, { taskId, ...input }) => ({
         summary: '已记录任务进展。', data: this.projects.recordProgress(context.projectId, taskId, input, {
-          actorId: context.actorId, messageId: context.messageId, source: context.channel.source,
-          ...(context.text ? { original: context.text } : {}),
+          actorId: context.actorId, messageId: context.messageId, source: context.event && context.actorId ? 'agent' : context.channel.source,
+          ...(context.text && !context.event ? { original: context.text } : {}),
         }),
       })))
     this.register(operation('tracking.request', '成员明确要求联系负责人、追一下进度时，发起指定任务的进展检查。只查状态直接回答；任务指代不清楚时追问。只登记检查，不能承诺提醒已送达。不要为了提醒而开工或提交验收。',
@@ -181,10 +182,28 @@ export class ProjectTools {
           objective: current.objective, status: current.status, ...fields } })
         return { summary: `已更新项目「${result.name}」`, data: { status: result.status, objective: result.objective, autoAdvance: result.autoAdvance } }
       }))
-    this.register(operation('task.start', '启动指定任务的 Agent 执行。项目须已开工，依赖须已验收，人工任务使用人工执行方式。',
+    this.register(operation('task.start', '登记任务已经开始，可与实际进展一起提交。负责人、项目开工和依赖条件由服务端核对。',
+      z.strictObject({ taskId: id }), (context, { taskId }) => {
+        const project = this.projects.detail(context.projectId)
+        if (context.event) {
+          const target = task(context, taskId)
+          const agentOwned = isProjectAgent(project.members.find(member => member.id === target.ownerId))
+          if (target.reviewOf || target.executionMode !== 'agent' && !agentOwned)
+            throw new ProjectError(403, '自动开工只适用于指派给项目 Agent 的普通任务。')
+        }
+        const started = this.projects.beginTask(project.id, taskId, project.revision, context.actorId).tasks.find(item => item.id === taskId)!
+        return { summary: `「${started.title}」已在进行中`, data: { taskId, status: started.status } }
+      }))
+    this.register(operation('execution.start', '按需调用后台 Worker，适用于仓库工作区、执行命令或可恢复运行。保留原负责人；能在当前处理完成的工作可直接提交进展或结果。',
       z.strictObject({ taskId: id }), (context, args) => {
-        task(context, args.taskId)
-        const result = host.start(context.projectId, args.taskId, this.projects.detail(context.projectId).revision)
+        const current = task(context, args.taskId)
+        const project = this.projects.detail(context.projectId)
+        const agentOwned = isProjectAgent(project.members.find(member => member.id === current.ownerId))
+        if (context.event && (current.reviewOf || current.executionMode !== 'agent' && !agentOwned))
+          throw new ProjectError(403, '自动派发只适用于指派给项目 Agent 的任务。')
+        if (context.actorId !== null && current.executionMode === undefined && !agentOwned && current.ownerId !== context.actorId)
+          throw new ProjectError(403, '请由任务负责人委托后台执行。')
+        const result = host.start(context.projectId, args.taskId, project.revision)
         const started = result.tasks.find(item => item.id === args.taskId)!
         return { summary: `已为「${started.title}」登记 Agent 执行`, data: { taskId: started.id, ticketId: started.ticketId, status: started.status } }
       }))
@@ -215,9 +234,9 @@ export class ProjectTools {
         return { summary: '讨论回复已登记，实际投递以回执为准。', data: host.reply(context, args.taskId, args.url, args.text),
           ...(context.event ? { replyChannel: projectChannel(host.store, this.projects.detail(context.projectId)) } : {}) }
       }))
-    this.register(operation('delivery.submit', '提交人工任务的交付证据并请求验收。仅提交成员明确提供的结果，不得自行编造已完成的产物。Agent 任务由成功工单自动发起验收。',
-      ReviewEvidence.extend({ taskId: id }), (context, { taskId, ...evidence }) => ({
-        summary: '人工交付的验收请求已登记，状态以事件处理结果为准。', data: host.reviews.submit(context, taskId, evidence),
+    this.register(operation('delivery.submit', '提交实际任务结果和证据。成员可提交明确提供的成果，项目 Agent 可提交自己受托完成的成果。验收任务须填写 outcome 和检查依据。',
+      TaskDelivery.extend({ taskId: id }), (context, { taskId, ...evidence }) => ({
+        summary: '提交已登记，状态以事件处理结果为准。', data: host.reviews.deliver(context, taskId, evidence, context.reviewId),
       })))
     this.register(operation('review.decide', '根据成员对具体交付的明确反馈，提交通过或退回验收。必须使用该交付的真实验收 ID、明确理由；只有指定负责人或本地管理者可以验收。不得将旧引用替换为新版，不得代替人自行通过验收。',
       z.strictObject({ taskId: id, reviewId: id, outcome: z.enum(['accepted', 'rejected']), reason: z.string().trim().min(1).max(8000) }),
@@ -246,7 +265,7 @@ export class ProjectTools {
 
   snapshot(projectId: string, channel?: ChannelRef) {
     const project = this.projects.detail(projectId)
-    const tasks = project.tasks.map(({ progress, ...task }) => ({ ...task, deliveryReview: deliveryReviewState(task),
+    const tasks = project.tasks.map(({ progress, ...task }) => ({ ...task, deliveryReview: deliveryReviewState(task, project.tasks),
       ...(progress?.length ? { progress: progress.slice(-5)
         .map(({ original: _original, ...record }) => ({ ...record, summary: record.summary.slice(0, 1000) })) } : {}) }))
     return { now: new Date().toISOString(), project: { ...project, tasks }, directory: this.projects.members().map(({ id, name }) => ({ id, name })), capabilities: this.host.capabilities(channel),
