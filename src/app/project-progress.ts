@@ -9,13 +9,15 @@ import type { ProjectEvents } from './project-events.ts'
 import { ProjectError, type Project, type ProjectTask } from './projects.ts'
 import type { Store } from './store.ts'
 import { projectChannel } from './project-notifications.ts'
+import { isProjectAgent } from './project-member.ts'
+import { awaitsTaskExecution } from './project-task-context.ts'
 
 const id = z.string().min(1).max(128)
 const Ready = z.strictObject({ signature: id, episode: id })
 export const taskReady: ProjectEventDefinition = {
   type: 'task.ready', category: 'dependencies', schema: Ready,
   description: '项目授权推进且任务依赖已验收，唤起 Agent 判断下一步。',
-  defaults: { enabled: true, instruction: '任务现在满足推进条件。已指派给项目 Agent 的普通任务可组合 task.start 与 execution.start。其余任务根据当前状态跟进负责人；条件不足时明确缺项。不得自行验收或虚构完成。' },
+  defaults: { enabled: true, instruction: '任务现在满足推进条件。项目 Agent 接手自己的任务，优先用当前资料和工具完成可直接处理的工作，并写回实际进展或结果。需要独立工作区、运行命令或持续执行时，才按授权安排后台协助。其他任务跟进原负责人。' },
   documentation: 'docs/events/follow-up.zh-CN.md',
 }
 const Due = z.strictObject({ checkId: id, signature: id, reason: z.string().min(1).max(2000) })
@@ -48,6 +50,7 @@ export class ProjectProgress {
     for (const type of [taskReady.type, checkDue.type, 'task.blocked']) host.agent.registerReaction?.(type, {
       tools: ['project.inspect', 'runtime.inspect', 'task.start', 'execution.start', 'task.follow_up', 'follow_up.schedule', 'follow_up.cancel'],
       current: (event, replyOnly) => this.current(event, replyOnly),
+      ...(type === taskReady.type && { work: { assignee: event => this.assignee(event), tools: ['knowledge.read', 'progress.record', 'delivery.submit'] } }),
     })
     host.events.handle(taskReady.type, event => {
       const project = event.projectId && host.store.get(KV.projects.project(event.projectId))
@@ -82,6 +85,15 @@ export class ProjectProgress {
     return projectChannel(this.host.store, project, owner || undefined)
   }
 
+  private assignee(event: ProjectEvent): string | undefined {
+    const store = this.host.store
+    const project = event.projectId && store.get(KV.projects.project(event.projectId))
+    if (!project) return
+    const task = project.tasks.find(item => item.id === event.taskId)
+    if (!task?.ownerId || task.reviewOf || !project.memberIds.includes(task.ownerId)) return
+    if (isProjectAgent(store.get(KV.projects.member(task.ownerId)))) return task.ownerId
+  }
+
   /** Recover existing readiness and overdue checks once at startup; orchestration passes never scan project tasks. */
   recover(): void {
     this.host.store.atomic(() => {
@@ -96,7 +108,8 @@ export class ProjectProgress {
       const entry = KV.projects.readiness(key(project.id, task.id))
       if (!eligible(project, task)) {
         // Keep the event's identity through the execution it started, but revoke it on pause or scope changes.
-        if (!(project.status === 'active' && project.autoAdvance && task.status === 'in-progress' && store.get(entry)?.signature === scope(project, task))) store.delete(entry)
+        if (!(project.status === 'active' && project.autoAdvance && awaitsTaskExecution(task) &&
+          store.get(entry)?.signature === scope(project, task))) store.delete(entry)
         continue
       }
       const signature = scope(project, task)
@@ -133,7 +146,7 @@ export class ProjectProgress {
       const payload = event.data as { ticketId: string; assignmentId: string; reportAt: string; attentionId?: string; deliveryVersion: number }
       const ticket = this.host.store.tickets.get(payload.ticketId)
       const assignment = ticket?.assignments.at(-1)
-      return task.status === 'in-progress' && (task.deliveryVersion ?? 0) === payload.deliveryVersion && ticket?.attention?.id === payload.attentionId
+      return awaitsTaskExecution(task) && (task.deliveryVersion ?? 0) === payload.deliveryVersion && ticket?.attention?.id === payload.attentionId
         && task.ticketId === ticket?.id && !ticket?.ended && assignment?.id === payload.assignmentId && assignment.report?.at === payload.reportAt
         && (assignment.report.state === 'blocked' || !!ticket?.attention)
     }

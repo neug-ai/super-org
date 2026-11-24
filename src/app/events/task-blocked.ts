@@ -3,7 +3,7 @@ import { key, type OutboundMessage, type Ticket } from '../../core/index.ts'
 import { KV } from '../../kv.ts'
 import type { ProjectEvent, ProjectEventDefinition } from '../../sources/project-events.ts'
 import { announce } from '../project-notifications.ts'
-import { taskReference } from '../project-task-context.ts'
+import { awaitsTaskExecution, taskReference } from '../project-task-context.ts'
 import type { ProjectEvents } from '../project-events.ts'
 import type { Store } from '../store.ts'
 import { workerSessionId } from '../../executor/dsh.ts'
@@ -47,7 +47,7 @@ export class TaskBlocked {
         const previous = store.get(stateKey)
         const assignment = ticket.assignments.at(-1)
         const report = assignment?.report
-        if (project.status === 'archived' || task.status !== 'in-progress' || !blocked(ticket) || !assignment || !report) {
+        if (project.status === 'archived' || !awaitsTaskExecution(task) || !blocked(ticket) || !assignment || !report) {
           if (previous) { this.host.withdraw(previous.noticeId); store.delete(stateKey) }
           continue
         }
@@ -76,7 +76,7 @@ export class TaskBlocked {
     const { store } = this.host
     const project = event.projectId && store.get(KV.projects.project(event.projectId))
     const task = project && project.tasks.find(item => item.id === event.taskId)
-    if (!project || project.status === 'archived' || !task || task.status !== 'in-progress' || task.ticketId !== payload.ticketId)
+    if (!project || project.status === 'archived' || !task || !awaitsTaskExecution(task) || task.ticketId !== payload.ticketId)
       return ignored('Task no longer waits for this execution')
     if ((task.deliveryVersion ?? 0) !== payload.deliveryVersion) return ignored('Delivery version changed')
     const ticket = store.tickets.get(payload.ticketId)

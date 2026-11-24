@@ -348,7 +348,11 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, inspec
     <div className="dt-project-heading">
       {showTitle && <h3>{task.title}</h3>}
       <Tag>{t(`project.priority.${task.priority ?? 'eliminate'}`)}</Tag>
-      <Button size="sm" variant="outline" onClick={() => editor({ ...base, type: 'task' })}>{t('project.editTask')}</Button>
+      <div className="dt-work-actions">
+        {project.status === 'active' && task.status === 'todo' && !blocked &&
+          <Button variant="primary" size="sm" disabled={pending} onClick={() => move('in-progress')}>{t('project.startTask')}</Button>}
+        <Button size="sm" variant="outline" onClick={() => editor({ ...base, type: 'task' })}>{t('project.editTask')}</Button>
+      </div>
     </div>
     <dl className="dt-work-task-properties">
       <div><dt>{t('project.owner')}</dt><dd>{owner}</dd></div>
@@ -386,8 +390,6 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, inspec
             onClick={() => editor({ type: 'decision', decision, revision: project.revision })}>{decision.question}</button>)}
         </div>}
         <div className="dt-work-actions">
-          {project.status === 'active' && task.status === 'todo' && !blocked &&
-            <Button variant="primary" size="sm" disabled={pending} onClick={() => move('in-progress')}>{t('project.startTask')}</Button>}
           {canDispatch && execution?.state === 'ready' && <Button variant="outline" size="sm" onClick={() => editor({ ...base, type: 'run' })}>{t('project.run')}</Button>}
           <Button variant="outline" size="sm" onClick={() => editor({ ...base, type: 'link' })}>{t('project.linkTicket')}</Button>
           {current && own && !current.ended && execution?.state === 'ready' &&
@@ -448,7 +450,7 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, inspec
             {entry.actorId === null && !corrected && <Button size="sm" variant="ghost"
               onClick={() => editor({ ...base, type: 'progress', entry })}>{t('project.tracking.correct')}</Button>}</div>
           <p className="dt-hint"><time dateTime={entry.at}>{new Date(entry.at).toLocaleString()}</time>{' · '}
-            {entry.source === 'request' ? t('project.tracking.web') : entry.source}</p>
+            {entry.source === 'request' ? t('project.tracking.web') : entry.source === 'agent' ? t('project.tracking.agent') : entry.source}</p>
           <p className="dt-project-description">{entry.summary}</p>
           {entry.blocker && <p>{t('project.tracking.blocker')} · {entry.blocker}</p>}
           {entry.links.map(url => <p key={url}><a href={url} target="_blank" rel="noreferrer">{url}</a></p>)}

@@ -121,11 +121,11 @@ export class ProjectTools {
     this.register(operation('runtime.inspect', '读取真实运行能力、消息通道、格式支持、最近成功发送的实际格式和原生审批限制；不能修改权限或假装已查阅外部文档。', z.strictObject({}), context => ({
       summary: '已读取运行能力', data: host.capabilities(context.channel),
     })))
-    this.register(operation('progress.record', '把成员明确报告的实际任务进展追加到指定任务。可记录卡点、证据和本人上次报告的 corrects。等待依赖或未分配的任务也能记录。此操作不改状态、派工或验收。只引用明确任务，不把计划或猜测写成已完成。',
+    this.register(operation('progress.record', '追加成员报告或当前项目 Agent 实际完成的任务进展。可记录卡点、证据和本人上次报告的 corrects。等待依赖时也能记录准备工作。计划或猜测不能当成成果。',
       ProgressInput.extend({ taskId: id }), (context, { taskId, ...input }) => ({
         summary: '已记录任务进展。', data: this.projects.recordProgress(context.projectId, taskId, input, {
-          actorId: context.actorId, messageId: context.messageId, source: context.channel.source,
-          ...(context.text ? { original: context.text } : {}),
+          actorId: context.actorId, messageId: context.messageId, source: context.event && context.actorId ? 'agent' : context.channel.source,
+          ...(context.text && !context.event ? { original: context.text } : {}),
         }),
       })))
     this.register(operation('tracking.request', '成员明确要求联系负责人、追一下进度时，发起指定任务的进展检查。只查状态直接回答；任务指代不清楚时追问。只登记检查，不能承诺提醒已送达。不要为了提醒而开工或提交验收。',
@@ -182,7 +182,7 @@ export class ProjectTools {
           objective: current.objective, status: current.status, ...fields } })
         return { summary: `已更新项目「${result.name}」`, data: { status: result.status, objective: result.objective, autoAdvance: result.autoAdvance } }
       }))
-    this.register(operation('task.start', '登记任务已经开始，可与进展记录一起提交。负责人、项目开工和依赖条件由服务端核对。派发工单使用独立的 execution.start。',
+    this.register(operation('task.start', '登记任务已经开始，可与实际进展一起提交。负责人、项目开工和依赖条件由服务端核对。',
       z.strictObject({ taskId: id }), (context, { taskId }) => {
         const project = this.projects.detail(context.projectId)
         if (context.event) {
@@ -194,7 +194,7 @@ export class ProjectTools {
         const started = this.projects.beginTask(project.id, taskId, project.revision, context.actorId).tasks.find(item => item.id === taskId)!
         return { summary: `「${started.title}」已在进行中`, data: { taskId, status: started.status } }
       }))
-    this.register(operation('execution.start', '根据明确委托为任务登记后台工单，保留原负责人。自动事件仅能派发已指派给项目 Agent 的任务。',
+    this.register(operation('execution.start', '按需调用后台 Worker，适用于仓库工作区、执行命令或可恢复运行。保留原负责人；能在当前处理完成的工作可直接提交进展或结果。',
       z.strictObject({ taskId: id }), (context, args) => {
         const current = task(context, args.taskId)
         const project = this.projects.detail(context.projectId)
@@ -234,7 +234,7 @@ export class ProjectTools {
         return { summary: '讨论回复已登记，实际投递以回执为准。', data: host.reply(context, args.taskId, args.url, args.text),
           ...(context.event ? { replyChannel: projectChannel(host.store, this.projects.detail(context.projectId)) } : {}) }
       }))
-    this.register(operation('delivery.submit', '提交任务结果和证据。验收任务也使用此操作，填写 outcome 和检查依据。仅提交当前消息明确授权且有依据的结果。',
+    this.register(operation('delivery.submit', '提交实际任务结果和证据。成员可提交明确提供的成果，项目 Agent 可提交自己受托完成的成果。验收任务须填写 outcome 和检查依据。',
       TaskDelivery.extend({ taskId: id }), (context, { taskId, ...evidence }) => ({
         summary: '提交已登记，状态以事件处理结果为准。', data: host.reviews.deliver(context, taskId, evidence, context.reviewId),
       })))

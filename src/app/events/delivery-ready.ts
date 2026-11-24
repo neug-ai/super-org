@@ -7,6 +7,7 @@ import type { ProjectReviews } from '../project-reviews.ts'
 import type { ProjectEvents } from '../project-events.ts'
 import type { Store } from '../store.ts'
 import { mergedDelivery } from '../repository-delivery.ts'
+import { awaitsTaskExecution } from '../project-task-context.ts'
 
 const Payload = z.strictObject({ ticketId: z.string().min(1), reportAt: z.iso.datetime() })
 export const deliveryReady: ProjectEventDefinition = {
@@ -14,8 +15,7 @@ export const deliveryReady: ProjectEventDefinition = {
   schema: Payload, defaults: { enabled: true }, documentation: 'docs/events/delivery.zh-CN.md',
 }
 interface Host { store: Store; events: ProjectEvents; reviews: ProjectReviews; notify(message: OutboundMessage): void }
-const awaitsDelivery = (task: ProjectTask) => !task.reviewOf && (task.status === 'in-progress' ||
-  task.status === 'todo' && task.executionMode === undefined && !!task.executionStartedAt)
+const awaitsDelivery = (task: ProjectTask) => !task.reviewOf && awaitsTaskExecution(task)
 
 /** Translates a completed project execution into one durable review event, including startup recovery. */
 export class DeliveryReady {
