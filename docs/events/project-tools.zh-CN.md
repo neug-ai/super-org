@@ -16,6 +16,7 @@
 | `runtime.inspect` | 无 | 核对实际运行能力、消息发送方式及最近发送结果，不能变更原生权限 |
 | `conversation.preferences.inspect/update` | 无 / `revision`、`value` | 读取或保存会话的格式及风格偏好，独立于项目 |
 | `task.start` | `taskId` | 使用现有项目执行入口登记工单；检查开工状态、依赖、人员和执行条件 |
+| `task.begin` | `taskId` | 项目已开工且依赖完成时，负责人可把自己的人工任务标为进行中，可和进展记录一起提交 |
 | `task.stop` | `taskId` | 停止当前执行，保留历史 |
 | `task.follow_up` | `taskId`、`text` | 向当前执行 Agent 传递补充信息 |
 | `issue.create` | `taskId` | 为任务创建或取回 Issue，使用项目关联的仓库；远端完成后回写并通知 |

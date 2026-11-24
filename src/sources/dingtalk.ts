@@ -423,11 +423,13 @@ export class DingTalk {
         ? '钉钉附件下载码无效或已过期，请重新引用这份文件并 @ 机器人。'
         : '钉钉未授权下载这份附件，请重新引用文件或提供机器人可访问的副本。')
     }
-    const url = new URL(result.downloadUrl)
-    if (url.protocol !== 'https:' || url.username || url.password || url.port ||
+    const url = URL.parse(result.downloadUrl)
+    if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password || url.port ||
       !['dingtalk.com', 'dingtalkapps.com', 'aliyuncs.com'].some(domain => url.hostname === domain || url.hostname.endsWith(`.${domain}`))) {
       throw new AttachmentReadError('钉钉返回了不受支持的附件下载地址。')
     }
+    // DingTalk may issue an HTTP URL for an OSS object that also serves the signed URL over HTTPS.
+    url.protocol = 'https:'
     const download = await this.http(url, { signal, redirect: 'error' })
     if (!download.ok || !download.body) throw new AttachmentReadError('附件链接暂时无法下载，请重新引用这份文件。')
     if (Number(download.headers.get('Content-Length')) > maxAttachmentBytes) {

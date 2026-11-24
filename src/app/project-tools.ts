@@ -181,7 +181,19 @@ export class ProjectTools {
           objective: current.objective, status: current.status, ...fields } })
         return { summary: `已更新项目「${result.name}」`, data: { status: result.status, objective: result.objective, autoAdvance: result.autoAdvance } }
       }))
-    this.register(operation('task.start', '启动指定任务的 Agent 执行。项目须已开工，依赖须已验收，人工任务使用人工执行方式。',
+    this.register(operation('task.begin', '登记人工任务已经开始。用于负责人开始自己的待办任务，可与进展记录一起提交。项目须已开工，依赖须已完成。不会派发 Agent 工单。',
+      z.strictObject({ taskId: id }), (context, { taskId }) => {
+        const current = task(context, taskId)
+        if (current.executionMode !== 'manual') throw new ProjectError(409, '只有人工任务可以登记人工开工。')
+        if (context.actorId !== null && context.actorId !== current.ownerId)
+          throw new ProjectError(403, '只有任务负责人可以在群里登记人工开工。')
+        if (current.status === 'in-progress') return { summary: `「${current.title}」已在进行中` }
+        if (current.status !== 'todo' || this.projects.detail(context.projectId).status !== 'active')
+          throw new ProjectError(409, '只有已开工项目中的待办任务可以登记开工。')
+        change(context, { kind: 'task-status', id: taskId, status: 'in-progress' })
+        return { summary: `已将「${current.title}」标记为进行中`, data: { taskId, status: 'in-progress' } }
+      }))
+    this.register(operation('task.start', '启动指定任务的 Agent 执行并登记工单。项目须已开工，依赖须已验收。人工开工使用 task.begin。',
       z.strictObject({ taskId: id }), (context, args) => {
         task(context, args.taskId)
         const result = host.start(context.projectId, args.taskId, this.projects.detail(context.projectId).revision)
