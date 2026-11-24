@@ -37,9 +37,10 @@ function bindTicket(card: Card, ticketId?: string): void {
 
 /** Includes completed events so missing input context cannot fall back to an older source card. */
 export function hasCardBinding(context: SourceContext, ticketId?: string, triggerId?: string): boolean {
+  if (!ticketId && !triggerId) return false
   return context.state.keys(cards).some(name => {
     const card = context.state.get(name)
-    return !!card && (ticketId ? belongsTo(card, ticketId) : !!triggerId && card.triggerId === triggerId)
+    return !!card && (!ticketId || belongsTo(card, ticketId)) && (!triggerId || card.triggerId === triggerId)
   })
 }
 

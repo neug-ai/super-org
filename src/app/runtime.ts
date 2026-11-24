@@ -26,6 +26,7 @@ import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import { attachmentDirectory, type ExecutionAttachment } from './project-attachments.ts'
 import { ticketCard } from './cards.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -259,12 +260,13 @@ export class Runtime extends Service implements SourceHost {
           },
           progress: () => this.projectProgress,
           tracking: () => this.projectTracking,
-          start: (projectId, taskId, revision) => this.runProjectTask(projectId, taskId, revision),
+          start: (projectId, taskId, revision, attachments) => this.runProjectTask(projectId, taskId, revision, attachments),
           stop: (projectId, taskId, ticketId) => this.stopProjectTask(projectId, taskId, ticketId),
-          follow: (projectId, taskId, ticketId, text, origin) => this.followProjectTask(projectId, taskId, ticketId, text, origin),
+          follow: (projectId, taskId, ticketId, text, origin, attachments) => this.followProjectTask(projectId, taskId, ticketId, text, origin, attachments),
           reply: (context, taskId, url, text) => this.projectRepository.reply(context, taskId, url, text) })
         this.projectAgent = new ProjectAgent({ store, events: projectEvents, effects, tools, planner: () => planning.planner,
           notify: message => this.communication.notify(message), lifetime: this.lifetime,
+          attachmentDirectory: attachmentDirectory(machine.stateDir),
           teamSkills: () => prompts.current().config.skills,
           runnable: () => setup.configured() && !this.paused() && !this.closing() })
         this.projectProgress = new ProjectProgress({ store, events: projectEvents, agent: this.projectAgent, lifetime: this.lifetime })
@@ -559,12 +561,12 @@ export class Runtime extends Service implements SourceHost {
   }
 
   /** Submit operator-approved project work through the existing source gate and ticket executor. */
-  runProjectTask(id: string, taskId: string, revision: number): ProjectDetail {
-    const result = this.dispatchProjectTask(id, taskId, revision)
+  runProjectTask(id: string, taskId: string, revision: number, attachments?: readonly ExecutionAttachment[]): ProjectDetail {
+    const result = this.dispatchProjectTask(id, taskId, revision, attachments)
     this.passes.request()
     return result
   }
-  private dispatchProjectTask(id: string, taskId: string, revision: number): ProjectDetail {
+  private dispatchProjectTask(id: string, taskId: string, revision: number, attachments?: readonly ExecutionAttachment[]): ProjectDetail {
     if (this.projectExecution().state !== 'ready') throw new ProjectError(409, 'Project execution is unavailable')
     return new Projects(this.store).startTask(id, taskId, revision, (task, repository, dependencies) => {
       if (repository && !this.deployment.github.cli)
@@ -589,6 +591,7 @@ export class Runtime extends Service implements SourceHost {
       const prompt = input + context.slice(0, limit - input.length)
       const trigger = requestTrigger(prompt)
       trigger.meta = { projectId: id, projectTaskId: taskId, projectRepository: repository, runner: this.ctx.get('agentSessionBinding')?.runner ?? 'DSH' }
+      if (attachments?.length) trigger.meta.executionAttachments = attachments
       if (issue) trigger.url = issue
       if (this.engine.receive(trigger) !== 'stored') throw new ProjectError(409, 'Local project intake is unavailable')
       const decision = this.engine.decide(trigger.id, { kind: 'accept', title: task.title, scope, name: `project-${task.id.slice(0, 8)}`,
@@ -597,7 +600,8 @@ export class Runtime extends Service implements SourceHost {
       return decision.ticketId
     })
   }
-  followProjectTask(id: string, taskId: string, ticketId: string, text: string, origin?: ProjectEvent): ProjectDetail {
+  followProjectTask(id: string, taskId: string, ticketId: string, text: string, origin?: ProjectEvent,
+    attachments?: readonly ExecutionAttachment[]): ProjectDetail {
     if (this.projectExecution().state !== 'ready') throw new ProjectError(409, 'Project execution is unavailable')
     const projects = new Projects(this.store)
     const result = this.store.atomic(() => {
@@ -605,6 +609,7 @@ export class Runtime extends Service implements SourceHost {
       const attentionId = this.store.tickets.get(ticketId)?.attention?.id
       let trigger = requestTrigger(text)
       if (attentionId) trigger.meta.projectAttentionId = attentionId
+      if (attachments?.length) trigger.meta.executionAttachments = attachments
       if (origin) {
         const feedback = this.projectRepository.followOrigin(origin)
         const inputId = key('project-feedback-input', origin.id, text)

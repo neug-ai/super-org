@@ -419,7 +419,7 @@ it('loads older web project conversation only through the history tools', async 
   }).data).toBeNull()
 })
 
-it('uses the summary of a quoted DingTalk attachment to record the owner’s progress and start their task once', async () => {
+it('uses DingTalk attachment previews for progress and hands the original to new and existing workers', async () => {
   const { h, projects, id, member, change, propose } = await pilot()
   change({ kind: 'project', value: { name: '2048 事件验收', status: 'active' } })
   const task = change({ kind: 'task', value: { title: '整理交付材料', ownerId: member.id } }).tasks.at(-1)!
@@ -427,7 +427,9 @@ it('uses the summary of a quoted DingTalk attachment to record the owner’s pro
   const kind = dingTalkKind(async message => { send(message) })
   h.runtime.sources.register(kind)
   const settings = h.runtime.store.settings()
-  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } } })
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } },
+    policy: { ...settings.policy, sources: { ...settings.policy.sources, request: { allowed: [{ id: 'local' }] } } } })
+  const slides = readFileSync(new URL('./fixtures/reordered-slides.pptx', import.meta.url))
   let receive!: (frame: { headers: { messageId: string }; data: string }) => Promise<void>
   const callback = vi.spyOn(DWClient.prototype, 'registerCallbackListener').mockImplementation(function (this: DWClient, _topic, fn) {
     receive = fn as typeof receive; return this
@@ -439,9 +441,11 @@ it('uses the summary of a quoted DingTalk attachment to record the owner’s pro
       const request = JSON.parse(String(init?.body))
       if (request.downloadCode === 'expired-code') return Response.json({ code: 'invalidParameter.robotCode.downloadCode' }, { status: 400 })
       if (request.downloadCode === 'untrusted-code') return Response.json({ downloadUrl: 'http://aliyuncs.com.example.org/handout' })
+      if (request.downloadCode === 'slides-code') return Response.json({ downloadUrl: 'https://files.oss-cn-zhangjiakou.aliyuncs.com/slides' })
       expect(request).toEqual({ robotCode: 'robot', downloadCode: 'temporary-file-secret' })
       return Response.json({ downloadUrl: 'http://files.oss-cn-zhangjiakou.aliyuncs.com/handout?Signature=fixture%2Btoken' })
     }
+    if (String(url).endsWith('/slides')) return new Response(new Uint8Array(slides))
     expect(String(url)).toBe('https://files.oss-cn-zhangjiakou.aliyuncs.com/handout?Signature=fixture%2Btoken')
     expect(init?.headers).toBeUndefined()
     expect(init?.redirect).toBe('error')
@@ -498,6 +502,26 @@ it('uses the summary of a quoted DingTalk attachment to record the owner’s pro
     const untrusted = await post('untrusted-file', { code: 'untrusted-code' })
     expect(untrusted?.reply).toContain('钉钉返回了不受支持的附件下载地址')
     expect(fetchFile).toHaveBeenCalledTimes(5)
+
+    const execution = change({ kind: 'task', value: { title: '分析原始演示稿', executionMode: 'agent', ownerId: member.id } }).tasks.at(-1)!
+    propose.mockResolvedValueOnce({ summary: '幻灯片摘要。' })
+      .mockResolvedValueOnce({ calls: [call('execution.start', { taskId: execution.id })], reply: '' })
+    const start = await post('start-with-file', { name: 'slides.pptx', code: 'slides-code' })
+    expect(start?.steps[0]?.error).toBeUndefined()
+    const ticketId = projects.detail(id).tasks.find(item => item.id === execution.id)!.ticketId!
+    expect(ticketId).toBeTruthy()
+    const worker = `worker-${ticketId}`
+    const assignment = h.relays(worker)[0] as { trigger: { attachments: { name: string; local_path: string }[] } }
+    const first = assignment.trigger.attachments[0]!
+    expect(first).toEqual({ name: 'slides.pptx', local_path: expect.stringMatching(/\.pptx$/) })
+    expect(readFileSync(first.local_path)).toEqual(slides)
+
+    propose.mockResolvedValueOnce({ summary: '幻灯片摘要。' })
+      .mockResolvedValueOnce({ calls: [call('task.follow_up', { taskId: execution.id, text: '请打开原始附件并按页分析。' })], reply: '' })
+    const follow = await post('follow-up-with-file', { name: 'slides.pptx', code: 'slides-code' })
+    expect(follow?.steps[0]?.error).toBeUndefined()
+    expect(h.relays(worker).at(-1)).toMatchObject({ text: '请打开原始附件并按页分析。', attachments: [first] })
+    expect(JSON.stringify(h.relays(worker))).not.toMatch(/幻灯片摘要|slides-code/)
   } finally { callback.mockRestore(); ack.mockRestore() }
 })
 

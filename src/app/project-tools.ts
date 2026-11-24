@@ -18,6 +18,7 @@ import type { ProjectEvent } from '../sources/project-events.ts'
 import { RepositoryFeedback } from '../sources/repository-events.ts'
 import { projectChannel } from './project-notifications.ts'
 import { readConversation, searchConversation } from './project-conversation-history.ts'
+import type { ExecutionAttachment } from './project-attachments.ts'
 
 const id = z.string().min(1).max(128)
 const editable = TaskInput.omit({ status: true, ticketId: true, executionMode: true })
@@ -35,6 +36,8 @@ export interface ProjectToolContext {
   reviewId?: string
   text?: string
   event?: ProjectEvent
+  /** Original files retained by the project Agent for this message. Never a model argument. */
+  executionAttachments?: readonly ExecutionAttachment[]
 }
 export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef }
 export interface ProjectOperation {
@@ -53,9 +56,9 @@ export interface ProjectToolsHost {
   authorizeHistory?(context: ProjectToolContext): boolean
   progress?(): ProjectProgress | undefined
   tracking?(): ProjectTracking
-  start(projectId: string, taskId: string, revision: number): ProjectDetail
+  start(projectId: string, taskId: string, revision: number, attachments?: readonly ExecutionAttachment[]): ProjectDetail
   stop(projectId: string, taskId: string, ticketId: string): ProjectDetail
-  follow(projectId: string, taskId: string, ticketId: string, text: string, origin?: ProjectEvent): ProjectDetail
+  follow(projectId: string, taskId: string, ticketId: string, text: string, origin?: ProjectEvent, attachments?: readonly ExecutionAttachment[]): ProjectDetail
   reply?(context: ProjectToolContext, taskId: string, url: string, text: string): unknown
 }
 
@@ -203,7 +206,7 @@ export class ProjectTools {
           throw new ProjectError(403, '自动派发只适用于指派给项目 Agent 的任务。')
         if (context.actorId !== null && current.executionMode === undefined && !agentOwned && current.ownerId !== context.actorId)
           throw new ProjectError(403, '请由任务负责人委托后台执行。')
-        const result = host.start(context.projectId, args.taskId, project.revision)
+        const result = host.start(context.projectId, args.taskId, project.revision, context.executionAttachments)
         const started = result.tasks.find(item => item.id === args.taskId)!
         return { summary: `已为「${started.title}」登记 Agent 执行`, data: { taskId: started.id, ticketId: started.ticketId, status: started.status } }
       }))
@@ -224,7 +227,7 @@ export class ProjectTools {
             return { summary: `已将补充信息交给「${current.title}」的执行 Agent`, replyChannel: projectChannel(host.store, this.projects.detail(context.projectId)) }
           }
         }
-        host.follow(context.projectId, current.id, current.ticketId, args.text)
+        host.follow(context.projectId, current.id, current.ticketId, args.text, undefined, context.executionAttachments)
         return { summary: `已将补充信息交给「${current.title}」的执行 Agent` }
       }))
     this.register(operation('discussion.reply', '根据成员要求向当前任务已关联的代码交付或评审线程回复。只登记可靠投递，实际发送以回执为准；不能自行猜测其他仓库的地址。',
