@@ -28,7 +28,7 @@ import type { Store } from './store.ts'
 import type { ProjectEvents } from './project-events.ts'
 import type { ProjectAgent } from './project-agent.ts'
 import type { ProjectTools } from './project-tools.ts'
-import { ReviewEvidence, type ProjectReviews } from './project-reviews.ts'
+import { TaskDelivery, type ProjectReviews } from './project-reviews.ts'
 import { CommunicationPreference, type Communication } from './communication.ts'
 import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
@@ -52,7 +52,7 @@ export interface HttpHost {
   readonly projectEvents?: Pick<ProjectEvents, 'view' | 'save' | 'saveSource' | 'list'>
   readonly projectAgent?: Pick<ProjectAgent, 'submit' | 'runs' | 'webConversation'>
   readonly projectTools?: Pick<ProjectTools, 'catalog' | 'snapshot'>
-  readonly projectReviews?: Pick<ProjectReviews, 'submit' | 'decide'>
+  readonly projectReviews?: Pick<ProjectReviews, 'deliver' | 'decide'>
   readonly communication?: Pick<Communication, 'read' | 'update'>
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
@@ -219,8 +219,8 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     },
     'POST projects/:id/tasks/:taskId/deliveries': async ({ params, body }) => {
       if (!host?.projectReviews) throw new ProjectError(409, '验收服务尚未启动。')
-      const { messageId, ...evidence } = ReviewEvidence.extend({ messageId: ticketId }).parse(await body())
-      return host.projectReviews.submit({ projectId: params.id, actorId: null, operationId: messageId,
+      const { messageId, ...evidence } = TaskDelivery.extend({ messageId: ticketId }).parse(await body())
+      return host.projectReviews.deliver({ projectId: params.id, actorId: null, operationId: messageId,
         channel: { source: 'request', thread: params.id, address: { projectId: params.id } } }, params.taskId, evidence)
     },
     'POST projects/:id/tasks/:taskId/progress': async ({ params, body }) => {
@@ -302,6 +302,9 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     'POST projects/:id/changes': async ({ params, body }) => {
       const request = ProjectChange.parse(await body(256 * 1024))
       const change = request.change
+      if (change.kind === 'task-status' && change.status === 'in-progress' &&
+        projects.detail(params.id).tasks.find(task => task.id === change.id)?.status === 'todo')
+        return projects.beginTask(params.id, change.id, request.revision)
       if (change.kind === 'task-status' || change.kind === 'task') {
         const current = projects.detail(params.id).tasks.find(task => task.id === change.id)
         const status = change.kind === 'task-status' ? change.status : change.value.status

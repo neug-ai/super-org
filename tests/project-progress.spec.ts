@@ -42,7 +42,7 @@ it('wakes the existing Agent tool loop from readiness and registers only one tic
     expect(context.message.actorId).toBeNull()
     expect(context.tools.map((tool: { name: string }) => tool.name)).not.toContain('review.decide')
     expect(prompt).toContain('系统事实唤起')
-    return { calls: [call('task.start', { taskId: task.id })], reply: '' }
+    return { calls: [call('execution.start', { taskId: task.id })], reply: '' }
   })
   activate(); await h.runtime.idle()
   expect(projects.detail(id).tasks[0]).toMatchObject({ status: 'in-progress', ticketId: expect.any(String) })
@@ -67,7 +67,7 @@ it('revokes a proposal when the project pauses while the Agent is thinking', asy
   propose.mockImplementationOnce(() => pending.promise)
   activate(); await vi.waitFor(() => expect(propose).toHaveBeenCalledOnce())
   change({ kind: 'project', value: { name: '2048', status: 'paused' } })
-  pending.resolve({ calls: [call('task.start', { taskId: task.id })], reply: '' })
+  pending.resolve({ calls: [call('execution.start', { taskId: task.id })], reply: '' })
   await h.runtime.idle()
   expect(projects.detail(id).tickets).toEqual([])
   expect(h.runtime.projectAgent!.runs(id)[0]?.status).toBe('failed')
@@ -76,7 +76,7 @@ it('revokes a proposal when the project pauses while the Agent is thinking', asy
 it('rejects system proposals to accept delivery, change objectives or act on another task', async () => {
   const { h, projects, id, task, activate, change, propose } = await pilot()
   const other = change({ kind: 'task', value: { title: 'Other', blockedBy: [task.id] } }).tasks[1]!
-  propose.mockResolvedValueOnce({ calls: [call('task.start', { taskId: other.id }), call('project.update', { objective: 'Injected objective' })], reply: '' })
+  propose.mockResolvedValueOnce({ calls: [call('execution.start', { taskId: other.id }), call('project.update', { objective: 'Injected objective' })], reply: '' })
     .mockResolvedValueOnce(done())
   activate(); await h.runtime.idle()
   expect(projects.detail(id)).toMatchObject({ objective: '', tickets: [] })
@@ -85,7 +85,7 @@ it('rejects system proposals to accept delivery, change objectives or act on ano
 
 it('reacts to a current blocker through the same Agent and continues the original ticket', async () => {
   const { h, projects, id, task, activate, propose } = await pilot()
-  propose.mockResolvedValueOnce({ calls: [call('task.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
+  propose.mockResolvedValueOnce({ calls: [call('execution.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
   activate(); await h.runtime.idle()
   const ticketId = projects.detail(id).tasks[0]!.ticketId!
   propose.mockImplementation(async prompt => {
@@ -110,7 +110,7 @@ it('advances B from the actual acceptance event without a new chat instruction',
     const context = input(prompt)
     const event = JSON.parse(context.message.text)
     return event.taskId === task.id && !context.previousSteps.length
-      ? { calls: [call('task.start', { taskId: task.id })], reply: '' } : done(context.previousSteps.length ? '已登记 B 执行。' : '')
+      ? { calls: [call('execution.start', { taskId: task.id })], reply: '' } : done(context.previousSteps.length ? '已登记 B 执行。' : '')
   })
   activate(); await h.runtime.idle()
   expect(projects.detail(id).tickets).toHaveLength(0)
@@ -127,7 +127,7 @@ it('advances B from the actual acceptance event without a new chat instruction',
 
 it('does not wake another Agent round for repeated reports about one blocked episode', async () => {
   const { h, projects, id, task, activate, propose } = await pilot()
-  propose.mockResolvedValueOnce({ calls: [call('task.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
+  propose.mockResolvedValueOnce({ calls: [call('execution.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
   activate(); await h.runtime.idle()
   const ticketId = projects.detail(id).tasks[0]!.ticketId!
   propose.mockResolvedValue(done())
@@ -140,7 +140,7 @@ it('does not wake another Agent round for repeated reports about one blocked epi
 
 it('allows a blocker reaction to remain silent without dispatch or reminder spam', async () => {
   const { h, projects, id, task, activate, propose } = await pilot()
-  propose.mockResolvedValueOnce({ calls: [call('task.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
+  propose.mockResolvedValueOnce({ calls: [call('execution.start', { taskId: task.id })], reply: '' }).mockResolvedValueOnce(done('已登记执行。'))
   activate(); await h.runtime.idle()
   const ticketId = projects.detail(id).tasks[0]!.ticketId!
   propose.mockResolvedValue(done())

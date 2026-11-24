@@ -15,7 +15,7 @@ const Ready = z.strictObject({ signature: id, episode: id })
 export const taskReady: ProjectEventDefinition = {
   type: 'task.ready', category: 'dependencies', schema: Ready,
   description: '项目授权推进且任务依赖已验收，唤起 Agent 判断下一步。',
-  defaults: { enabled: true, instruction: '任务现在满足推进条件。结合最新目标、分工和依赖判断下一步；Agent 任务条件具备时通过 task.start 登记一次执行，人工任务提醒负责人开始。条件不足时明确缺项，必要时预约检查。不得自行验收或虚构完成。' },
+  defaults: { enabled: true, instruction: '任务现在满足推进条件。已指派给项目 Agent 的普通任务可组合 task.start 与 execution.start。其余任务根据当前状态跟进负责人；条件不足时明确缺项。不得自行验收或虚构完成。' },
   documentation: 'docs/events/follow-up.zh-CN.md',
 }
 const Due = z.strictObject({ checkId: id, signature: id, reason: z.string().min(1).max(2000) })
@@ -46,7 +46,7 @@ export class ProjectProgress {
     host.events.register('project', [taskReady])
     host.events.register('clock', [checkDue])
     for (const type of [taskReady.type, checkDue.type, 'task.blocked']) host.agent.registerReaction?.(type, {
-      tools: ['project.inspect', 'runtime.inspect', 'task.start', 'task.follow_up', 'follow_up.schedule', 'follow_up.cancel'],
+      tools: ['project.inspect', 'runtime.inspect', 'task.start', 'execution.start', 'task.follow_up', 'follow_up.schedule', 'follow_up.cancel'],
       current: (event, replyOnly) => this.current(event, replyOnly),
     })
     host.events.handle(taskReady.type, event => {

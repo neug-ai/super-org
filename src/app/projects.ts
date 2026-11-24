@@ -11,6 +11,7 @@ import type { Store } from './store.ts'
 import type { ExecutorLoad } from './views/tickets.ts'
 import { currentReview, deliveryScopeChanged, nextDelivery, type DeliveryEvidence, type ProjectReview } from './project-deliveries.ts'
 import { TrackingSchedule } from './tracking-schedule.ts'
+import { isProjectAgent, projectAgentAccount } from './project-member.ts'
 
 const title = z.string().trim().min(1).max(200)
 const description = z.string().trim().max(8000)
@@ -63,7 +64,8 @@ export const TaskInput = z.strictObject({
   ownerId: id.nullable().default(null), milestoneId: id.nullable().default(null), blockedBy: ids.default([]),
   dueDate: dueDate.default(null), acceptance: longText.default(''), issueUrl: issue.default(null), ticketId: id.nullable().default(null),
   priority: Priority.default(defaultPriority),
-  executionMode: z.enum(['manual', 'agent']).nullable().default(null),
+  // Existing API clients and saved tasks may still have the old execution model.
+  executionMode: z.enum(['manual', 'agent']).nullable().optional(),
   issueRole: z.enum(['reference', 'resolve']).optional(),
   deliveryMode: z.enum(['report', 'pull-request']).optional(),
   pullRequestUrl: z.string().regex(/^https:\/\/github\.com\/[\w-]+\/[\w.-]+\/pull\/[1-9]\d*$/).nullable().optional(),
@@ -80,6 +82,7 @@ export const ProjectChange = z.strictObject({
   change: z.discriminatedUnion('kind', [
     z.strictObject({ kind: z.literal('project'), value: ProjectInput }),
     z.strictObject({ kind: z.literal('add-member'), memberId: id }),
+    z.strictObject({ kind: z.literal('add-agent') }),
     z.strictObject({ kind: z.literal('new-member'), value: MemberInput }),
     z.strictObject({ kind: z.literal('remove-member'), memberId: id }),
     z.strictObject({ kind: z.literal('task'), id: id.optional(), value: TaskInput }),
@@ -105,6 +108,7 @@ export type ProjectTask = Omit<z.output<typeof TaskInput>, 'executionMode'> & {
   executionStartedAt?: string
   deliveryVersion?: number
   reviews?: ProjectReview[]
+  reviewOf?: { taskId: string; reviewId: string; version: number }
   progress?: TaskProgress[]
 }
 export type ProjectMilestone = z.output<typeof MilestoneInput> & { id: string }
@@ -191,6 +195,11 @@ export class Projects {
   }
 
   members(): Member[] { return this.records(KV.projects.member).sort(byName) }
+
+  ensureProjectAgent(): Member {
+    return this.store.atomic(() => this.members().find(isProjectAgent) ??
+      this.saveMember({ name: 'Agent', accounts: [projectAgentAccount] }))
+  }
 
   repositoryBindings(): { repository: string; since: string }[] {
     return this.records(KV.projects.project).flatMap(project => project.repository && project.status !== 'archived'
@@ -417,6 +426,27 @@ export class Projects {
     }) }
   }
 
+  beginTask(projectId: string, taskId: string, revision: number, actorId: string | null = null): ProjectDetail {
+    const project = this.atRevision(projectId, revision)
+    const task = requireRecord(project.tasks, taskId, 'Task')
+    if (actorId !== null && (!project.memberIds.includes(actorId) || task.executionMode === 'agent' || task.ownerId !== actorId))
+      throw new ProjectError(403, '只有任务负责人可以在群里登记开工。')
+    if (task.status === 'in-progress') return this.detail(projectId)
+    if (project.status !== 'active' || task.status !== 'todo')
+      throw new ProjectError(409, '只有已开工项目中的待办任务可以登记开工。')
+    return this.change(projectId, { revision, change: { kind: 'task-status', id: taskId, status: 'in-progress' } })
+  }
+
+  private advanceDelivery(project: Project, task: ProjectTask): void {
+    const review = currentReview(task)
+    const reviewTask = review?.taskId && project.tasks.find(item => item.id === review.taskId)
+    if (review?.status === 'pending' && reviewTask && active(reviewTask)) {
+      reviewTask.status = 'cancelled'
+      reviewTask.updatedAt = isoNow()
+    }
+    nextDelivery(task)
+  }
+
   /** Create the execution ticket and save its project link in the same transaction. */
   startTask(projectId: string, taskId: string, revision: number,
     start: (task: ProjectTask, repository: string | null, dependencies: ProjectTask[]) => string): ProjectDetail {
@@ -425,7 +455,6 @@ export class Projects {
       const task = requireRecord(project.tasks, taskId, 'Task')
       if (project.status !== 'active' || !active(task) || task.status === 'in-review')
         throw new ProjectError(409, 'Only active work outside review can be started')
-      if (task.executionMode === 'manual') throw new ProjectError(409, 'This task is assigned to manual execution')
       const dependencies = task.blockedBy.flatMap(id => project.tasks.find(dependency => dependency.id === id) ?? [])
       if (dependencies.length !== task.blockedBy.length || dependencies.some(dependency => dependency.status !== 'done'))
         throw new ProjectError(409, 'Finish the task dependencies before starting execution')
@@ -434,9 +463,9 @@ export class Projects {
       if ((task.ticketId && this.store.tickets.get(task.ticketId)?.ended === undefined) || this.detail(projectId).tickets.some(item => item.taskId === taskId && !item.ended))
         throw new ProjectError(409, 'This task already has an open ticket')
       const ticketId = start(task, project.repository ?? null, dependencies)
-      nextDelivery(task)
+      this.advanceDelivery(project, task)
       task.ticketId = ticketId
-      task.status = 'in-progress'
+      if (task.executionMode !== undefined) task.status = 'in-progress'
       task.updatedAt = isoNow()
       task.executionStartedAt = task.updatedAt
       return this.save(project)
@@ -455,20 +484,30 @@ export class Projects {
   }
 
   /** Captures an immutable review snapshot for the current delivery. Called by the ordered review event handler. */
-  requestReview(projectId: string, taskId: string, evidence: DeliveryEvidence, at: string): ProjectDetail {
+  requestReview(projectId: string, taskId: string, evidence: DeliveryEvidence, at: string, linkedTask: boolean): ProjectDetail {
     return this.store.atomic(() => {
       const project = this.require(projectId)
       const task = requireRecord(project.tasks, taskId, 'Task')
-      if (project.status === 'archived' || !['todo', 'in-progress', 'in-review'].includes(task.status))
+      if (project.status === 'archived' || task.reviewOf || !['todo', 'in-progress', 'in-review'].includes(task.status))
         throw new ProjectError(409, '任务当前不能提交验收。')
       if (task.blockedBy.some(id => project.tasks.find(item => item.id === id)?.status !== 'done'))
         throw new ProjectError(409, '请先完成前置任务的验收。')
       if (this.detail(projectId).tickets.some(item => !item.ended && (item.id === task.ticketId || item.taskId === task.id)))
         throw new ProjectError(409, '当前执行尚未结束，暂不能提交验收。')
       if (currentReview(task)?.status === 'pending') throw new ProjectError(409, '本版交付已经在等待验收。')
-      if (!task.deliveryVersion || currentReview(task)) nextDelivery(task)
+      if (!task.deliveryVersion || currentReview(task)) this.advanceDelivery(project, task)
       const review: ProjectReview = { id: randomUUID(), version: task.deliveryVersion!, requestedAt: at, status: 'pending',
-        requirements: { title: task.title, description: task.description, acceptance: task.acceptance, ownerId: task.ownerId }, evidence }
+        requirements: { title: task.title, description: task.description, acceptance: task.acceptance,
+          ...((!linkedTask || task.executionMode !== undefined) && { ownerId: task.ownerId }) }, evidence }
+      if (linkedTask) {
+        const value = TaskInput.parse({ title: `验收「${task.title.slice(0, 170)}」· 第 ${review.version} 版`,
+          acceptance: task.acceptance, description: evidence.summary, milestoneId: task.milestoneId,
+          ownerId: task.executionMode !== undefined && task.ownerId && project.memberIds.includes(task.ownerId) ? task.ownerId : null })
+        const reviewTask: ProjectTask = { ...value, id: randomUUID(), createdAt: at, updatedAt: at, completedAt: null,
+          reviewOf: { taskId, reviewId: review.id, version: review.version } }
+        review.taskId = reviewTask.id
+        project.tasks.push(reviewTask)
+      }
       ;(task.reviews ??= []).push(review)
       task.status = 'in-review'; task.updatedAt = at; task.completedAt = null
       return this.save(project)
@@ -483,11 +522,20 @@ export class Projects {
       const review = currentReview(task)
       if (project.status === 'archived' || task.status !== 'in-review' || !review || review.id !== reviewId || review.status !== 'pending')
         throw new ProjectError(409, '这次验收已结束或交付已更新，请查看当前交付。')
-      if (decision.actorId !== null && (!project.memberIds.includes(decision.actorId) || review.requirements.ownerId !== decision.actorId))
+      const reviewTask = review.taskId ? requireRecord(project.tasks, review.taskId, 'Review task') : undefined
+      if (reviewTask && !active(reviewTask)) throw new ProjectError(409, '当前验收任务已结束。')
+      if (reviewTask?.blockedBy.some(id => project.tasks.find(item => item.id === id)?.status !== 'done'))
+        throw new ProjectError(409, '请先完成验收任务的前置工作。')
+      if (decision.actorId !== null && (!project.memberIds.includes(decision.actorId) ||
+        (reviewTask ? reviewTask.ownerId : review.requirements.ownerId) !== decision.actorId))
         throw new ProjectError(403, '请由这项任务当前指定的负责人验收。')
       if (task.blockedBy.some(id => project.tasks.find(item => item.id === id)?.status !== 'done'))
         throw new ProjectError(409, '前置验收已经变化，请先核对依赖。')
       review.status = outcome; review.decision = decision
+      if (reviewTask) {
+        reviewTask.status = 'done'
+        reviewTask.updatedAt = reviewTask.completedAt = decision.at
+      }
       task.status = outcome === 'accepted' ? 'done' : 'in-progress'
       task.completedAt = outcome === 'accepted' ? decision.at : null
       task.updatedAt = decision.at
@@ -512,6 +560,12 @@ export class Projects {
           }
           break
         case 'new-member': project.memberIds.push(this.saveMember(change.value).id); break
+        case 'add-agent': {
+          const member = this.ensureProjectAgent()
+          if (project.memberIds.includes(member.id)) return this.detail(projectId)
+          project.memberIds.push(member.id)
+          break
+        }
         case 'add-member': {
           if (!this.store.get(KV.projects.member(change.memberId))) throw new ProjectError(404, 'Member not found')
           if (project.memberIds.includes(change.memberId)) return this.detail(projectId)
@@ -545,6 +599,11 @@ export class Projects {
           const value = change.kind === 'task-status' ? { ...current!, status: change.status }
             : change.kind === 'task-ticket' ? { ...current!, ticketId: change.ticketId }
               : change.kind === 'task-priority' ? { ...current!, priority: change.priority } : change.value
+          if (current?.executionMode !== undefined && value.executionMode === undefined && value.ownerId === current.ownerId)
+            value.executionMode = current.executionMode
+          if (current?.reviewOf && (value.blockedBy.includes(current.reviewOf.taskId) ||
+            ['done', 'in-review', 'cancelled'].includes(value.status) && value.status !== current.status))
+            throw new ProjectError(409, '请从验收任务的交付入口登记验收结果。')
           if (value.issueUrl && value.issueUrl !== current?.issueUrl) {
             const linked = project.tasks.find(task => task.id !== current?.id && task.issueUrl === value.issueUrl)
             if (linked) throw new ProjectError(409, `This GitHub Issue is already linked to “${linked.title}”`)
@@ -568,7 +627,7 @@ export class Projects {
             if (changed && this.detail(projectId).tickets.some(item => !item.ended && (item.id === current.ticketId || item.taskId === current.id)))
               throw new ProjectError(409, '请先停止当前执行，再修改交付范围。')
             if (changed || task.status !== current.status || task.ticketId !== current.ticketId) {
-              nextDelivery(current)
+              this.advanceDelivery(project, current)
               task.deliveryVersion = current.deliveryVersion
               task.reviews = current.reviews
               if (changed && task.status === 'in-review') task.status = 'in-progress'
@@ -585,7 +644,11 @@ export class Projects {
           if (current?.status === 'done' && task.status !== 'done' &&
             project.tasks.some(item => item.status !== 'todo' && item.status !== 'cancelled' && item.blockedBy.includes(task.id)))
             throw new ProjectError(409, 'Move dependent tasks back to To do before reopening this task')
-          if (current) Object.assign(current, task)
+          if (current) {
+            // New assignments replace the historical mode and its overloaded owner field.
+            if (value.executionMode === undefined) delete current.executionMode
+            Object.assign(current, task)
+          }
           else project.tasks.push(task)
           break
         }

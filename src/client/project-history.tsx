@@ -1,7 +1,7 @@
 import { useId, useRef, useState, type ReactNode } from 'react'
 import type { ApiResponse } from '../app/api.ts'
 import type { ProjectDetail, ProjectTask } from '../app/projects.ts'
-import { deliveryReviewState } from '../app/project-deliveries.ts'
+import { currentReview, deliveryReviewState } from '../app/project-deliveries.ts'
 import { usePoll, type Call } from './api.ts'
 import { Button, Icon, SegmentedTabs, Tag, type IconName, type TagTone } from './controls.tsx'
 import { errorText, formatBytes, type T } from './text.ts'
@@ -204,14 +204,16 @@ function PendingWork({ t, project, answers, reviews, checks, taskName, openTask,
     </section>}
     {!!reviews.length && <section className="dt-history-bucket"><h4>{t('project.history.pendingReviews')}</h4>
       <ul className="dt-history-records">{reviews.map(task => {
-        const review = deliveryReviewState(task)
-        const owner = review.reviewerId && memberNames.get(review.reviewerId)
+        const review = currentReview(task)
+        const reviewTask = review?.taskId && project.tasks.find(item => item.id === review.taskId)
+        const reviewerId = reviewTask ? reviewTask.ownerId : review?.requirements.ownerId
+        const owner = reviewerId && memberNames.get(reviewerId)
         return <li key={task.id} className="dt-history-record">
           <span className="dt-history-record-icon"><Icon name="review" /></span>
           <div><strong>{task.title}</strong>
-            <p className="dt-project-meta">{t('project.tracking.awaitingReview', { version: review.version ?? '—', owner: owner || t('project.unassigned') })}</p>
+            <p className="dt-project-meta">{t('project.tracking.awaitingReview', { version: review?.version ?? '—', owner: owner || t('project.unassigned') })}</p>
           </div>
-          {openTask && <Button size="sm" variant="outline" onClick={() => openTask(task)}>{t('project.history.openTask')}</Button>}
+          {openTask && <Button size="sm" variant="outline" onClick={() => openTask(reviewTask || task)}>{t('project.history.openTask')}</Button>}
         </li>
       })}</ul>
     </section>}

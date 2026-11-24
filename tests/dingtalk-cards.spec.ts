@@ -204,7 +204,7 @@ it('plans directly from a member’s minutes and resumes from a clarification th
     expect(notify.mock.lastCall?.[0]).toMatchObject({ kind: 'notice', text: expect.stringContaining('新增 实现原型') })
     expect(notify.mock.lastCall?.[0].text).toContain(question)
     const before = projects.detail(id)
-    expect(before).toMatchObject({ status: 'planning', tasks: [{ title: '实现原型', ownerId: reviewer, executionMode: 'agent', ticketId: null }], tickets: [] })
+    expect(before).toMatchObject({ status: 'planning', tasks: [{ title: '实现原型', ownerId: projects.ensureProjectAgent().id, ticketId: null }], tickets: [] })
     const prototype = before.tasks[0]!
 
     const reply = { ...message, msgId: 'review-reply', text: { content: '会议反馈：测试用例由 Agent 执行，由林同学验收，至少包含失败场景。' } }
@@ -226,7 +226,7 @@ it('plans directly from a member’s minutes and resumes from a clarification th
     expect(notify.mock.lastCall?.[0]).toMatchObject({ kind: 'notice', text: expect.stringContaining('新增 整理测试用例') })
     expect(notify.mock.lastCall?.[0].text).not.toContain(question)
     expect(projects.detail(id)).toMatchObject({ status: 'planning', tasks: [prototype, { title: '整理测试用例',
-      executionMode: 'agent', ownerId: reviewer, blockedBy: [prototype.id], status: 'todo', ticketId: null }], tickets: [] })
+      ownerId: projects.ensureProjectAgent().id, blockedBy: [prototype.id], status: 'todo', ticketId: null }], tickets: [] })
 
     await deliver({ ...reply, msgId: 'additional-feedback' })
     await effects.idle('project-plan')
@@ -271,8 +271,8 @@ it.each([
     const detail = projects.detail(project!.id)
     expect(detail).toMatchObject({ name: '样例项目', repository, status: 'planning', autoAdvance: false,
       dingTalkGroup: 'group', tickets: [], decisions: [{ initialMeeting: true }],
-      tasks: [{ title: '整理首版边界', executionMode: 'agent', ownerId: reviewer.id, ticketId: null, issueUrl: null }] })
-    expect(new Set(detail.memberIds)).toEqual(new Set([author.id, reviewer.id]))
+      tasks: [{ title: '整理首版边界', ownerId: projects.ensureProjectAgent().id, ticketId: null, issueUrl: null }] })
+    expect(new Set(detail.memberIds)).toEqual(new Set([author.id, projects.ensureProjectAgent().id]))
   } finally { await effects.drain(); store.close(); rmSync(directory, { recursive: true, force: true }) }
 })
 it('keeps the source receipt and appends confirmation and result, retaining the spinner until the final reply', async () => {

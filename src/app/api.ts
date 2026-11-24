@@ -42,7 +42,7 @@ export interface Api {
   'GET projects/:id/history/statistics': { response: ReturnType<import('./project-history.ts').ProjectHistory['statistics']> }
   'GET projects/workspace/storage': { response: ReturnType<typeof import('./project-history.ts').databaseStorage> }
   'POST projects/:id/synchronization/:operationId/retry': { response: { status: 'queued' } }
-  'POST projects/:id/tasks/:taskId/deliveries': { body: { messageId: string; summary: string; links?: string[] }; response: ReturnType<ProjectReviews['submit']> }
+  'POST projects/:id/tasks/:taskId/deliveries': { body: { messageId: string; summary: string; links?: string[]; outcome?: 'accepted' | 'rejected' }; response: ReturnType<ProjectReviews['deliver']> }
   'POST projects/:id/tasks/:taskId/progress': { body: ProgressInput & { messageId: string }; response: TaskProgress }
   'POST projects/:id/tasks/:taskId/tracking': { body: { messageId: string; focus?: string }; response: ProjectEvent }
   'POST projects/:id/tasks/:taskId/reviews/:reviewId': { body: { messageId: string; outcome: 'accepted' | 'rejected'; reason: string }; response: ReturnType<ProjectReviews['decide']> }

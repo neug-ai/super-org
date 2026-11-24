@@ -15,13 +15,14 @@ export const ticketLabel = (t: T, ticket: ProjectTicket) => {
   return t(ticket.stage === 'idle' ? 'stage.idle' : ticket.action === 'queued' ? 'stage.queued' : 'stage.working')
 }
 
-export function ProjectMembers({ t, project, canAdd, pending, create, add, edit, remove, showTasks }: {
+export function ProjectMembers({ t, project, canAdd, pending, create, add, addAgent, edit, remove, showTasks }: {
   t: T; project: ProjectDetail; canAdd: boolean; pending: boolean; create: () => void; add: () => void;
-  edit: (member: Member) => void; remove: (member: Member) => void; showTasks: (member: Member) => void
+  addAgent?: () => void; edit: (member: Member) => void; remove: (member: Member) => void; showTasks: (member: Member) => void
 }) {
   return <section className="dt-card dt-project-panel">
     <div className="dt-project-heading"><h3>{t('project.members')}</h3><div className="dt-work-actions">
       {canAdd && <Button variant="outline" size="sm" onClick={add}>{t('project.addMember')}</Button>}
+      {addAgent && <Button variant="outline" size="sm" disabled={pending} onClick={addAgent}>{t('project.addAgentMember')}</Button>}
       <Button variant="primary" size="sm" icon={<Icon name="plus" size={14} />} onClick={create}>{t('project.newMember')}</Button>
     </div></div>
     <p className="dt-hint">{t(project.members.length ? 'project.membersHelp' : 'project.membersEmptyHelp')}</p>

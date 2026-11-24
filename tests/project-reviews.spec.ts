@@ -52,6 +52,45 @@ it('captures manual evidence and requirements once, notifies the bound reviewer 
   expect(projects.detail(id).tickets).toEqual([])
   expect(h.runtime.projectEvents.list({ projectId: id })).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'review.accepted', status: 'applied' })]))
 })
+it('uses the same task operations for people and the project Agent and completes a version-linked review task', async () => {
+  const { h, id, owner, other, projects, context, change } = await pilot()
+  const roster = change({ kind: 'add-agent' })
+  const agent = roster.members.find(member => member.accounts.some(account => account.provider === 'agent'))!
+  expect(change({ kind: 'add-agent' }).memberIds.filter(id => id === agent.id)).toHaveLength(1)
+  const tools = h.runtime.projectTools!
+  const operation = (messageId: string, actorId: string | null) => ({ ...context(messageId, actorId), messageId })
+  const deliver = (taskId: string, body: Record<string, unknown>) => h.api('POST', `projects/${id}/tasks/${taskId}/deliveries`, body)
+  for (const person of [owner, agent]) {
+    const task = change({ kind: 'task', value: { title: `Experiment by ${person.name}`, ownerId: person.id } }).tasks.at(-1)!
+    expect(task).not.toHaveProperty('executionMode')
+    const actor = operation(`work-${person.id}`, person.id)
+    tools.execute('task.start', { taskId: task.id }, actor)
+    tools.execute('progress.record', { taskId: task.id, summary: 'Collected experimental data' }, actor)
+    const before = projects.detail(id)
+    expect(before.tasks.find(item => item.id === task.id)).toMatchObject({ status: 'in-progress', ownerId: person.id,
+      progress: [{ actorId: person.id, summary: 'Collected experimental data' }] })
+    expect(before.tickets).toEqual([])
+    expect(await deliver(task.id, { messageId: `delivery-${person.id}`, summary: 'Result' })).toMatchObject({ status: 200 })
+    await h.runtime.idle()
+    const parent = projects.detail(id).tasks.find(item => item.id === task.id)!
+    const review = currentReview(parent)!
+    const check = projects.detail(id).tasks.find(item => item.id === review.taskId)!
+    expect(review.requirements).not.toHaveProperty('ownerId')
+    expect(check).toMatchObject({ status: 'todo', ownerId: null, reviewOf: { taskId: task.id, reviewId: review.id, version: review.version } })
+    change({ kind: 'task', id: check.id, value: { ...TaskInput.strip().parse(check), ownerId: other.id } })
+    const result = { taskId: check.id, outcome: 'accepted', summary: 'Reproduced the result', links: ['https://example.com/verification'] }
+    expect(() => tools.execute('delivery.submit', result, operation(`self-${person.id}`, person.id))).toThrow('负责人')
+    tools.execute('task.start', { taskId: check.id }, operation(`check-start-${person.id}`, other.id))
+    const saved = tools.execute('delivery.submit', result, operation(`check-result-${person.id}`, other.id))
+    await h.runtime.idle()
+    expect(tools.execute('delivery.submit', result, operation(`check-result-${person.id}`, other.id)).data).toMatchObject({
+      ...(saved.data as { eventId: string }), status: 'applied' })
+    const after = projects.detail(id)
+    expect(after.tasks.find(item => item.id === task.id)).toMatchObject({ status: 'done', ownerId: person.id })
+    expect(after.tasks.find(item => item.id === check.id)).toMatchObject({ status: 'done', ownerId: other.id })
+    expect(currentReview(after.tasks.find(item => item.id === task.id)!)).toMatchObject({ status: 'accepted', decision: { actorId: other.id, links: result.links } })
+  }
+})
 it('retries the same delivery and decision idempotently, and rejects reuse with different evidence', async () => {
   const { h, id, task, readTask, submit, decide } = await pilot()
   const review = await submit(); const first = await decide(review.id, 'accepted')

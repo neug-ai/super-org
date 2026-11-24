@@ -38,7 +38,8 @@ async function pilot(knowledgeDir?: string) {
 }
 
 it('uses the screenshot request and quote to add acceptance criteria and assignment without dispatching work', async () => {
-  const { h, projects, id, assignee, task, propose, say } = await pilot()
+  const { h, projects, id, assignee, task, propose, say, change } = await pilot()
+  const agent = change({ kind: 'add-agent' }).members.find(member => member.accounts.some(account => account.provider === 'agent'))!
   propose.mockImplementationOnce(async prompt => {
     expect(prompt).toContain('请你帮忙梳理 验收通过条件并分派给 李顺阳')
     expect(prompt).toContain('整理开发测试用例')
@@ -46,7 +47,7 @@ it('uses the screenshot request and quote to add acceptance criteria and assignm
     expect(prompt).toContain('task.create')
     return { calls: [call('member.add', { memberId: assignee.id }), call('task.create', { title: '整理开发测试用例',
       description: '整理普通合并、连续相同数字、无效移动、结束与重开的用例', acceptance: '每条列明初始棋盘、操作、预期棋盘和计分变化',
-      ownerId: assignee.id, executionMode: 'agent', blockedBy: [task.id] })], reply: '' }
+      ownerId: agent.id, blockedBy: [task.id] })], reply: '' }
   }).mockImplementationOnce(async prompt => {
     expect(prompt).toContain('已创建「整理开发测试用例」')
     return done('已补充测试用例的验收条件，由李顺阳验收。')
@@ -55,7 +56,7 @@ it('uses the screenshot request and quote to add acceptance criteria and assignm
     '整理开发测试用例由 Agent 执行、李顺阳验收。需要覆盖哪些内容，以什么条件验收？')
   expect(run.status).toBe('completed')
   expect(projects.detail(id)).toMatchObject({ status: 'planning', autoAdvance: false, tickets: [], tasks: [task,
-    { title: '整理开发测试用例', status: 'todo', ownerId: assignee.id, executionMode: 'agent', blockedBy: [task.id] }] })
+    { title: '整理开发测试用例', status: 'todo', ownerId: agent.id, blockedBy: [task.id] }] })
   expect(run.steps[0]?.results).toHaveLength(2)
   expect(h.runtime.projectEvents.list({ projectId: id }).map(event => event.type)).toContain('project.message.received')
   const history = await h.api('GET', `projects/${id}/agent-runs`)
@@ -122,7 +123,7 @@ it('starts work through normal project tools and reuses the same run on request 
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy,
     sources: { ...settings.policy.sources, request: { allowed: [{ id: 'local' }] } } } })
-  propose.mockResolvedValueOnce({ calls: [call('project.update', { status: 'active' }), call('task.start', { taskId: task.id })], reply: '' })
+  propose.mockResolvedValueOnce({ calls: [call('project.update', { status: 'active' }), call('execution.start', { taskId: task.id })], reply: '' })
   const run = await say('start', '项目开工，先让 Agent 做规则整理')
   expect(run.status).toBe('completed')
   expect(projects.detail(id)).toMatchObject({ status: 'active', tasks: [{ status: 'in-progress' }], tickets: [expect.objectContaining({ taskId: task.id })] })
@@ -134,7 +135,7 @@ it('starts work through normal project tools and reuses the same run on request 
 it('preserves dependency gates and rolls back kickoff when dispatch fails', async () => {
   const { projects, id, change, task, propose, say } = await pilot()
   const downstream = change({ kind: 'task', value: { title: 'Dependent work', executionMode: 'agent', blockedBy: [task.id] } }).tasks[1]!
-  propose.mockResolvedValueOnce({ calls: [call('project.update', { status: 'active' }), call('task.start', { taskId: downstream.id })], reply: '' })
+  propose.mockResolvedValueOnce({ calls: [call('project.update', { status: 'active' }), call('execution.start', { taskId: downstream.id })], reply: '' })
   const run = await say('blocked-dispatch', '先开始第二项')
   expect(run.steps[0]?.error).toBeTruthy()
   expect(projects.detail(id)).toMatchObject({ status: 'planning', tickets: [] })
@@ -421,7 +422,7 @@ it('loads older web project conversation only through the history tools', async 
 it('uses the summary of a quoted DingTalk attachment to record the owner’s progress and start their task once', async () => {
   const { h, projects, id, member, change, propose } = await pilot()
   change({ kind: 'project', value: { name: '2048 事件验收', status: 'active' } })
-  const task = change({ kind: 'task', value: { title: '整理交付材料', executionMode: 'manual', ownerId: member.id } }).tasks.at(-1)!
+  const task = change({ kind: 'task', value: { title: '整理交付材料', ownerId: member.id } }).tasks.at(-1)!
   const send = vi.fn()
   const kind = dingTalkKind(async message => { send(message) })
   h.runtime.sources.register(kind)
@@ -468,10 +469,10 @@ it('uses the summary of a quoted DingTalk attachment to record the owner’s pro
       expect(prompt).toContain('"attachments":[{"name":"handout.html","summary":"材料按章节列出了执行证据。"')
       expect(prompt).not.toContain('Execution evidence by section')
       return { calls: [call('progress.record', { taskId: task.id, summary: '已整理交付材料。handout.html 按章节列出执行证据。' }),
-        call('task.begin', { taskId: task.id })], reply: '' }
+        call('task.start', { taskId: task.id })], reply: '' }
     }).mockImplementationOnce(async prompt => {
       expect(prompt).toContain('已记录任务进展。')
-      expect(prompt).toContain('已将「整理交付材料」标记为进行中')
+      expect(prompt).toContain('「整理交付材料」已在进行中')
       return done('已记录进展，并将整理交付材料标记为进行中。')
     })
     const run = (await post('quote-file'))!
@@ -500,18 +501,18 @@ it('uses the summary of a quoted DingTalk attachment to record the owner’s pro
   } finally { callback.mockRestore(); ack.mockRestore() }
 })
 
-it('keeps manual start restricted to the owner and leaves progress available while dependencies are open', async () => {
+it('keeps task start restricted to the owner and leaves progress available while dependencies are open', async () => {
   const { h, id, member, assignee, task, change, projects } = await pilot()
   change({ kind: 'project', value: { name: '2048 事件验收', status: 'active' } })
   change({ kind: 'add-member', memberId: assignee.id })
-  const downstream = change({ kind: 'task', value: { title: '整理交付材料', executionMode: 'manual', ownerId: member.id,
+  const downstream = change({ kind: 'task', value: { title: '整理交付材料', ownerId: member.id,
     blockedBy: [task.id] } }).tasks.at(-1)!
   const tools = h.runtime.projectTools!
   const context = { projectId: id, actorId: member.id, messageId: 'waiting-work', operationId: 'waiting-work',
     channel: { source: 'dingtalk', thread: 'test-group', address: { conversationId: 'test-group' } } }
-  expect(() => tools.execute('task.begin', { taskId: downstream.id }, { ...context, actorId: assignee.id })).toThrow('只有任务负责人')
-  expect(() => tools.execute('task.begin', { taskId: downstream.id }, context)).toThrow('dependencies')
-  expect(() => tools.execute('task.begin', { taskId: task.id }, context)).toThrow('只有人工任务')
+  expect(() => tools.execute('task.start', { taskId: downstream.id }, { ...context, actorId: assignee.id })).toThrow('只有任务负责人')
+  expect(() => tools.execute('task.start', { taskId: downstream.id }, context)).toThrow('dependencies')
+  expect(() => tools.execute('task.start', { taskId: task.id }, context)).toThrow('只有任务负责人')
   tools.execute('progress.record', { taskId: downstream.id, summary: '已列出交付清单' }, context)
   expect(projects.detail(id).tasks.at(-1)).toMatchObject({ status: 'todo', progress: [{ summary: '已列出交付清单' }] })
 })

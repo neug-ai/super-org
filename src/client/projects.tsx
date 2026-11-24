@@ -2,6 +2,7 @@ import { useState, type FormEvent, type ReactNode } from 'react'
 import type { Member, MemberInput, Project, ProjectChange, ProjectDecision, ProjectDetail, ProjectExecution, ProjectMilestone, ProjectPriority, ProjectTask, ProjectTicket, TaskProgress } from '../app/projects.ts'
 import { taskContext } from '../app/project-task-context.ts'
 import { currentReview } from '../app/project-deliveries.ts'
+import { isProjectAgent } from '../app/project-member.ts'
 import { usePoll, type Call } from './api.ts'
 import { ProjectHistory } from './project-history.tsx'
 import { AgentStatus } from './agent-status.tsx'
@@ -207,11 +208,6 @@ function TaskFields({ t, task, project }: Basic & { task?: ProjectTask; project:
           <option value={task.ownerId}>{t('project.formerMember')}</option>}
         {project.members.map(member => <option key={member.id} value={member.id}>{member.name}</option>)}
       </select></Field>
-      <Field label={t('project.executionMode')}><select className="dt-select" name="executionMode" defaultValue={task?.executionMode ?? ''}>
-        <option value="">{t('project.unassigned')}</option>
-        <option value="manual">{t('project.executionMode.manual')}</option>
-        <option value="agent">{t('project.executionMode.agent')}</option>
-      </select></Field>
       <Field label={t('project.due')}><Input name="dueDate" type="date" defaultValue={task?.dueDate ?? ''} /></Field>
       <Field label={t('project.milestone')}><select className="dt-select" name="milestoneId" defaultValue={task?.milestoneId ?? ''}>
         <option value="">{t('empty')}</option>
@@ -244,7 +240,6 @@ function taskValue(data: FormData) {
   return { title: field(data, 'title'), description: field(data, 'description'), status: field(data, 'status') as ProjectTask['status'],
     ownerId: optional(data, 'ownerId'), milestoneId: optional(data, 'milestoneId'), blockedBy: data.getAll('blockedBy').map(String),
     dueDate: optional(data, 'dueDate'), acceptance: field(data, 'acceptance'), issueUrl: optional(data, 'issueUrl'),
-    executionMode: optional(data, 'executionMode') as ProjectTask['executionMode'],
     priority: field(data, 'priority') as ProjectPriority, issueRole: field(data, 'issueRole') as ProjectTask['issueRole'],
     deliveryMode: field(data, 'deliveryMode') as ProjectTask['deliveryMode'], pullRequestUrl: optional(data, 'pullRequestUrl'),
     targetBranch: optional(data, 'targetBranch') }
@@ -324,9 +319,9 @@ function TicketSelect({ t, call, ticketId, issue, related }: Basic & {
   </>
 }
 
-function TaskDetail({ t, project, task, execution, pending, editor, move, openTicket, showTitle = true }: Basic & {
+function TaskDetail({ t, project, task, execution, pending, editor, move, inspect, openTicket, showTitle = true }: Basic & {
   project: ProjectDetail; task: ProjectTask; execution: ProjectExecution | undefined; pending: boolean; editor: (value: ProjectEditor) => void;
-  move: (status: ProjectTask['status']) => void; openTicket?: (id: string) => void; showTitle?: boolean
+  move: (status: ProjectTask['status']) => void; inspect: (task: ProjectTask) => void; openTicket?: (id: string) => void; showTitle?: boolean
 }) {
   const issue = task.issueUrl
   const attempts = project.tickets.filter(ticket => ticket.id === task.ticketId || ticket.taskId === task.id)
@@ -334,7 +329,7 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, openTi
   const own = current?.taskId === task.id
   const blocked = task.blockedBy.some(id => project.tasks.find(dep => dep.id === id)?.status !== 'done')
   const waiting = project.decisions.filter(decision => decision.taskId === task.id && !decision.answeredAt)
-  const canStart = task.executionMode !== 'manual' && project.status === 'active' && (task.status === 'todo' || task.status === 'in-progress')
+  const canDispatch = project.status === 'active' && (task.status === 'todo' || task.status === 'in-progress')
     && !blocked && !waiting.length && !attempts.some(ticket => !ticket.ended)
   const milestone = project.milestones.find(item => item.id === task.milestoneId)
   const owner = task.ownerId ? project.members.find(member => member.id === task.ownerId)?.name ?? t('project.formerMember') : t('project.unassigned')
@@ -342,6 +337,9 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, openTi
   const [share, setShare] = useState<'copied' | 'manual'>()
   const context = taskContext(project, task, t('project.acceptance'))
   const review = currentReview(task)
+  const reviewTask = review?.taskId && project.tasks.find(item => item.id === review.taskId)
+  const reviewedTask = task.reviewOf && project.tasks.find(item => item.id === task.reviewOf?.taskId)
+  const reviewedDelivery = reviewedTask && reviewedTask.reviews?.find(item => item.id === task.reviewOf?.reviewId)
   const copyContext = async () => {
     try { await navigator.clipboard.writeText(context); setShare('copied') }
     catch { setShare('manual') }
@@ -354,7 +352,7 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, openTi
     </div>
     <dl className="dt-work-task-properties">
       <div><dt>{t('project.owner')}</dt><dd>{owner}</dd></div>
-      {task.executionMode && <div><dt>{t('project.executionMode')}</dt><dd>{t(`project.executionMode.${task.executionMode}`)}</dd></div>}
+      {task.executionMode === 'agent' && <div><dt>{t('project.legacyAgent')}</dt><dd>{t('project.legacyAgentHelp')}</dd></div>}
       {milestone && <div><dt>{t('project.milestone')}</dt><dd>{milestone.title}</dd></div>}
       {task.dueDate && <div><dt>{t('project.due')}</dt><dd><time dateTime={task.dueDate}>{task.dueDate}</time></dd></div>}
     </dl>
@@ -388,7 +386,9 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, openTi
             onClick={() => editor({ type: 'decision', decision, revision: project.revision })}>{decision.question}</button>)}
         </div>}
         <div className="dt-work-actions">
-          {canStart && execution?.state === 'ready' && <Button variant="primary" size="sm" onClick={() => editor({ ...base, type: 'run' })}>{t('project.run')}</Button>}
+          {project.status === 'active' && task.status === 'todo' && !blocked &&
+            <Button variant="primary" size="sm" disabled={pending} onClick={() => move('in-progress')}>{t('project.startTask')}</Button>}
+          {canDispatch && execution?.state === 'ready' && <Button variant="outline" size="sm" onClick={() => editor({ ...base, type: 'run' })}>{t('project.run')}</Button>}
           <Button variant="outline" size="sm" onClick={() => editor({ ...base, type: 'link' })}>{t('project.linkTicket')}</Button>
           {current && own && !current.ended && execution?.state === 'ready' &&
             <Button size="sm" onClick={() => editor({ ...base, type: 'follow-up', ticket: current })}>{t('project.followUp')}</Button>}
@@ -403,9 +403,17 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, openTi
         {current?.summary ? <MarkdownContent t={t} text={current.summary} /> : <p className="dt-hint">{t('project.noReport')}</p>}
         {current?.pullUrls.map(url => <Issue key={url} url={url} />)}
         {task.acceptance && <p className="dt-project-description"><strong>{t('project.acceptance')}</strong><br />{task.acceptance}</p>}
+        {reviewedTask && <Button variant="outline" size="sm" onClick={() => inspect(reviewedTask)}>{t('project.openOriginalTask')}</Button>}
+        {reviewedDelivery?.decision && <div className="dt-project-answer">
+          <Tag>{t(`project.review.${reviewedDelivery.status}`)}</Tag>
+          <MarkdownContent t={t} text={reviewedDelivery.decision.reason} />
+          {reviewedDelivery.decision.links?.map(url => <p key={url}><a href={url} target="_blank" rel="noreferrer">{url}</a></p>)}
+        </div>}
         {task.executionMode !== 'agent' && ['todo', 'in-progress'].includes(task.status) &&
           <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'delivery' })}>{t('project.submitDelivery')}</Button>}
-        {task.status === 'in-review' && review?.status === 'pending' && <div className="dt-work-actions">
+        {task.status === 'in-review' && reviewTask &&
+          <Button variant="outline" size="sm" onClick={() => inspect(reviewTask)}>{t('project.openReviewTask')}</Button>}
+        {task.status === 'in-review' && review?.status === 'pending' && !review.taskId && <div className="dt-work-actions">
           <span>{t('project.tracking.awaitingReview', { version: review.version, owner })}</span>
           <Button variant="primary" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'accepted' })}>{t('project.acceptTask')}</Button>
           <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'rejected' })}>{t('project.rejectDelivery')}</Button>
@@ -452,7 +460,9 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, openTi
       <select className="dt-select" disabled={pending} aria-label={t('project.move', { title: task.title })} value={task.status}
         onChange={event => move(event.target.value as ProjectTask['status'])}>
         {TASK_STATES.map(state => <option key={state} value={state}
-          disabled={state === 'done' && review?.status !== 'pending' || state === 'in-review' && task.executionMode === 'agent'}>{t(`project.state.${state}`)}</option>)}
+          disabled={state === 'done' && (review?.status !== 'pending' || !!review.taskId) ||
+            state === 'in-review' && (task.executionMode === 'agent' || !!task.reviewOf) ||
+            state === 'cancelled' && !!task.reviewOf}>{t(`project.state.${state}`)}</option>)}
       </select>
     </label>
   </article>
@@ -562,6 +572,13 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
   }
   const moveTask = (task: ProjectTask, status: ProjectTask['status']) => {
     if (status === task.status) return
+    const review = currentReview(task)
+    if (task.reviewOf && (status === 'done' || status === 'in-review')) { setEditor({ type: 'delivery', task, revision: project.revision }); return }
+    if (review?.taskId && (status === 'done' || (task.status === 'in-review' && status === 'in-progress'))) {
+      const reviewTask = project.tasks.find(item => item.id === review.taskId)
+      if (reviewTask) inspect(reviewTask)
+      return
+    }
     if (status === 'done') { setEditor({ type: 'review', task, outcome: 'accepted', revision: project.revision }); return }
     if (status === 'in-review') { setEditor({ type: 'delivery', task, revision: project.revision }); return }
     if (task.status === 'in-review' && status === 'in-progress') { setEditor({ type: 'review', task, outcome: 'rejected', revision: project.revision }); return }
@@ -578,7 +595,7 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
   }
   const renderTask = (task: ProjectTask, showTitle: boolean) => <TaskDetail key={task.id}
     t={t} project={project} task={task} execution={execution} pending={pending} editor={setEditor} openTicket={openTicket}
-    showTitle={showTitle} move={status => moveTask(task, status)} />
+    showTitle={showTitle} move={status => moveTask(task, status)} inspect={inspect} />
   const taskCounts = [project.tasks.filter(task => task.status !== 'cancelled').length,
     project.tasks.filter(task => task.status === 'in-progress').length, project.tasks.filter(task => task.status === 'in-review').length,
     project.tasks.filter(task => task.status === 'done').length]
@@ -612,11 +629,18 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
     </Editor>; break
     case 'delivery': dialog = <Editor t={t} title={t('project.submitDelivery')} close={close} save={async data => {
       await call('POST projects/:id/tasks/:taskId/deliveries', { id, taskId: editor.task.id,
-        body: { messageId: field(data, 'messageId'), summary: field(data, 'summary'), links: field(data, 'links').split(/\s+/).filter(Boolean) } })
+        body: { messageId: field(data, 'messageId'), summary: field(data, 'summary'), links: field(data, 'links').split(/\s+/).filter(Boolean),
+          ...(editor.task.reviewOf && { outcome: field(data, 'outcome') as 'accepted' | 'rejected' }) } })
       await Promise.all([reload(), changed()])
     }}>
       <p>{editor.task.title}</p>
-      <Field label={t('project.deliverySummary')}><textarea className="dt-textarea" name="summary" required maxLength={12000} rows={5} /></Field>
+      {editor.task.reviewOf && <Field label={t('project.reviewOutcome')}><select name="outcome" className="dt-select" required defaultValue="">
+        <option value="" disabled>{t('empty')}</option>
+        <option value="accepted">{t('project.acceptTask')}</option>
+        <option value="rejected">{t('project.rejectDelivery')}</option>
+      </select></Field>}
+      <Field label={t('project.deliverySummary')}><textarea className="dt-textarea" name="summary" required
+        maxLength={editor.task.reviewOf ? 8000 : 12000} rows={5} /></Field>
       <Field label={t('project.deliveryLinks')}><textarea className="dt-textarea" name="links" rows={3} /></Field>
     </Editor>; break
     case 'progress': dialog = <Editor t={t} title={t(editor.entry ? 'project.tracking.correct' : 'project.tracking.record')} close={close} save={async data => {
@@ -732,6 +756,7 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
     {section === 'tasks' && trackingFeedback && <p className="dt-hint" role="status">{trackingFeedback}</p>}
     {section === 'members' && <ProjectMembers t={t} project={project} canAdd={addable} pending={pending}
       create={() => setEditor({ type: 'new-member', revision })} add={() => setEditor({ type: 'member', revision })}
+      addAgent={project.members.some(isProjectAgent) ? undefined : () => { void action({ kind: 'add-agent' }).then(directoryChanged) }}
       edit={member => setEditor({ type: 'edit-member', revision, member })} remove={member => setEditor({ type: 'remove-member', revision, member })}
       showTasks={member => filterTasks(member.id, '')} />}
     {section === 'milestones' && <ProjectMilestones t={t} project={project}

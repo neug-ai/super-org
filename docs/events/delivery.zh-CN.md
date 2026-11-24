@@ -98,17 +98,19 @@ Content-Type: application/json
 
 设为 `false` 时通过请求不改变任务状态，事件保留为 ignored。其他事件仍按各自配置运行。通用配置见[项目事件配置](README.zh-CN.md)。
 
-成员引用某次交付并明确反馈通过后，由所选 Agent 调用 `review.decide`，传入实际验收 ID、accepted 和成员的依据。没有通过关键词或固定短语要求。服务端核验成员、项目群和该任务当前负责人；其他成员不能代验收。负责人是任务分工，不增加永久“验收员”角色。未指定负责人时，先明确任务分工，或由本地管理者有据代验收。
+每次新交付会产生一项指向该版本的验收任务。负责人使用普通任务操作登记开工和进展，并在提交结果时填写通过或退回以及依据。群里自然语言表达该结论即可，由 Agent 调用对应验收任务的 `delivery.submit`。服务端检查成员、项目群、该验收任务的负责人和原交付版本。
 
-看板“验收通过”和群消息共用此事件。本地管理接口代表本机管理者，记录 actorId=null、source=request 和所填依据，不冒充其他成员。看板窗口保存打开时的验收 ID，即使后台出现新版，也不会把点击自动换到新版。
+看板和群消息共用此事件。通过或退回都会完成当次验收任务。通过会完成原任务，退回会把原任务送回进行中，依据留在该版记录上。需要等待通过后继续的工作应依赖原任务。本地管理接口记录实际本地操作者和依据。
 
 ```http
-POST /orchestrator/api/projects/:id/tasks/:taskId/reviews/:reviewId
+POST /orchestrator/api/projects/:id/tasks/:reviewTaskId/deliveries
 Content-Type: application/json
 X-Orchestrator-Request: 1
 
-{"messageId":"唯一请求ID","outcome":"accepted","reason":"按当前条件检查了边界和输出，结果满足要求"}
+{"messageId":"唯一请求ID","outcome":"accepted","summary":"按当前条件检查了边界和输出，结果满足要求"}
 ```
+
+已有的待验收交付仍可通过 `/projects/:id/tasks/:taskId/reviews/:reviewId` 提交原版本的决定。
 
 队列按入队顺序检查：任务须仍待验收，验收 ID 和版本须为当前、状态须 pending，依赖和授权须仍有效。有效时将任务设为 done，保存完成时间、操作者、来源、依据和决策时间，并登记群通知。双端几乎同时通过或退回时，第一项有效决策结案，后续项记录已失效；重复请求沿用原结果。
 

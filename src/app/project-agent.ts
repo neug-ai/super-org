@@ -17,7 +17,7 @@ const Call = z.strictObject({ tool: z.string().min(1).max(100), arguments: z.str
 const Decision = z.strictObject({ calls: z.array(Call).max(8), reply: z.string().max(1800) })
 const { $schema: _dialect, ...decisionSchema } = z.toJSONSchema(Decision)
 const { $schema: _replyDialect, ...actionReplySchema } = z.toJSONSchema(Decision.extend({ reply: z.string().trim().min(1).max(1800) }))
-const Proposed = z.strictObject({ runId: z.string(), turn: z.number().int().nonnegative(), revision: z.number().int().nonnegative(),
+const Proposed = z.strictObject({ toolVersion: z.literal(2).optional(), runId: z.string(), turn: z.number().int().nonnegative(), revision: z.number().int().nonnegative(),
   decision: Decision, provider: z.string(), failure: z.string().optional() })
 const proposed: ProjectEventDefinition = { type: 'project.agent.proposed', category: 'agent', schema: Proposed,
   description: '按当前项目版本提交一次 Agent 工具调用或答复。', defaults: { enabled: true }, internal: true,
@@ -179,15 +179,15 @@ export class ProjectAgent {
       ...(run.message.mentions ? ['message.mentions 是钉钉回调识别出的本条消息 @ 对象，可用其中的 memberId。列表不提供 @ 在正文中的位置。'
         + '只有任务与人选对应明确时才修改分工。单个明确的指派可使用唯一的 @ 人选，前提是 unresolvedCount 为 0。多个任务或多种角色时，勿按列表顺序猜测。'
         + '先落实可确认的分工，再询问仍缺哪个任务或角色的人选；无法解析的 @ 可请发送者补充普通文字姓名。'] : []),
-      'executionMode=agent 时 ownerId 是本任务的人类验收人，executionMode=manual 时是执行人。结合已有分工理解这次指派，确有歧义时追问。',
-      '创建或分配任务与立即执行分别使用对应工具。根据用户本次意图决定是否需要开工和 task.start。任务依赖与状态由服务端检查。',
-      '人工任务负责人要求开工，或报告本项工作已有实质成果并要求更新进展时，项目已开工、任务待办且依赖已完成的，用 task.begin 标记进行中。'
-        + '需要时与 progress.record 同批调用。等待依赖时先记准备成果。仅分享资料或询问进度时，按原请求处理。',
+      'ownerId 指向执行任务的项目成员，人和已登记的项目 Agent 共用这个字段。历史任务的 executionMode=agent 沿用旧分工，旧 ownerId 只用于该任务历史验收。'
+        + '验收同样是一项任务，可以通过 task.update 更新对应验收任务的 ownerId。',
+      '用 task.start 登记任务开工。负责人要求开工或报告工作已有实质成果并要求更新进展，且满足开工条件时，可以与 progress.record 一起调用。等待依赖时先记准备成果。',
+      '明确委托后台执行时使用 execution.start，执行工单保留原负责人。确实授权从现在开始执行时，可同时登记开工。单纯指派、记录进展、登记开工或询问状态时，无需创建工单。',
       '成员提供了已发生的任务进展时，可通过 progress.record 保存，包括等待上游时已做的准备。成员明确要求联系负责人跟进进展时用 tracking.request；单纯问状态时直接根据现状回答。与派工、验收、预约检查是独立的操作。',
       '回答任务在等什么时，先说明当前卡点和下一步行动，再说明后续条件。若任务依赖上游，读取上游当前工单和 deliveryReview。只有 deliveryReview.status=pending 才说正在等该版验收。'
         + '尚未发起时明确说尚未提交验收；已指定的验收人是之后的角色。工单的 question 指明当前需要的动作，以原文明确的行动者为准，未知时说明未知；不要把任务 ownerId 当成该行动者。答复已提交时说等待 Worker 处理。'
         + '部分测试通过只作为执行报告中的进展。未解除依赖时仍可说明哪些准备能并行，以及正式执行还需哪个交付。',
-      '验收必须针对具体交付。reviews 保存了历史和当前版本及真实验收 ID；若 message.reviewId 有值，只能处理其引用的验收。成员明确给出通过或退回反馈时使用 review.decide，不能自行宣布验收通过。判断时保留成员的实际理由。人工交付仅从成员明确提供的结果使用 delivery.submit。',
+      '交付和验收任务均使用 delivery.submit。根据验收任务的 reviewOf 定位交付版本，提交时提供 outcome 和成员给出的实际依据。旧交付没有关联验收任务时使用 review.decide。若 message.reviewId 有值，只能处理其引用的验收。禁止自行宣布验收通过。',
       '验收条件可以在用户要求下结合目标拟出。已知范围能作合理判断时直接提出和应用，缺少实质决定时问清。',
       '已有工具结果证明成功后再描述已完成的操作。需要调用工具时先返回 calls，下一轮会收到实际结果；全部处理完时 calls 为空，reply 给出结果、说明或具体问题。',
       '遵守 conversationPreference 的格式和自然语言风格。成员要求后续持续改变消息风格时，使用会话偏好工具保存；未保存不得承诺以后一直记得。本次排版要求只影响本次答复，无需改项目或建任务。',
@@ -213,7 +213,7 @@ export class ProjectAgent {
     }
     host.lifetime.throwIfAborted()
     const failure = decision ? undefined : '这次项目请求暂时无法生成有效处理结果，请稍后重试。'
-    const value = { runId, turn: run.turn, revision: snapshot.project.revision, provider: planner.name,
+    const value = { toolVersion: 2 as const, runId, turn: run.turn, revision: snapshot.project.revision, provider: planner.name,
       decision: decision ?? { calls: [], reply: failure! }, ...(failure ? { failure } : {}) }
     host.store.atomic(() => {
       const current = host.store.get(KV.projects.agentRun(runId))
@@ -250,9 +250,12 @@ export class ProjectAgent {
     try {
       step.results = host.store.atomic(() => value.decision.calls.map((call, index) => {
         const args = JSON.parse(call.arguments)
-        if (run.event && (!(this.reactions.get(run.event.type)?.tools ?? []).includes(call.tool) || (args.taskId !== undefined && args.taskId !== run.event.taskId)))
+        const tool = value.toolVersion === undefined
+          ? call.tool === 'task.start' ? 'execution.start' : call.tool === 'task.begin' ? 'task.start' : call.tool
+          : call.tool
+        if (run.event && (!(this.reactions.get(run.event.type)?.tools ?? []).includes(tool) || (args.taskId !== undefined && args.taskId !== run.event.taskId)))
           throw new ProjectError(403, 'Autonomous follow-up is limited to the event task and its published tools')
-        return host.tools.execute(call.tool, args, { ...run.message, event: run.event, operationId: key(run.id, String(run.turn), String(index)) })
+        return host.tools.execute(tool, args, { ...run.message, event: run.event, operationId: key(run.id, String(run.turn), String(index)) })
       }))
     } catch (error) { step.error = `这批操作已回滚。${error instanceof Error ? error.message.slice(0, 1200) : '操作失败'}` }
     const replyChannel = step.results.findLast(result => result.replyChannel)?.replyChannel

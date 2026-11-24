@@ -73,7 +73,8 @@ it('honors an event JSON override and preserves an auditable ignored result', as
 it('applies the delivery without a DingTalk group and retains the successful execution evidence', async () => {
   const { h, id, projects, report, send } = await pilot(null)
   await report(); await h.runtime.idle()
-  expect(projects.detail(id)).toMatchObject({ tasks: [{ status: 'in-review' }], tickets: [{ reportState: 'ready', ended: true }] })
+  expect(projects.detail(id)).toMatchObject({ tasks: [{ status: 'in-review' }, { status: 'todo', reviewOf: { version: 1 } }],
+    tickets: [{ reportState: 'ready', ended: true }] })
   expect(h.runtime.projectEvents.list({ projectId: id })[0]?.status).toBe('applied')
   expect(send).not.toHaveBeenCalled()
 })

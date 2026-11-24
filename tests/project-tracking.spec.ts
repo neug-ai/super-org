@@ -165,7 +165,7 @@ it('uses a configurable project clock with zero inbound messages and reads subse
   const other = new Projects(runtime.store).create(ProjectInput.parse({ name: 'Other project' }))
   propose.mockImplementation(async prompt => {
     const context = data(prompt)
-    expect(context.candidates.map((candidate: { taskId: string }) => candidate.taskId)).toEqual([upstream.id, task.id])
+    expect(context.candidates.map((candidate: { taskId: string }) => candidate.taskId)).toEqual([upstream.id, task.id, review.taskId])
     const candidate = context.candidates[1]
     expect(candidate.evidence[`review:${review.id}`]).toMatchObject({ status: 'pending' })
     expect(candidate.evidence[`task:${task.id}`]).toMatchObject({ status: 'todo', dueDate: '2026-11-20', dependencies: [upstream.id] })
@@ -200,7 +200,7 @@ it('uses a configurable project clock with zero inbound messages and reads subse
 
 it('revalidates author and project scope and stores corrections on an unassigned task', async () => {
   const { h, runtime, projects, id, change, owner, say, propose, events, detail, assertions } = await pilot('12:00', false)
-  const task = change({ kind: 'task', value: { title: 'D 兼容性调查' } }).tasks[2]!
+  const task = change({ kind: 'task', value: { title: 'D 兼容性调查' } }).tasks.at(-1)!
   const path = `projects/${id}/tasks/${task.id}/progress`
   await say('outsider', '帮忙问问 D。', 'outsider')
   await say('wrong-group', '帮忙问问 D。', 'alice', 'unrelated-group')
@@ -214,7 +214,7 @@ it('revalidates author and project scope and stores corrections on an unassigned
     { source: 'dingtalk', messageId: 'someone-else', actorId: owner('甲') })).toThrow(/original author/)
   expect(await h.api('POST', path, { messageId: 'correction', summary: '已用三个浏览器测试', corrects })).toMatchObject({ status: 200 })
   expect(await h.api('POST', path, { messageId: 'bad-link', summary: 'Test', links: ['javascript:alert(1)'] })).toMatchObject({ status: 400 })
-  expect(detail().tasks[2]).toMatchObject({ ownerId: null, status: 'todo', progress: [{ id: corrects, summary: '已用两个浏览器测试' },
+  expect(detail().tasks.find(item => item.id === task.id)).toMatchObject({ ownerId: null, status: 'todo', progress: [{ id: corrects, summary: '已用两个浏览器测试' },
     { corrects, summary: '已用三个浏览器测试' }] })
   assertions()
 })
@@ -240,10 +240,10 @@ it('checks the current blocker with the member named by the Worker and rejects t
   const settings = runtime.store.settings()
   runtime.store.saveSettings({ ...settings, policy: { ...settings.policy,
     sources: { ...settings.policy.sources, request: { allowed: [{ id: 'local' }] } } } })
-  const task = change({ kind: 'task', value: { title: '候选版交付', executionMode: 'agent', ownerId: owner('甲') } }).tasks[2]!
+  const task = change({ kind: 'task', value: { title: '候选版交付', executionMode: 'agent', ownerId: owner('甲') } }).tasks.at(-1)!
   expect((await h.api('POST', `projects/${id}/tasks/${task.id}/run`, { revision: detail().revision })).status).toBe(200)
   await runtime.idle()
-  const ticketId = detail().tasks[2]!.ticketId!
+  const ticketId = detail().tasks.find(item => item.id === task.id)!.ticketId!
   await h.runTool(`worker-${ticketId}`, 'orchestrator_report', { state: 'blocked', summary: '已通过规则测试，真机证据待补',
     human_action: '请丙在真机上检查触屏并回传截图。' })
   await runtime.idle()
@@ -264,7 +264,7 @@ it('checks the current blocker with the member named by the Worker and rejects t
   })
   await advance('10:00')
   expect(send()).toEqual([{ mentions: undefined, content: expect.stringContaining(question), url: expect.any(String) }])
-  expect(detail().tasks[2]).toMatchObject({ status: 'in-progress', ownerId: owner('甲') })
+  expect(detail().tasks.find(item => item.id === task.id)).toMatchObject({ status: 'in-progress', ownerId: owner('甲') })
 })
 
 it('rejects hallucinated references and drops a stale reminder that was waiting for Outbox retry', async () => {
