@@ -7,6 +7,7 @@ import { branchCiTrigger, commentTrigger } from '../src/sources/github.ts'
 import { dingTalkKind, DingTalk } from '../src/sources/dingtalk.ts'
 import { key, type OutboundMessage } from '../src/core/index.ts'
 import { KV } from '../src/kv.ts'
+import { requestKind, requestTrigger } from '../src/sources/request.ts'
 
 let h: Awaited<ReturnType<typeof startRuntime>> | undefined
 afterEach(async () => { await h?.stop(); h = undefined; vi.restoreAllMocks() })
@@ -308,6 +309,23 @@ it('keeps an older input binding in the report after a newer event reaches the s
   await source.receive(second); await h.runtime.idle()
   const newer = h.relays(worker).find(item => item.trigger_id === second.id)!.reply_card as { card_id: string }
   expect(newer.card_id).not.toBe(original.card_id)
+  await expect(h.runTool(worker, 'orchestrator_report', { state: 'progress', summary: 'Card-bound answer', reply_to_trigger_id: second.id }))
+    .rejects.toThrow('Copy card_id')
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy,
+    sources: { ...settings.policy.sources, request: { allowed: [{ id: 'local' }] } } } })
+  const local = requestTrigger('Can you verify the local draft?')
+  expect(await h.runtime.context(requestKind).receive(local)).toBe('stored')
+  h.runtime.engine.attach(id, local.id)
+  await h.runtime.idle()
+  await h.runTool(worker, 'orchestrator_report', { state: 'progress', summary: 'Verified the local draft.', reply_to_trigger_id: local.id })
+  await h.runtime.idle()
+  const answer = h.relays(h.runtime.masterId).find(item => item.kind === 'worker_report' && item.answer_to === local.id)!
+  expect(answer).toMatchObject({ summary: 'Verified the local draft.' })
+  expect(answer).not.toHaveProperty('reply_card')
+  await h.runTool(h.runtime.masterId, 'orchestrator_reply', {
+    ticket_id: id, trigger_id: local.id, purpose: 'answer', text: 'Verified the local draft.',
+  })
   await expect(h.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Old work finished.' }))
     .rejects.toThrow('Copy card_id')
   await h.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Old work finished.', card_id: original.card_id })

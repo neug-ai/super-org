@@ -88,14 +88,15 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
-        reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
+        reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers. Use its trigger ID for a cardless follow-up on a ticket with past cards.'),
       }).strict(),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
+        const target = args.reply_to_trigger_id ?? args.question_for_trigger_id
         const binding = args.card_id ? host.cardReplies?.resolve(args.card_id, ticketId) : undefined
         if (args.card_id && !binding) throw new Error('Card replies are unavailable')
-        if (!args.card_id && host.cardReplies?.has(ticketId)) {
+        if (!args.card_id && host.cardReplies?.has(ticketId, target)) {
           throw new Error('Copy card_id from the input reply_card; a worker has no current card')
         }
         if (binding && args.reply_to_trigger_id && binding.channel.address.triggerId !== args.reply_to_trigger_id) {
