@@ -403,6 +403,128 @@ it('continues DingTalk conversation, reads local knowledge, and retains project 
   } finally { callback.mockRestore(); ack.mockRestore() }
 })
 
+it('reads quoted DingTalk files and native documents with the sender access, and records only supported progress', async () => {
+  const { h, projects, task, id, propose } = await pilot()
+  const send = vi.fn()
+  const kind = dingTalkKind(async message => { send(message) })
+  h.runtime.sources.register(kind)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } } })
+  let receive!: (frame: { headers: { messageId: string }; data: string }) => Promise<void>
+  const callback = vi.spyOn(DWClient.prototype, 'registerCallbackListener').mockImplementation(function (this: DWClient, _topic, fn) {
+    receive = fn as typeof receive; return this
+  })
+  const ack = vi.spyOn(DWClient.prototype, 'socketCallBackResponse').mockImplementation(() => {})
+  const link = (id: string) => `https://alidocs.dingtalk.com/i/nodes/${id}`
+  const fileUrl = 'https://files.oss-cn-zhangjiakou.aliyuncs.com/workflow.html?Signature=private'
+  let directoryDenied = false
+  const http = vi.fn(async (address: string | URL, init?: RequestInit) => {
+    const url = new URL(address)
+    expect(init?.redirect === 'error' || url.pathname.endsWith('/accessToken')).toBe(true)
+    if (url.pathname.endsWith('/accessToken')) return Response.json({ accessToken: 'test-app-token' })
+    if (url.pathname === '/topapi/v2/user/get') {
+      expect(url.origin).toBe('https://oapi.dingtalk.com')
+      expect(url.searchParams.get('access_token')).toBe('test-app-token')
+      expect(JSON.parse(String(init?.body))).toEqual({ userid: 'member' })
+      return directoryDenied ? Response.json({ errcode: 88 }) : Response.json({ errcode: 0, result: { unionid: 'requester-union-id' } })
+    }
+    if (url.href === fileUrl) {
+      expect(init?.headers).toEqual({ 'x-oss-test': 'signature' })
+      return new Response('<h1>交付 Workflow</h1><p>已完成五项移动规则测试，触屏测试待验收。</p><script>FORGED_PROGRESS</script>')
+    }
+    expect(url.origin).toBe('https://api.dingtalk.com')
+    expect(new Headers(init?.headers).get('x-acs-dingtalk-access-token')).toBe('test-app-token')
+    if (url.pathname.endsWith('/downloadInfos/query')) {
+      expect(url.pathname).toBe('/v1.0/storage/spaces/space/dentries/file/downloadInfos/query')
+      expect(url.searchParams.get('unionId')).toBe('requester-union-id')
+      expect(init?.method).toBe('POST')
+      return Response.json({ headerSignatureInfo: { resourceUrls: [fileUrl], headers: { 'x-oss-test': 'signature' } } })
+    }
+    expect(url.searchParams.get('operatorId')).toBe('requester-union-id')
+    if (url.pathname === '/v2.0/wiki/nodes/workflow') return Response.json({
+      node: { nodeId: 'workflow', name: 'workflow.html', category: 'DOCUMENT', extension: 'html', type: 'FILE' },
+    })
+    if (url.pathname === '/v2.0/doc/dentries/workflow/queryDentryId') return Response.json({ spaceId: 'space', dentryId: 'file' })
+    if (url.pathname.startsWith('/v2.0/wiki/nodes/')) return Response.json({
+      node: { nodeId: url.pathname.split('/').at(-1), name: '验收说明', category: 'ALIDOC', extension: 'adoc', type: 'FILE' },
+    })
+    if (url.pathname === '/v1.0/doc/suites/documents/private/blocks')
+      return Response.json({ code: 'AccessDenied', message: 'private response' }, { status: 403 })
+    expect(url.pathname).toBe('/v1.0/doc/suites/documents/native/blocks')
+    expect(url.searchParams.get('endIndex')).toBe('100')
+    return Response.json({ success: true, result: { data: [
+      { blockType: 'paragraph', paragraph: { children: [{ elementType: 'text', text: { content: '重新开始按钮需要小屏核对。' } }] } },
+    ] } })
+  })
+  try {
+    const agent = h.runtime.projectAgent!
+    const bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, http as typeof fetch,
+      undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, agent))
+    agent.registerLinkedDocumentReader(kind.kind, bot.linkedDocumentReader('test-corp'))
+    const post = async (msgId: string, content: string, document?: string, corpId = 'test-corp', staffId = 'member') => {
+      await receive({ headers: { messageId: msgId }, data: JSON.stringify({
+        msgId, senderStaffId: staffId, senderCorpId: corpId, conversationId: 'test-group', conversationType: '2',
+        isInAtList: true, robotCode: 'test', sessionWebhook: 'https://oapi.dingtalk.com/robot/send?test',
+        sessionWebhookExpiredTime: Date.now() + 60_000, msgtype: 'text', text: { content,
+          ...(document ? { isReplyMsg: true, repliedMsg: { msgId: 'unknown-card', msgType: 'interactiveCard',
+            content: { biz_custom_action_url: document } } } : {}) },
+      }) })
+      await h.runtime.idle()
+      return agent.runs(id).find(run => run.message.nativeMessageId === msgId)
+    }
+    const contextOf = (prompt: string) => JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+    const progress = '已完成五项移动规则测试，触屏测试待验收。'
+    propose.mockImplementationOnce(async prompt => {
+      expect(contextOf(prompt)).toMatchObject({ name: 'workflow.html', text: expect.stringContaining(progress) })
+      expect(prompt).not.toMatch(/FORGED_PROGRESS|requester-union-id|Signature=private|test-app-token/)
+      return { summary: progress }
+    }).mockImplementationOnce(async prompt => {
+      expect(contextOf(prompt).reference.documents).toEqual([{ link: link('workflow'), name: 'workflow.html', summary: progress, partial: true }])
+      return { calls: [call('progress.record', { taskId: task.id, summary: progress, links: [link('workflow')] })], reply: '' }
+    }).mockResolvedValueOnce(done('已将五项规则测试和待验收的触屏测试记入任务。'))
+    const title = '请根据这份资料更新整理首版规则的进展'
+    const imported = await post('html-card', title, `${link('workflow')}?utm_source=card`)
+    expect(imported?.reply).toContain('已将五项规则测试')
+    const reads = http.mock.calls.length
+    await post('html-card', title, link('workflow'))
+    expect(http).toHaveBeenCalledTimes(reads)
+    expect(imported?.documentResults).toHaveLength(1)
+    expect(projects.detail(id).tasks[0]?.progress).toMatchObject([{ summary: progress, links: [link('workflow')] }])
+
+    propose.mockImplementationOnce(async prompt => {
+      expect(contextOf(prompt).text).toContain('重新开始按钮需要小屏核对')
+      return { summary: '重新开始按钮需要小屏核对。' }
+    }).mockImplementationOnce(async prompt => {
+      expect(contextOf(prompt).reference.documents).toMatchObject([{ link: link('native'), partial: false }])
+      return done('文档正文提到重新开始按钮需要小屏核对。')
+    })
+    expect((await post('direct-native', `请读这份文档 ${link('native')}`))?.reply).toContain('文档正文提到')
+
+    propose.mockImplementationOnce(async prompt => {
+      expect(contextOf(prompt).reference.documents).toEqual([{ link: link('private'), name: '在线文档',
+        error: '钉钉拒绝读取文档正文，请检查应用权限和你对该资料的访问权限。' }])
+      expect(prompt).not.toContain('private response')
+      return done('进展暂未更新。')
+    })
+    const denied = await post('private-card', title, link('private'))
+    expect(denied?.reply).toContain('钉钉拒绝读取文档正文')
+    expect(denied?.reply).toContain('在群里上传导出的可访问文件')
+    expect(denied?.steps).toEqual([])
+    expect(projects.detail(id).tasks[0]?.progress).toHaveLength(1)
+    const authorizedReads = http.mock.calls.length
+    projects.addDingTalkSender(id, 'outside-corp', 'outsider', '外部项目成员')
+    expect((await post('foreign-sender', title, link('native'), 'outside-corp', 'outsider'))?.documentResults)
+      .toMatchObject([{ error: '无法验证当前发送者属于已配置的钉钉企业。' }])
+    await post('unknown-provider', '顺带看看 https://untrusted.example/doc')
+    expect(http).toHaveBeenCalledTimes(authorizedReads)
+    directoryDenied = true
+    const missingScope = await post('missing-scope', title, link('workflow'))
+    expect(missingScope?.reply).toContain('钉钉应用尚未开通成员信息读权限')
+    expect(http).toHaveBeenCalledTimes(authorizedReads + 1)
+    expect(projects.detail(id).tickets).toEqual([])
+  } finally { callback.mockRestore(); ack.mockRestore() }
+})
+
 it('resolves an old material link exactly through the web conversation API', async () => {
   const { h, id, say, propose } = await pilot()
   const url = 'https://docs.example.org/workflow'
@@ -494,6 +616,9 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     if (String(url).endsWith('/messageFiles/download')) {
       const request = JSON.parse(String(init?.body))
       if (request.downloadCode === 'expired-code') return Response.json({ code: 'invalidParameter.robotCode.downloadCode' }, { status: 400 })
+      if (request.downloadCode === 'ip-denied') return Response.json({
+        code: 'Forbidden.AccessDenied.IpNotInWhiteList', message: 'private-egress-address',
+      }, { status: 403 })
       if (request.downloadCode === 'untrusted-code') return Response.json({ downloadUrl: 'http://aliyuncs.com.example.org/handout' })
       if (request.downloadCode === 'slides-code') return Response.json({ downloadUrl: 'https://files.oss-cn-zhangjiakou.aliyuncs.com/slides' })
       expect(request).toEqual({ robotCode: 'robot', downloadCode: 'temporary-file-secret' })
@@ -562,6 +687,17 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     const untrusted = await post('untrusted-file', { code: 'untrusted-code' })
     expect(untrusted?.reply).toContain('钉钉返回了不受支持的附件下载地址')
     expect(fetchFile).toHaveBeenCalledTimes(5)
+    for (const extension of ['html', 'md', 'pdf']) {
+      propose.mockImplementationOnce(async prompt => {
+        expect(prompt).toContain('需要应用管理员处理当前部署问题')
+        expect(prompt).not.toContain('private-egress-address')
+        return done('正文尚未读取，任务进展没更新。')
+      })
+      const denied = await post(`ip-denied-${extension}`, { code: 'ip-denied', name: `workflow.${extension}` })
+      expect(denied?.attachmentResults).toMatchObject([{ resolution: 'deployment' }])
+      expect(denied?.reply).toContain('服务器出口 IP')
+      expect(denied?.reply).not.toMatch(/private-egress-address|重新引用|上传导出/)
+    }
 
     const execution = change({ kind: 'task', value: { title: '分析原始演示稿', executionMode: 'agent', ownerId: member.id } }).tasks.at(-1)!
     propose.mockResolvedValueOnce({ summary: '幻灯片摘要。' })

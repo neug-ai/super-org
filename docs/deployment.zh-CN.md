@@ -28,6 +28,12 @@ CODEX_SANDBOX=workspace-write
 
 在钉钉应用中启用机器人和 Stream 接入，发布并把机器人加入群。使用同一机器人时保留一个接收服务。在 `.env` 同时填写 `DINGTALK_CLIENT_ID` 和 `DINGTALK_CLIENT_SECRET`。若要从空群提交首次纪要建项，将 `DINGTALK_OPEN_CONVERSATION_ID` 设为该群会话 ID。已有项目也可在项目设置中绑定会话 ID。
 
+附件下载返回 `Forbidden.AccessDenied.IpNotInWhiteList` 时，请到当前应用的「开发管理 → 服务器出口 IP」核对钉钉报错中看到的出口地址。保存正确的出口 IP 后再重试下载。Stream 已连接时，服务端下载仍需通过这个检查。 [钉钉服务端接口常见问题](https://dingtalk.apifox.cn/doc-3662574)
+
+应用已放行 IPv4 出口、部署环境同时有 IPv4 和 IPv6 时，可以用 `node --dns-result-order=ipv4first lib/codex-cli.js --env-file .env` 启动本机服务，使 Node.js 优先尝试 IPv4。沿用现有状态目录和启动环境。IP 白名单仍以钉钉实际收到的请求为准。 [Node.js 启动参数](https://nodejs.org/api/cli.html#--dns-result-orderorder)
+
+读取钉钉文档卡片时，将 `DINGTALK_DOCUMENT_CORP_ID` 设为**该企业内部应用所属企业**的 Corp ID。给应用开通成员信息读权限及知识库读取权限。读取原生文字文档需要访问文档块接口的权限，读取已上传到钉钉文档空间的文件还需要企业存储文件读权限。应用的成员可见范围须覆盖发起请求的人，发起者须有相应文档的读取或下载权限。服务以当前群消息发送者为操作者调用钉钉接口。 [查询用户详情](https://dingtalk.apifox.cn/api-139715614) [钉钉文档权限](https://dingtalk.apifox.cn/doc-392510) [获取文件下载信息](https://dingtalk.apifox.cn/api-142019647)
+
 当前机器人处理群内 @ 消息。建项入口群在绑定项目之前，`登记项目成员`（也可说「把我登记加入」）和 `项目会议纪要：…` 走建项流程，其他 @ 消息按钉钉来源准入规则交给通用 Agent。普通问答可直接回复，并延续当前群最近的问答。项目群成员也可直接聊天或查询知识库。配置 `SUPERAGENT_KNOWLEDGE_DIR` 可让项目 Agent 只读查阅该目录下的 Markdown。引用任务、交付或卡片时，客户端需提供可解析的引用字段。可在正文带任务短引用或明确名称。同一项目的后续通知按实际群绑定发送。会话 webhook 过期时由应用群发送接口投递，需要相应权限。项目回复支持会话级 Markdown 偏好。 [沟通事件](events/communication.zh-CN.md)
 
 `DINGTALK_CARD_TEMPLATE_ID` 用于可选的回执卡片。 `DINGTALK_GITHUB_NOTIFY_CONVERSATION_ID` 是独立 GitHub 通知与本地通用请求的回复群，不是每个项目的群绑定。 [钉钉卡片配置](../cards/README.md)
