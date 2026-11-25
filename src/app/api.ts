@@ -34,7 +34,7 @@ export interface Api {
   'GET projects/tools': { response: ReturnType<ProjectTools['catalog']> }
   'GET projects/:id/conversation-preferences': { response: ConversationPreference }
   'PUT projects/:id/conversation-preferences': { body: { requestId: string; revision: number; value: CommunicationPreference }; response: ReturnType<Communication['update']> }
-  'POST projects/:id/messages': { body: { messageId?: string; text: string; quoted?: string }; response: ReturnType<ProjectAgent['submit']> }
+  'POST projects/:id/messages': { body: { messageId?: string; text: string; quoted?: string; replyToMessageId?: string }; response: ReturnType<ProjectAgent['submit']> }
   'GET projects/:id/agent-runs': { response: ProjectAgentRun[] }
   'GET projects/:id/conversation': { response: ReturnType<ProjectAgent['webConversation']> }
   'GET projects/:id/checks': { response: import('./project-progress.ts').ProjectCheck[] }

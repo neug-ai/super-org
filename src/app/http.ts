@@ -246,9 +246,10 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     },
     'POST projects/:id/messages': async ({ params, body }) => {
       const message = z.strictObject({ messageId: ticketId.optional(), text: z.string().trim().min(1).max(26000),
-        quoted: z.string().max(16000).default('') }).parse(await body())
+        quoted: z.string().max(16000).default(''), replyToMessageId: ticketId.optional() }).parse(await body())
       projects.detail(params.id)
-      return agent().submit({ ...message, projectId: params.id, actorId: null, messageId: message.messageId ?? randomUUID(),
+      return agent().submit({ text: message.text, quoted: message.quoted, replyToNativeMessageId: message.replyToMessageId,
+        projectId: params.id, actorId: null, messageId: message.messageId ?? randomUUID(),
         channel: { source: 'request', thread: params.id, address: { projectId: params.id } } })
     },
     'GET projects/:id/agent-runs': ({ params }) => agent().runs(params.id),

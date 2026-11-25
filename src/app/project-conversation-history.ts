@@ -168,9 +168,14 @@ export function searchConversation(store: Store, scope: Scope, input: Search) {
   })
 }
 
-export function readConversation(store: Store, scope: Scope, id: string, offset: number) {
-  const turn = turns(store, scope, ` AND (run.key = ? OR ${MESSAGE} ->> '$.messageId' = ? OR ${NATIVE} = ?)
+/** Resolve one exact reference using the same project and conversation boundary as history reads. */
+export function findConversationTurn(store: Store, scope: Scope, id: string) {
+  return turns(store, scope, ` AND (run.key = ? OR ${MESSAGE} ->> '$.messageId' = ? OR ${NATIVE} = ?)
     ORDER BY (run.key = ?) DESC, ${AT} DESC LIMIT 1`, KV.projects.agentRun(id), id, id, KV.projects.agentRun(id))[0]
+}
+
+export function readConversation(store: Store, scope: Scope, id: string, offset: number) {
+  const turn = findConversationTurn(store, scope, id)
   if (!turn) return undefined
   const end = offset + pageSize
   const replies = !offset && turn.nativeId ? turns(store, scope, ` AND ${PARENT} = ?

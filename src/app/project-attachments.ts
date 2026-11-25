@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { extname, join } from 'node:path'
 import { z } from 'zod'
 import { key } from '../core/index.ts'
@@ -15,7 +15,7 @@ const ExecutionAttachment = z.strictObject({
 })
 export type ExecutionAttachment = z.output<typeof ExecutionAttachment>
 export const ExecutionAttachments = z.array(ExecutionAttachment).max(maxProjectAttachments)
-export type AttachmentResult = { name: string; kind?: 'image'; original?: ExecutionAttachment } & ({ summary?: string; partial: boolean } | { error: string })
+export type AttachmentResult = { attachmentId?: string; name: string; kind?: 'image'; original?: ExecutionAttachment } & ({ summary?: string; partial: boolean } | { error: string })
 const Preview = z.strictObject({ summary: z.string().trim().min(1).max(350) })
 const { $schema: _preview, ...schema } = z.toJSONSchema(Preview)
 
@@ -32,10 +32,13 @@ export class ProjectAttachments {
     this.readers.set(source, reader)
   }
 
-  async read(message: ProjectMessage, planner: ProjectPlanner, signal: AbortSignal): Promise<AttachmentResult[]> {
+  async read(message: ProjectMessage, planner: ProjectPlanner, signal: AbortSignal,
+    retained: readonly AttachmentResult[] = []): Promise<AttachmentResult[]> {
     const results: AttachmentResult[] = []
     const reader = this.readers.get(message.channel.source)
     for (const attachment of message.attachments ?? []) {
+      const cached = retained.find(item => item.attachmentId === attachment.id && item.original)
+      const attachmentId = attachment.id
       const extension = extname(attachment.name).toLowerCase()
       const isImage = attachment.kind === 'image' || imageExtension(extension)
       const kind = isImage ? { kind: 'image' as const } : {}
@@ -43,14 +46,19 @@ export class ProjectAttachments {
       let original: ExecutionAttachment | undefined
       try {
         if (!isImage && !supportedAttachment(attachment.name)) throw new AttachmentReadError('当前不支持这个文件格式。')
-        if (!reader) throw new AttachmentReadError('当前聊天来源尚未配置附件读取。')
-        const bytes = await reader(message, attachment, signal)
+        const retainedFile = ExecutionAttachment.safeParse(cached?.original).data
+        const retainedBytes = this.directory && retainedFile
+          ? await readFile(join(this.directory, retainedFile.file), { signal }).catch(() => undefined) : undefined
+        signal.throwIfAborted()
+        if (!retainedBytes && !reader) throw new AttachmentReadError('当前聊天来源尚未配置附件读取。')
+        const bytes = retainedBytes ?? await reader!(message, attachment, signal)
+        if (retainedBytes) original = retainedFile
         signal.throwIfAborted()
         if (bytes.length > maxAttachmentBytes) throw new AttachmentReadError('附件超过大小上限。')
         if (isImage) {
           const image = readAttachmentImage(bytes)
           if (!imageExtension(extname(name).toLowerCase())) name = name.slice(0, 180 - image.extension.length) + image.extension
-          if (this.directory) original = await this.retain(this.directory, message, attachment, name, bytes, image.extension)
+          if (this.directory && !original) original = await this.retain(this.directory, message, attachment, name, bytes, image.extension)
           if (!planner.proposeWithImage) throw new AttachmentReadError('当前项目 Agent 未启用图片识别。')
           let summary: string
           try {
@@ -62,10 +70,10 @@ export class ProjectAttachments {
             summary = Preview.parse(result).summary
           } catch { signal.throwIfAborted(); throw new AttachmentReadError('图片识别暂未生成可用结果。') }
           signal.throwIfAborted()
-          results.push({ name, ...kind, summary, partial: false, ...(original ? { original } : {}) })
+          results.push({ attachmentId, name, ...kind, summary, partial: false, ...(original ? { original } : {}) })
           continue
         }
-        if (this.directory) original = await this.retain(this.directory, message, attachment, name, bytes, extension)
+        if (this.directory && !original) original = await this.retain(this.directory, message, attachment, name, bytes, extension)
         const { text, partial } = await readAttachmentText(attachment.name, bytes, signal)
         signal.throwIfAborted()
         let summary: string | undefined
@@ -77,13 +85,13 @@ export class ProjectAttachments {
           summary = Preview.parse(result).summary
         } catch { signal.throwIfAborted() }
         signal.throwIfAborted()
-        results.push({ name, summary, partial, ...(original ? { original } : {}) })
+        results.push({ attachmentId, name, summary, partial, ...(original ? { original } : {}) })
       } catch (error) {
         signal.throwIfAborted()
         const issue = error instanceof AttachmentReadError ? error.message : isImage
           ? '图片暂时无法下载或读取，请重发。' : original
           ? '暂时无法提取可预览的文字。' : '附件暂时无法下载或保存，请重新引用文件或提供可访问的副本。'
-        results.push({ name, ...kind, error: issue, ...(original ? { original } : {}) })
+        results.push({ attachmentId, name, ...kind, error: issue, ...(original ? { original } : {}) })
       }
     }
     return results

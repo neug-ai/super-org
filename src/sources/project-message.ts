@@ -14,6 +14,7 @@ export const ProjectMessage = z.strictObject({
   sentAt: z.iso.datetime().optional(),
   nativeMessageId: id.optional(),
   replyToNativeMessageId: id.optional(),
+  quotedDocumentLinks: z.array(z.url({ protocol: /^https$/ }).max(600)).min(1).max(3).optional(),
   sourceUrl: z.url({ protocol: /^https?$/ }).optional(),
   attachments: z.array(MessageAttachment).max(maxProjectAttachments).optional(),
   attachmentOnly: z.literal(true).optional(),
