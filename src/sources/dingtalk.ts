@@ -8,7 +8,7 @@ import type { Projects } from '../app/projects.ts'
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream'
 import { z } from 'zod'
 import { type SourceKind } from './kind.ts'
-import { projectMessageReceived, type MessageAttachment, type ProjectMessage } from './project-message.ts'
+import { maxProjectAttachments, projectMessageReceived, type MessageAttachment, type ProjectMessage } from './project-message.ts'
 import { DingTalkCards } from './dingtalk-cards.ts'
 import { AttachmentReadError, maxAttachmentBytes } from '../app/attachment-text.ts'
 
@@ -98,7 +98,7 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
       text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '',
       sentAt: trigger.at, nativeMessageId: typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined,
       replyToNativeMessageId: typeof trigger.meta.replyToMessageId === 'string' ? trigger.meta.replyToMessageId : undefined,
-      ...(attachments?.length && { attachments }),
+      ...(attachments?.length && { attachments, ...(trigger.meta.attachmentOnly === true && { attachmentOnly: true as const }) }),
       ...(mentions.size || unresolvedCount ? { mentions: { members: [...mentions.values()], unresolvedCount } } : {}) })
     return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' : '已收到，正在结合项目现状处理。'
   }
@@ -140,26 +140,57 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
 // dingtalk: provider implementation
 export const dingTalkRoute = family<Route, [string]>('dingtalk-route:')
 const tickets = family<string, [string, string]>('dingtalk-ticket:')
-const bodies = family<{ messageType: string; content: unknown }, [string]>('dingtalk-body:')
-const NativeFile = z.object({ fileName: z.string().trim().min(1).max(300), downloadCode: z.string().min(1).max(4000), fileId: z.string().optional() })
+type NativeBody = { messageType: string; content: unknown }
+type NativeAttachment = { descriptor: MessageAttachment; downloadCode?: string }
+const bodies = family<NativeBody, [string]>('dingtalk-body:')
+const DownloadCode = z.string().min(1).max(4000)
+const NativeFile = z.object({ fileName: z.string().trim().min(1).max(300), downloadCode: DownloadCode, fileId: z.string().optional() })
+const NativeImage = z.object({ type: z.string().optional(), downloadCode: DownloadCode.optional(), pictureDownloadCode: DownloadCode.optional() })
+const RichText = z.object({ richText: z.array(z.unknown()) })
 
-function nativeFile(conversation: string, messageId: string, payload: { messageType: string; content: unknown }) {
-  const content = payload.content
-  const envelope = content && typeof content === 'object' && 'quote' in content
-    ? QuotedMessage.safeParse(content.quote).data : undefined
-  const quote = envelope?.msgType === 'file' && envelope.msgId ? envelope : undefined
-  if (!quote && payload.messageType !== 'file') return
-  let value = quote ? quote.content : envelope && content && typeof content === 'object' && 'content' in content ? content.content : content
-  if (typeof value === 'string') {
-    try { value = JSON.parse(value) } catch { return }
+function attachmentParts(conversation: string, messageId: string, messageType: string, content: unknown): NativeAttachment[] {
+  const nativeMessageId = messageId.trim()
+  if (!nativeMessageId || nativeMessageId.length > 300) return []
+  if (typeof content === 'string') {
+    try { content = JSON.parse(content) } catch { return [] }
   }
-  const parsed = NativeFile.safeParse(value)
-  if (!parsed.success) return
-  const { fileName, downloadCode, fileId } = parsed.data
-  const nativeMessageId = (quote?.msgId ?? messageId).trim()
-  if (!nativeMessageId || nativeMessageId.length > 300) return
-  return { descriptor: { id: key('dingtalk-file', conversation, nativeMessageId, fileId ?? fileName),
-    name: fileName, nativeMessageId }, downloadCode }
+  if (messageType === 'file') {
+    const file = NativeFile.safeParse(content).data
+    return file ? [{ descriptor: { id: key('dingtalk-file', conversation, nativeMessageId, file.fileId ?? file.fileName),
+      name: file.fileName, nativeMessageId }, downloadCode: file.downloadCode }] : []
+  }
+  const parts = messageType === 'picture' ? [content] : messageType === 'richText' ? RichText.safeParse(content).data?.richText ?? [] : []
+  const images: NativeAttachment[] = []
+  for (const [slot, part] of parts.entries()) {
+    const image = NativeImage.safeParse(part).data
+    if (messageType === 'richText' && image?.type !== 'picture' && !image?.pictureDownloadCode) continue
+    const downloadCode = image?.pictureDownloadCode ?? image?.downloadCode
+    images.push({ descriptor: { id: key('dingtalk-image', conversation, nativeMessageId, String(slot)), kind: 'image',
+      name: `图片 ${images.length + 1}`, nativeMessageId }, downloadCode })
+    if (images.length >= maxProjectAttachments) break
+  }
+  return images
+}
+
+function unpackBody(payload: NativeBody) {
+  const content = payload.content
+  return content && typeof content === 'object' && 'quote' in content
+    ? { quote: QuotedMessage.safeParse(content.quote).data, content: 'content' in content ? content.content : undefined }
+    : { content }
+}
+
+function nativeAttachments(route: Route, messageId: string, payload: NativeBody, stored: (id: string) => NativeBody | undefined): NativeAttachment[] {
+  const { conversationId, robotCode } = route
+  const { content, quote } = unpackBody(payload)
+  const all = attachmentParts(conversationId, messageId, payload.messageType, content)
+  if (quote?.msgId && quote.msgType && all.length < maxProjectAttachments) {
+    const id = quote.msgId.trim()
+    const quoted = attachmentParts(conversationId, id, quote.msgType, quote.content)
+    const original = !quoted.some(item => item.downloadCode) && id && id.length <= 300
+      ? stored(key('dingtalk', robotCode, conversationId, id)) : undefined
+    all.push(...(original ? attachmentParts(conversationId, id, original.messageType, unpackBody(original).content) : quoted))
+  }
+  return [...new Map(all.map(item => [item.descriptor.id, item])).values()].slice(0, maxProjectAttachments)
 }
 const senderIdentities = family<string | null, [string]>('dingtalk-sender-identity:')
 const optionalIdentity = z.string().min(1).max(256).optional()
@@ -174,6 +205,7 @@ const Message = z.object({ msgId: z.string().min(1), conversationId: z.string().
 export interface Route { webhook: string; expires: number; robotCode: string; conversationId: string; corpId?: string }
 export const ticketReference = (text: string): string | undefined => /(?:^|\s)#([a-f0-9]{12,32})(?=\s|$|[，。,:：])/i.exec(text)?.[1]?.toLowerCase()
 export const label = (id: string): string => `#${id.slice(0, 12)}`
+const picturePlaceholder = '[图片附件]'
 /** Projects the platform's body into text without treating a wire-format type as an admission rule. */
 function contentText(value: unknown): string {
   if (typeof value === 'string') {
@@ -192,7 +224,7 @@ function contentText(value: unknown): string {
   if (typeof body.recognition === 'string') return body.recognition
   if (typeof body.unknownMsgType === 'string') return body.unknownMsgType
   if (body.type === 'br') return '\n'
-  if (body.type === 'picture' || body.pictureDownloadCode) return '\n[图片附件，内容尚未下载或解析]\n'
+  if (body.type === 'picture' || body.pictureDownloadCode) return `\n${picturePlaceholder}\n`
   if (typeof body.fileName === 'string') return `[文件附件：${body.fileName}，内容尚未下载或解析]`
   return ''
 }
@@ -253,7 +285,7 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): {
   const message = Message.parse(raw)
   if (message.senderId && message.senderId === message.chatbotUserId) return
   const text = [message.text?.content, contentText(message.content)].filter(value => value?.trim()).join('\n').trim()
-    || `[钉钉 ${message.msgtype} 消息，未提供可解析文本；附件内容尚未下载或解析]`
+    || (message.msgtype === 'picture' ? picturePlaceholder : `[钉钉 ${message.msgtype} 消息，未提供可解析文本；附件内容尚未下载或解析]`)
   const id = key('dingtalk', message.robotCode, message.conversationId, message.msgId)
   const quote = quotedMessage(head)
   const replyToBot = !!quote?.senderId && !!message.chatbotUserId && quote.senderId === message.chatbotUserId
@@ -285,7 +317,7 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): {
         ...(reference ? { ticketReference: reference, referenceResolved: matches.length === 1 } : {}) } },
     route: { webhook: message.sessionWebhook, expires: message.sessionWebhookExpiredTime, robotCode: message.robotCode,
       conversationId: conversation, corpId: message.senderCorpId },
-    ...(message.content !== undefined || quote ? { body: { messageType: message.msgtype,
+    ...(message.content !== undefined || quote || message.msgtype === 'picture' ? { body: { messageType: message.msgtype,
       content: quote ? { content: message.content, quote } : message.content } } : {}),
   }
 }
@@ -340,8 +372,12 @@ export class DingTalk {
           context.state.set(dingTalkRoute(parsed.route.conversationId), parsed.route)
           // Preserve native content/attachment references in the original Source KV, separate from model text.
           if (parsed.body) {
-            const attachment = nativeFile(parsed.route.conversationId, String(trigger.meta.messageId), parsed.body)
-            if (attachment) trigger.meta.attachments = [attachment.descriptor]
+            const attachments = nativeAttachments(parsed.route, String(trigger.meta.messageId), parsed.body, id => context.state.get(bodies(id)))
+            if (attachments.length) {
+              trigger.meta.attachments = attachments.map(item => item.descriptor)
+              if (trigger.text.split(/\s*\n\s*/).filter(Boolean).every(line => line === picturePlaceholder))
+                trigger.meta.attachmentOnly = true
+            }
             context.state.set(bodies(parsed.trigger.id), parsed.body)
           }
           const result = context.receive(trigger)
@@ -406,10 +442,12 @@ export class DingTalk {
     const { conversationId, triggerId } = message.channel.address
     const payload = triggerId && this.context.state.get(bodies(triggerId))
     const route = conversationId && this.context.state.get(dingTalkRoute(conversationId))
-    const file = payload && conversationId && message.nativeMessageId && nativeFile(conversationId, message.nativeMessageId, payload)
-    if (message.channel.source !== 'dingtalk' || triggerId !== message.messageId || !route || !file || file.descriptor.id !== attachment.id) {
+    const file = payload && route && message.nativeMessageId && nativeAttachments(route, message.nativeMessageId, payload, id => this.context.state.get(bodies(id)))
+      .find(item => item.descriptor.id === attachment.id && item.descriptor.nativeMessageId === attachment.nativeMessageId)
+    if (message.channel.source !== 'dingtalk' || triggerId !== message.messageId || !route || !file) {
       throw new AttachmentReadError('无法验证这个钉钉附件的来源，请在项目群重新引用文件。')
     }
+    if (!file.downloadCode) throw new AttachmentReadError('这条消息没有可用的图片下载码，请把图片和 @ 机器人放在同一条消息里重发。')
     const signal = AbortSignal.any([lifetime, AbortSignal.timeout(20_000)])
     const token = await this.accessToken()
     const response = await this.http('https://api.dingtalk.com/v1.0/robot/messageFiles/download', {

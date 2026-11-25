@@ -179,7 +179,7 @@ it('preserves rich-text order around images and accepts string-encoded content',
   const content = { richText: [{ text: '前文\n' }, { type: 'picture', downloadCode: 'media-reference' }, { text: '\n后文' }] }
   const parsed = dingTalkTrigger(event({ msgtype: 'richText', text: undefined, content: JSON.stringify(content) }), source)!
   expect(parsed.trigger.text).toContain('前文\n')
-  expect(parsed.trigger.text).toContain('[图片附件，内容尚未下载或解析]')
+  expect(parsed.trigger.text).toContain('[图片附件]')
   expect(parsed.trigger.text).toMatch(/前文[\s\S]*图片附件[\s\S]*后文/)
   expect(parsed.body?.content).toBe(JSON.stringify(content))
   expect(parsed.trigger.text).not.toContain('media-reference')
@@ -187,7 +187,7 @@ it('preserves rich-text order around images and accepts string-encoded content',
 it.each(['picture', 'audio', 'video', 'file', 'unknownMsgType', 'futureMessageType'])('accepts %s group mentions instead of silently dropping them', msgtype => {
   const parsed = dingTalkTrigger(event({ msgtype, text: undefined, content: { downloadCode: 'media-reference' } }), source)!
   expect(parsed.trigger.meta.messageType).toBe(msgtype)
-  expect(parsed.trigger.text).toContain('尚未下载或解析')
+  expect(parsed.trigger.text).toContain(msgtype === 'picture' ? '[图片附件]' : '尚未下载或解析')
   expect(parsed.body).toEqual({ messageType: msgtype, content: { downloadCode: 'media-reference' } })
 })
 it('retains audio transcription and file names when supplied by the platform', () => {

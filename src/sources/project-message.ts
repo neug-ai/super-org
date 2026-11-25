@@ -2,8 +2,9 @@ import { z } from 'zod'
 import type { ProjectEventDefinition } from './project-events.ts'
 
 const id = z.string().min(1).max(300)
+export const maxProjectAttachments = 3
 export const MessageAttachment = z.strictObject({
-  id, name: z.string().min(1).max(300), nativeMessageId: id,
+  id, name: z.string().min(1).max(300), nativeMessageId: id, kind: z.literal('image').optional(),
 })
 export type MessageAttachment = z.output<typeof MessageAttachment>
 export const ProjectMessage = z.strictObject({
@@ -14,7 +15,8 @@ export const ProjectMessage = z.strictObject({
   nativeMessageId: id.optional(),
   replyToNativeMessageId: id.optional(),
   sourceUrl: z.url({ protocol: /^https?$/ }).optional(),
-  attachments: z.array(MessageAttachment).max(3).optional(),
+  attachments: z.array(MessageAttachment).max(maxProjectAttachments).optional(),
+  attachmentOnly: z.literal(true).optional(),
   mentions: z.strictObject({ members: z.array(z.strictObject({ memberId: id, name: z.string().min(1).max(200) })).max(50),
     unresolvedCount: z.number().int().min(0).max(50) }).optional(),
   channel: z.strictObject({ source: id, thread: id, address: z.record(z.string(), z.string()) }),
