@@ -188,7 +188,7 @@ function memberValue(data: FormData): MemberInput {
 
 type ProjectEditor = { revision: number } & ({ type: 'member' | 'new-member' | 'issue' } | { type: 'task'; task?: ProjectTask }
   | { type: 'edit-member' | 'remove-member'; member: Member }
-  | { type: 'review'; task: ProjectTask; outcome: 'accepted' | 'rejected' } | { type: 'delivery'; task: ProjectTask }
+  | { type: 'review'; task: ProjectTask; outcome: 'accepted' | 'rejected' | 'feedback' } | { type: 'delivery'; task: ProjectTask }
   | { type: 'progress'; task: ProjectTask; entry?: TaskProgress } | { type: 'tracking'; task: ProjectTask }
   | { type: 'link' | 'run'; task: ProjectTask } | { type: 'follow-up' | 'stop'; task: ProjectTask; ticket: ProjectTicket }
   | { type: 'milestone'; milestone?: ProjectMilestone } | { type: 'decision'; decision?: ProjectDecision })
@@ -415,8 +415,9 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, inspec
           <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'delivery' })}>{t('project.submitDelivery')}</Button>}
         {task.status === 'in-review' && reviewTask &&
           <Button variant="outline" size="sm" onClick={() => inspect(reviewTask)}>{t('project.openReviewTask')}</Button>}
-        {task.status === 'in-review' && review?.status === 'pending' && !review.taskId && <div className="dt-work-actions">
-          <span>{t('project.tracking.awaitingReview', { version: review.version, owner })}</span>
+        {task.status === 'in-review' && review?.status === 'pending' && <div className="dt-work-actions">
+          <span>{t('project.tracking.awaitingReview', { version: review.version })}</span>
+          <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'feedback' })}>{t('project.addReviewFeedback')}</Button>
           <Button variant="primary" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'accepted' })}>{t('project.acceptTask')}</Button>
           <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'rejected' })}>{t('project.rejectDelivery')}</Button>
         </div>}
@@ -428,9 +429,17 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, inspec
             <MarkdownContent t={t} text={item.evidence.summary} />
             {item.evidence.links.map(url => <p key={url}><a href={url} target="_blank" rel="noreferrer">{url}</a></p>)}
             <p><strong>{t('project.acceptance')}</strong><br />{item.requirements.acceptance}</p>
-            {item.decision && <p>{t('project.reviewReason')}: {item.decision.reason}<br />
-              {item.decision.actorId ? project.members.find(member => member.id === item.decision!.actorId)?.name ?? t('project.formerMember') : t('project.localOperator')}
-              {' · '}<time dateTime={item.decision.at}>{new Date(item.decision.at).toLocaleString()}</time></p>}
+            {[...(item.feedback ?? []), ...(item.decision ? [item.decision] : [])].map((entry, index) => {
+              const recorder = entry.actorName ?? (entry.actorId
+                ? project.members.find(member => member.id === entry.actorId)?.name ?? t('project.formerMember') : t('project.localOperator'))
+              return <div key={`${entry.at}-${index}`} className="dt-project-answer">
+                <strong>{t(entry === item.decision ? 'project.reviewReason' : 'project.reviewFeedback')}</strong>
+                <MarkdownContent t={t} text={entry.reason} />
+                {entry.links?.map(url => <p key={url}><a href={url} target="_blank" rel="noreferrer">{url}</a></p>)}
+                <p className="dt-hint">{entry.reviewerName ? t('project.reviewRecordedBy', { reviewer: entry.reviewerName, recorder }) : recorder}
+                  {' · '}<time dateTime={entry.at}>{new Date(entry.at).toLocaleString()}</time></p>
+              </div>
+            })}
           </details>)}
         </section>}
       </div></li>
@@ -666,17 +675,21 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
       <p>{editor.task.title}</p>
       <Field label={t('project.tracking.focus')}><textarea className="dt-textarea" name="focus" maxLength={2000} rows={3} /></Field>
     </Editor>; break
-    case 'review': dialog = <Editor t={t} title={t(editor.outcome === 'accepted' ? 'project.acceptTask' : 'project.rejectDelivery')} close={close}
+    case 'review': dialog = <Editor t={t} title={t(editor.outcome === 'feedback' ? 'project.addReviewFeedback'
+      : editor.outcome === 'accepted' ? 'project.acceptTask' : 'project.rejectDelivery')} close={close}
       save={async data => {
         const review = currentReview(editor.task)
         if (!review) throw new Error(t('project.noCurrentReview'))
         await call('POST projects/:id/tasks/:taskId/reviews/:reviewId', { id, taskId: editor.task.id, reviewId: review.id,
-          body: { messageId: field(data, 'messageId'), outcome: editor.outcome, reason: field(data, 'reason') } })
+          body: { messageId: field(data, 'messageId'), outcome: editor.outcome, reason: field(data, 'reason'),
+            reviewerName: field(data, 'reviewerName').trim() || undefined } })
         await Promise.all([reload(), changed()])
       }}>
       <p>{editor.task.title} · {t('project.deliveryVersion', { version: currentReview(editor.task)?.version ?? 0 })}</p>
       <p>{currentReview(editor.task)?.requirements.acceptance}</p>
-      <Field label={t('project.reviewReason')}><textarea className="dt-textarea" name="reason" required maxLength={8000} rows={4} /></Field>
+      <Field label={t(editor.outcome === 'feedback' ? 'project.reviewFeedback' : 'project.reviewReason')}>
+        <textarea className="dt-textarea" name="reason" required maxLength={8000} rows={4} /></Field>
+      <Field label={t('project.reviewReviewerName')}><input className="dt-input" name="reviewerName" maxLength={200} /></Field>
       <p className="dt-hint">{t('project.localReviewHelp')}</p>
     </Editor>; break
     case 'task': dialog = <Editor t={t} title={t(editor.task ? 'project.editTask' : 'project.addTask')} close={close}

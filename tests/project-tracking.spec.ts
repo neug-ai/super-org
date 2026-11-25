@@ -165,7 +165,7 @@ it('uses a configurable project clock with zero inbound messages and reads subse
   const other = new Projects(runtime.store).create(ProjectInput.parse({ name: 'Other project' }))
   propose.mockImplementation(async prompt => {
     const context = data(prompt)
-    expect(context.candidates.map((candidate: { taskId: string }) => candidate.taskId)).toEqual([upstream.id, task.id, review.taskId])
+    expect(context.candidates.map((candidate: { taskId: string }) => candidate.taskId)).toEqual([upstream.id, task.id])
     const candidate = context.candidates[1]
     expect(candidate.evidence[`review:${review.id}`]).toMatchObject({ status: 'pending' })
     expect(candidate.evidence[`task:${task.id}`]).toMatchObject({ status: 'todo', dueDate: '2026-11-20', dependencies: [upstream.id] })
@@ -259,7 +259,7 @@ it('checks the current blocker with the member named by the Worker and rejects t
     const candidate = data(prompt).candidates.find((item: { taskId: string }) => item.taskId === task.id)
     expect(candidate).toMatchObject({ questionRef: ref, recipients: [{ id: owner('丙'), name: '丙' }],
       evidence: { [ref]: { question: '请丙在真机上检查触屏并回传截图。' },
-        [`task:${task.id}`]: { deliveryReview: { status: 'not-requested', reviewerId: owner('甲') } } } })
+        [`task:${task.id}`]: { deliveryReview: { status: 'not-requested', reviewerId: null } } } })
     return suggest(task.id, owner('丙'), ref)
   })
   await advance('10:00')

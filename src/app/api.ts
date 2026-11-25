@@ -45,7 +45,7 @@ export interface Api {
   'POST projects/:id/tasks/:taskId/deliveries': { body: { messageId: string; summary: string; links?: string[]; outcome?: 'accepted' | 'rejected' }; response: ReturnType<ProjectReviews['deliver']> }
   'POST projects/:id/tasks/:taskId/progress': { body: ProgressInput & { messageId: string }; response: TaskProgress }
   'POST projects/:id/tasks/:taskId/tracking': { body: { messageId: string; focus?: string }; response: ProjectEvent }
-  'POST projects/:id/tasks/:taskId/reviews/:reviewId': { body: { messageId: string; outcome: 'accepted' | 'rejected'; reason: string }; response: ReturnType<ProjectReviews['decide']> }
+  'POST projects/:id/tasks/:taskId/reviews/:reviewId': { body: import('zod').input<typeof import('./project-reviews.ts').ReviewInput> & { messageId: string }; response: ReturnType<ProjectReviews['decide']> }
   'GET projects/workflow': { response: ReturnType<ProjectEvents['view']> }
   'PUT projects/workflow': { body: { revision: number; config: Partial<ProjectWorkflowConfig> }; response: ReturnType<ProjectEvents['view']> }
   'PUT projects/workflow/sources/:source': { body: { revision: number; config: ProjectWorkflowConfig['sources'][string] }; response: ReturnType<ProjectEvents['view']> }

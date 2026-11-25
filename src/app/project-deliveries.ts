@@ -2,6 +2,16 @@ import type { ProjectTask } from './projects.ts'
 
 export interface DeliveryEvidence { summary: string; links: string[]; ticketId?: string; reportAt?: string;
   code?: { url: string; head: string; mergeCommit: string; base?: string; updatedAt: string } }
+export type ReviewOutcome = 'accepted' | 'rejected' | 'feedback'
+export interface ReviewEntry {
+  actorId: string | null
+  actorName?: string
+  reviewerName?: string
+  source: string
+  reason: string
+  at: string
+  links?: string[]
+}
 export interface ProjectReview {
   id: string
   version: number
@@ -10,18 +20,19 @@ export interface ProjectReview {
   taskId?: string
   requirements: { title: string; description: string; acceptance: string; ownerId?: string | null }
   evidence: DeliveryEvidence
-  decision?: { actorId: string | null; source: string; reason: string; at: string; links?: string[] }
+  feedback?: ReviewEntry[]
+  decision?: ReviewEntry
 }
 
 export const reviewReference = (review: ProjectReview) => `〔交付第 ${review.version} 版 · 验收 ${review.id.slice(0, 8)}〕`
 export const currentReview = (task: ProjectTask) => task.reviews?.findLast(review => review.version === task.deliveryVersion)
 
-/** Distinguishes the configured reviewer from a review actually requested for this delivery. */
+/** Describes the current delivery, including the assignee of a legacy linked review task. */
 export function deliveryReviewState(task: ProjectTask, tasks: readonly ProjectTask[] = []) {
   const review = currentReview(task)
   return review ? { status: review.status, reviewId: review.id, version: review.version, ...(review.taskId && { taskId: review.taskId }),
-    reviewerId: review.taskId ? tasks.find(item => item.id === review.taskId)?.ownerId ?? null : review.requirements.ownerId ?? null }
-    : { status: 'not-requested' as const, reviewerId: task.executionMode === 'agent' ? task.ownerId : null }
+    reviewerId: review.taskId ? tasks.find(item => item.id === review.taskId)?.ownerId ?? null : null }
+    : { status: 'not-requested' as const, reviewerId: null }
 }
 
 /** Invalidates the old review before beginning a new execution or changing its acceptance scope. */

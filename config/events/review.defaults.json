@@ -4,15 +4,19 @@
       "on": {
         "review.requested": {
           "enabled": true,
-          "description": "记录本版交付和验收条件，并通知任务负责人验收。"
+          "description": "记录本版交付和验证条件，并通知任务负责人安排验证。"
         },
         "review.accepted": {
           "enabled": true,
-          "description": "当前负责人通过本版验收，完成任务并保留验收依据。"
+          "description": "记录人工通过结论和依据，并完成原任务。"
         },
         "review.rejected": {
           "enabled": true,
-          "description": "当前负责人退回本版交付，保留原因并返回进行中。"
+          "description": "记录人工退回结论和原因，原任务返回进行中。"
+        },
+        "review.feedback": {
+          "enabled": true,
+          "description": "把反馈附到当前交付版本，保持任务待验证。"
         }
       }
     }

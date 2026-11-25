@@ -28,7 +28,7 @@ import type { Store } from './store.ts'
 import type { ProjectEvents } from './project-events.ts'
 import type { ProjectAgent } from './project-agent.ts'
 import type { ProjectTools } from './project-tools.ts'
-import { TaskDelivery, type ProjectReviews } from './project-reviews.ts'
+import { ReviewInput, TaskDelivery, type ProjectReviews } from './project-reviews.ts'
 import { CommunicationPreference, type Communication } from './communication.ts'
 import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
@@ -235,9 +235,10 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     },
     'POST projects/:id/tasks/:taskId/reviews/:reviewId': async ({ params, body }) => {
       if (!host?.projectReviews) throw new ProjectError(409, '验收服务尚未启动。')
-      const value = z.strictObject({ messageId: ticketId, outcome: z.enum(['accepted', 'rejected']), reason: z.string().trim().min(1).max(8000) }).parse(await body())
+      const value = ReviewInput.extend({ messageId: ticketId }).parse(await body())
       return host.projectReviews.decide({ projectId: params.id, actorId: null, operationId: value.messageId,
-        channel: { source: 'request', thread: params.id, address: { projectId: params.id } } }, params.taskId, params.reviewId, value.outcome, value.reason)
+        channel: { source: 'request', thread: params.id, address: { projectId: params.id } } }, params.taskId, params.reviewId, value.outcome,
+        value.reason, undefined, value.links, value.reviewerName)
     },
     'GET projects/tools': () => {
       if (!host?.projectTools) throw new ProjectError(409, 'Project management tools are unavailable')
