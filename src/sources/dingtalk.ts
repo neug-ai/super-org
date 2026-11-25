@@ -94,10 +94,12 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
       }
     }
     const attachments = Array.isArray(trigger.meta.attachments) ? trigger.meta.attachments as MessageAttachment[] : undefined
+    const quotedLinks = trigger.meta.quotedDocumentLinks
     const result = agent.submit({ projectId, actorId: memberId, messageId: trigger.id, channel: trigger.channel,
       text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '',
       sentAt: trigger.at, nativeMessageId: typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined,
       replyToNativeMessageId: typeof trigger.meta.replyToMessageId === 'string' ? trigger.meta.replyToMessageId : undefined,
+      ...(Array.isArray(quotedLinks) && quotedLinks.length && { quotedDocumentLinks: quotedLinks }),
       ...(attachments?.length && { attachments, ...(trigger.meta.attachmentOnly === true && { attachmentOnly: true as const }) }),
       ...(mentions.size || unresolvedCount ? { mentions: { members: [...mentions.values()], unresolvedCount } } : {}) })
     return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' : '已收到，正在结合项目现状处理。'
@@ -242,6 +244,26 @@ function quotedMessage(head: Record<string, unknown>) {
     if (quote.success) return quote.data
   }
 }
+/** Recognizes canonical document links carried by a quoted DingTalk card, independently of its sender. */
+function quotedDocumentLinks(quote: z.output<typeof QuotedMessage> | undefined): string[] {
+  if (quote?.msgType !== 'interactiveCard') return []
+  let content = quote.content
+  if (typeof content === 'string') {
+    try { content = JSON.parse(content) } catch { return [] }
+  }
+  if (!content || typeof content !== 'object') return []
+  const card = content as Record<string, unknown>
+  const candidates = Array.isArray(card.cardContent) ? card.cardContent.slice(0, 50)
+    .flatMap(node => node?.elementType === 'LINK' ? [node.value] : []) : []
+  const links = [card.biz_custom_action_url, ...candidates].flatMap(value => {
+    if (typeof value !== 'string' || value.length > 2048) return []
+    const url = URL.parse(value)
+    if (!url || url.origin !== 'https://alidocs.dingtalk.com' || url.username || url.password ||
+      !/^\/i\/nodes\/[a-zA-Z0-9_-]{1,512}\/?$/.test(url.pathname)) return []
+    return [url.origin + url.pathname.replace(/\/$/, '')]
+  })
+  return [...new Set(links)].slice(0, 3)
+}
 /** Only card TEXT nodes are readable quote content; opaque/encrypted content is never guessed. */
 function quotedText(value: unknown, depth = 0): string {
   if (depth > 8) return ''
@@ -288,6 +310,7 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): {
     || (message.msgtype === 'picture' ? picturePlaceholder : `[钉钉 ${message.msgtype} 消息，未提供可解析文本；附件内容尚未下载或解析]`)
   const id = key('dingtalk', message.robotCode, message.conversationId, message.msgId)
   const quote = quotedMessage(head)
+  const documentLinks = quotedDocumentLinks(quote)
   const replyToBot = !!quote?.senderId && !!message.chatbotUserId && quote.senderId === message.chatbotUserId
   const botQuote = replyToBot ? quotedText(quote?.content) : ''
   const directReference = ticketReference(text)
@@ -312,6 +335,7 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): {
         ...(mentions.length ? { mentionedStaffIds: mentions } : {}),
         ...(message.senderNick?.trim() ? { senderNick: message.senderNick.trim().slice(0, 200) } : {}),
         ...(quote ? { replyToMessageId: quote.msgId, replyToMessageType: quote.msgType, replyToBot } : {}),
+        ...(documentLinks.length && { quotedDocumentLinks: documentLinks }),
         ...(botQuote ? { replyToBotText: botQuote.slice(0, 8000) } : {}),
         ...(reference ? { referenceSource: directReference ? 'text' : 'quote' } : {}),
         ...(reference ? { ticketReference: reference, referenceResolved: matches.length === 1 } : {}) } },

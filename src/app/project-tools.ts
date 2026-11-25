@@ -18,7 +18,7 @@ import type { ProjectEvent } from '../sources/project-events.ts'
 import { RepositoryFeedback } from '../sources/repository-events.ts'
 import { explicitProjectMention, projectChannel } from './project-notifications.ts'
 import { readConversation, searchConversation } from './project-conversation-history.ts'
-import type { ExecutionAttachment } from './project-attachments.ts'
+import type { ExecutionMaterials } from './project-references.ts'
 
 const id = z.string().min(1).max(128)
 const editable = TaskInput.omit({ status: true, ticketId: true, executionMode: true })
@@ -36,8 +36,8 @@ export interface ProjectToolContext {
   reviewId?: string
   text?: string
   event?: ProjectEvent
-  /** Original files retained by the project Agent for this message. Never a model argument. */
-  executionAttachments?: readonly ExecutionAttachment[]
+  /** Original files and links resolved for this turn by the project Agent. */
+  executionMaterials?: ExecutionMaterials
 }
 export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef; replyMention?: string }
 export interface ProjectOperation {
@@ -53,12 +53,12 @@ export interface ProjectToolsHost {
   communication: Communication
   capabilities(channel?: ChannelRef): unknown
   knowledgeDir?: string
-  authorizeHistory?(context: ProjectToolContext): boolean
+  authorizeHistory?(context: Pick<ProjectToolContext, 'channel' | 'actorId'>): boolean
   progress?(): ProjectProgress | undefined
   tracking?(): ProjectTracking
-  start(projectId: string, taskId: string, revision: number, attachments?: readonly ExecutionAttachment[]): ProjectDetail
+  start(projectId: string, taskId: string, revision: number, materials?: ExecutionMaterials): ProjectDetail
   stop(projectId: string, taskId: string, ticketId: string): ProjectDetail
-  follow(projectId: string, taskId: string, ticketId: string, text: string, origin?: ProjectEvent, attachments?: readonly ExecutionAttachment[]): ProjectDetail
+  follow(projectId: string, taskId: string, ticketId: string, text: string, origin?: ProjectEvent, materials?: ExecutionMaterials): ProjectDetail
   reply?(context: ProjectToolContext, taskId: string, url: string, text: string): unknown
 }
 
@@ -101,7 +101,7 @@ export class ProjectTools {
       }))
     }
     const authorizeHistory = (context: ProjectToolContext) => {
-      if (host.authorizeHistory && !host.authorizeHistory(context)) throw new ProjectError(403, '无法读取当前会话的历史。')
+      if (!this.mayReadHistory(context)) throw new ProjectError(403, '无法读取当前会话的历史。')
     }
     const historyAuthor = (actorId: string | null) => actorId === null ? '本地操作者' : host.store.get(KV.projects.member(actorId))?.name ?? null
     this.register(operation('conversation.history.search', '按关键词和可选 UTC 时间范围检索（结巴分词与 BM25 排序）当前项目会话中已保存的消息与已送达回复，最多五条。', z.strictObject({
@@ -217,7 +217,7 @@ export class ProjectTools {
           throw new ProjectError(403, '自动派发只适用于指派给项目 Agent 的任务。')
         if (context.actorId !== null && current.executionMode === undefined && !agentOwned && current.ownerId !== context.actorId)
           throw new ProjectError(403, '请由任务负责人委托后台执行。')
-        const result = host.start(context.projectId, args.taskId, project.revision, context.executionAttachments)
+        const result = host.start(context.projectId, args.taskId, project.revision, context.executionMaterials)
         const started = result.tasks.find(item => item.id === args.taskId)!
         return { summary: `已为「${started.title}」登记 Agent 执行`, data: { taskId: started.id, ticketId: started.ticketId, status: started.status } }
       }))
@@ -238,7 +238,7 @@ export class ProjectTools {
             return { summary: `已将补充信息交给「${current.title}」的执行 Agent`, replyChannel: projectChannel(host.store, this.projects.detail(context.projectId)) }
           }
         }
-        host.follow(context.projectId, current.id, current.ticketId, args.text, undefined, context.executionAttachments)
+        host.follow(context.projectId, current.id, current.ticketId, args.text, undefined, context.executionMaterials)
         return { summary: `已将补充信息交给「${current.title}」的执行 Agent` }
       }))
     this.register(operation('discussion.reply', '根据成员要求向当前任务已关联的代码交付或评审线程回复。只登记可靠投递，实际发送以回执为准；不能自行猜测其他仓库的地址。',
@@ -267,6 +267,10 @@ export class ProjectTools {
   }
 
   reviewReference(projectId: string, quoted: string): string | undefined { return this.host.reviews.reference(projectId, quoted) }
+
+  mayReadHistory(context: Pick<ProjectToolContext, 'channel' | 'actorId'>): boolean {
+    return this.host.authorizeHistory?.(context) ?? true
+  }
 
   register(tool: ProjectOperation): void {
     if (this.operations.has(tool.name)) throw new Error(`Project tool already registered: ${tool.name}`)

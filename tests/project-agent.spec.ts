@@ -7,6 +7,7 @@ import { KV } from '../src/kv.ts'
 import { Commands } from '../src/infra/commands.ts'
 import type { ProjectAgentRun } from '../src/app/project-agent.ts'
 import type { ProjectPlanner } from '../src/app/project-planning.ts'
+import { materialReference, resolveProjectReferences } from '../src/app/project-references.ts'
 import { obsoleteExplicitProjectMention } from '../src/app/project-notifications.ts'
 import { MemberInput, ProjectChange, ProjectInput, Projects } from '../src/app/projects.ts'
 import { projectMessageReceived } from '../src/sources/project-message.ts'
@@ -378,7 +379,58 @@ it('continues DingTalk conversation, reads local knowledge, and retains project 
       projectId: id, actorId: null, messageId: 'traversal', operationId: 'traversal',
       channel: { source: 'request', thread: id, address: {} },
     })).toThrow('不在配置目录内')
+
+    const documentUrl = 'https://alidocs.dingtalk.com/i/nodes/example-workflow'
+    propose.mockImplementationOnce(async prompt => {
+      const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+      expect(context.message).toMatchObject({ text: '是这个', quoted: '', replyToNativeMessageId: 'never-stored-card',
+        quotedDocumentLinks: [documentUrl] })
+      expect(context.reference).toEqual({ quote: 'inline', links: [documentUrl] })
+      expect(prompt).toContain('无需让成员重发该链接')
+      expect(prompt).not.toMatch(/tracking-secret|untrusted\.example|fake-signature/)
+      return done('我已识别这份钉钉文档链接。打开正文仍需要文档访问权限。')
+    })
+    await receive({ headers: { messageId: 'document-card' }, data: JSON.stringify({ ...JSON.parse(frame.data), msgId: 'document-card',
+      text: { content: '是这个', isReplyMsg: true, repliedMsg: { msgId: 'never-stored-card', senderId: 'another-bot',
+        msgType: 'interactiveCard', content: {
+          biz_custom_action_url: `${documentUrl}?tracking-secret#share`,
+          cardContent: [{ elementType: 'LINK', value: documentUrl }, { elementType: 'LINK', value: 'https://untrusted.example/doc' },
+            { elementType: 'LINK', value: 'https://files.aliyuncs.com/private.pdf?Signature=fake-signature' }],
+        } } } }) })
+    await h.runtime.idle()
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining('我已识别这份钉钉文档链接。打开正文仍需要文档访问权限。') }))
+    expect(h.runtime.projectAgent!.runs(id)[0]?.steps).toEqual([])
   } finally { callback.mockRestore(); ack.mockRestore() }
+})
+
+it('resolves an old material link exactly through the web conversation API', async () => {
+  const { h, id, say, propose } = await pilot()
+  const url = 'https://docs.example.org/workflow'
+  const old = await say('old-workflow', `最新版 workflow 在这里：${url}。`)
+  for (let i = 0; i < 6; i++) await say(`unrelated-${i}`, `同期无关消息 ${i}`)
+  propose.mockImplementationOnce(async prompt => {
+    const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+    expect(context.reference).toEqual({ quote: 'resolved', links: [url], message: { id: old.id, text: old.message.text } })
+    expect(context.recentConversation).not.toContainEqual(expect.objectContaining({ id: old.id }))
+    return done('我已定位 workflow 链接。')
+  })
+  const response = await h.api('POST', `projects/${id}/messages`, {
+    messageId: 'quote-workflow', text: '这份 workflow', replyToMessageId: 'old-workflow',
+  })
+  expect(response.status).toBe(200)
+  await h.runtime.idle()
+  const agent = h.runtime.projectAgent!
+  const run = agent.runs(id).find(item => item.message.messageId === 'quote-workflow')!
+  expect(run.reply).toContain('我已定位 workflow 链接。')
+  expect(run.references?.links).toEqual([url])
+  const unmatched = { ...run.message, quoted: materialReference(old.id) }
+  expect(resolveProjectReferences(h.runtime.store, { ...unmatched, channel: { ...unmatched.channel, thread: 'another-chat' } }, true))
+    .toMatchObject({ links: [], attachments: [] })
+  expect(resolveProjectReferences(h.runtime.store, { ...unmatched, projectId: 'another-project' }, true))
+    .toMatchObject({ links: [], attachments: [] })
+  expect(resolveProjectReferences(h.runtime.store, unmatched, false)).toMatchObject({ links: [], attachments: [] })
+  expect(resolveProjectReferences(h.runtime.store, { ...unmatched, quoted: '', replyToNativeMessageId: 'unknown-message' }, true))
+    .toEqual({ quote: 'unavailable', links: [], attachments: [] })
 })
 
 it('loads older web project conversation only through the history tools', async () => {
@@ -458,11 +510,17 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     const bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, fetchFile as typeof fetch,
       undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, agent))
     agent.registerAttachmentReader('dingtalk', (message, attachment, signal) => bot.readProjectAttachment(message, attachment, signal))
-    const post = async (msgId: string, options: { sender?: string; name?: string; code?: string } = {}) => {
+    const sourceLink = 'https://docs.example.org/slide-notes'
+    const post = async (msgId: string, options: { sender?: string; name?: string; code?: string; summaryCard?: string; link?: string } = {}) => {
       await receive({ headers: { messageId: msgId }, data: JSON.stringify({ msgId, senderStaffId: options.sender ?? 'member', conversationId: 'test-group',
-        conversationType: '2', isInAtList: true, senderCorpId: 'test-corp', robotCode: 'robot', msgtype: 'text',
-        text: { content: '针对整理交付材料的任务，我做了这份文档，请根据文档更新进展', isReplyMsg: true, repliedMsg: { msgId: 'original-file-not-stored', msgType: 'file',
-          content: { fileId: 'attachment-one', fileName: options.name ?? 'handout.html', downloadCode: options.code ?? 'temporary-file-secret' } } },
+        conversationType: '2', isInAtList: true, senderCorpId: 'test-corp', robotCode: 'robot', chatbotUserId: 'bot', msgtype: 'text',
+        text: { content: options.summaryCard ? '请继续处理上面的原件' :
+          ['针对整理交付材料的任务，我做了这份文档，请根据文档更新进展', options.link].filter(Boolean).join('\n'),
+        isReplyMsg: true, repliedMsg: options.summaryCard
+          ? { msgId: 'bot-summary', senderId: 'bot', msgType: 'interactiveCard',
+            content: { cardContent: [{ elementType: 'TEXT', value: options.summaryCard }] } }
+          : { msgId: 'original-file-not-stored', msgType: 'file',
+            content: { fileId: 'attachment-one', fileName: options.name ?? 'handout.html', downloadCode: options.code ?? 'temporary-file-secret' } } },
         sessionWebhook: 'https://oapi.dingtalk.com/robot/send?fixture', sessionWebhookExpiredTime: Date.now() + 60_000 }) })
       await h.runtime.idle()
       return agent.runs(id).find(run => run.message.nativeMessageId === msgId)
@@ -508,7 +566,7 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     const execution = change({ kind: 'task', value: { title: '分析原始演示稿', executionMode: 'agent', ownerId: member.id } }).tasks.at(-1)!
     propose.mockResolvedValueOnce({ summary: '幻灯片摘要。' })
       .mockResolvedValueOnce({ calls: [call('execution.start', { taskId: execution.id })], reply: '' })
-    const start = await post('start-with-file', { name: 'slides.pptx', code: 'slides-code' })
+    const start = await post('start-with-file', { name: 'slides.pptx', code: 'slides-code', link: sourceLink })
     expect(start?.steps[0]?.error).toBeUndefined()
     const ticketId = projects.detail(id).tasks.find(item => item.id === execution.id)!.ticketId!
     expect(ticketId).toBeTruthy()
@@ -517,12 +575,25 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     const first = assignment.trigger.attachments[0]!
     expect(first).toEqual({ name: 'slides.pptx', local_path: expect.stringMatching(/\.pptx$/) })
     expect(readFileSync(first.local_path)).toEqual(slides)
+    expect(assignment.trigger).toMatchObject({ source_links: [sourceLink] })
+    expect(start?.reply).toContain(materialReference(start!.id))
 
     propose.mockResolvedValueOnce({ summary: '幻灯片摘要。' })
       .mockResolvedValueOnce({ calls: [call('task.follow_up', { taskId: execution.id, text: '请打开原始附件并按页分析。' })], reply: '' })
     const follow = await post('follow-up-with-file', { name: 'slides.pptx', code: 'slides-code' })
     expect(follow?.steps[0]?.error).toBeUndefined()
     expect(h.relays(worker).at(-1)).toMatchObject({ text: '请打开原始附件并按页分析。', attachments: [first] })
+    const downloads = fetchFile.mock.calls.length
+    propose.mockImplementationOnce(async prompt => {
+      const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+      expect(context.reference).toMatchObject({ quote: 'resolved', links: [sourceLink], message: { id: start!.id } })
+      expect(context.attachments).toMatchObject([{ name: 'slides.pptx', availableToWorker: true }])
+      return { calls: [call('task.follow_up', { taskId: execution.id, text: '继续用原件和原始链接核对。' })], reply: '' }
+    })
+    const fromSummary = await post('follow-up-with-summary', { summaryCard: start!.reply })
+    expect(fromSummary?.steps[0]?.error).toBeUndefined()
+    expect(h.relays(worker).at(-1)).toMatchObject({ text: '继续用原件和原始链接核对。', attachments: [first], source_links: [sourceLink] })
+    expect(fetchFile).toHaveBeenCalledTimes(downloads)
     expect(JSON.stringify(h.relays(worker))).not.toMatch(/幻灯片摘要|slides-code/)
   } finally { callback.mockRestore(); ack.mockRestore() }
 })
@@ -618,10 +689,12 @@ it('reads native, captioned and quoted DingTalk images through the shared attach
       text: { content: '请读引用的图', isReplyMsg: true, repliedMsg: { msgType: 'picture', msgId, content } } })
     const embedded = await post('quote-image', quote('not-cached', JSON.stringify({ downloadCode: 'image-code-quote' })))
     expect(embedded?.reply).toContain('LIME-37')
+    const downloads = fetchMedia.mock.calls.length
     propose.mockResolvedValueOnce(done('下一步可以请李顺阳核对画面。'))
     const cached = await post('quote-cache', quote('native-image'))
     expect(cached?.reply).toContain('LIME-37')
     expect(cached?.reply).toContain('李顺阳')
+    expect(fetchMedia).toHaveBeenCalledTimes(downloads)
     expect(send.mock.calls.find(([message]) => message.text === cached?.reply)?.[0].channel.address).not.toHaveProperty('mentionUserId')
     const missing = await post('quote-missing', quote('unknown-image'))
     expect(missing?.reply).toContain('没有可用的图片下载码')
@@ -631,7 +704,7 @@ it('reads native, captioned and quoted DingTalk images through the shared attach
     await post('outsider-image', { ...picture, senderStaffId: 'outsider' })
     await post('unaddressed-image', { ...picture, isInAtList: false })
     expect(describe).toHaveBeenCalledTimes(4)
-    expect(fetchMedia.mock.calls.filter(([url]) => !String(url).endsWith('/accessToken'))).toHaveLength(10)
+    expect(fetchMedia.mock.calls.filter(([url]) => !String(url).endsWith('/accessToken'))).toHaveLength(8)
     expect(JSON.stringify(agent.runs(id))).not.toMatch(/image-code|signed-url/)
     expect(obsoleteExplicitProjectMention(h.runtime.store, mentioned[0]!)).toBe(false)
     change({ kind: 'remove-member', memberId: assignee.id })
@@ -684,6 +757,8 @@ it('routes a bound Feishu project conversation and retrieves a retained message 
   expect(old.message).toMatchObject({ nativeMessageId: 'om_history1', channel: { source: 'feishu' } })
   propose.mockImplementationOnce(async prompt => {
     expect(prompt).toContain('"replyToNativeMessageId":"om_history1"')
+    const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+    expect(context.reference).toEqual({ quote: 'resolved', links: [], message: { id: old.id, text: '发布窗口是下周三' } })
     return { calls: [call('conversation.history.search', { query: '发布窗口', after: '2026-09-09T00:00:01Z', before: '2026-09-09T00:00:02Z' }),
       call('conversation.history.read', { messageId: 'om_history1' })], reply: '' }
   }).mockImplementationOnce(async () => done('原文记录是下周三。'))
