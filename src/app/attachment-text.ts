@@ -16,7 +16,9 @@ const maxSlides = 120
 const skippedTags = new Set(['script', 'style', 'head', 'iframe', 'template', 'noscript', 'object', 'svg'])
 
 /** An attachment failure whose message is safe to show in the originating conversation. */
-export class AttachmentReadError extends Error {}
+export class AttachmentReadError extends Error {
+  constructor(message: string, readonly resolution?: 'deployment') { super(message) }
+}
 
 function htmlText(data: Buffer): string {
   const text: string[] = []

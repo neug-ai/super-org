@@ -10,7 +10,8 @@ import { z } from 'zod'
 import { type SourceKind } from './kind.ts'
 import { maxProjectAttachments, projectMessageReceived, type MessageAttachment, type ProjectMessage } from './project-message.ts'
 import { DingTalkCards } from './dingtalk-cards.ts'
-import { AttachmentReadError, maxAttachmentBytes } from '../app/attachment-text.ts'
+import { AttachmentReadError, maxAttachmentBytes, readAttachmentText, supportedAttachment } from '../app/attachment-text.ts'
+import type { LinkedDocumentReader } from '../app/project-attachments.ts'
 
 // dingtalk-projects: provider implementation
 function sender(trigger: Trigger) {
@@ -245,6 +246,14 @@ function quotedMessage(head: Record<string, unknown>) {
   }
 }
 /** Recognizes canonical document links carried by a quoted DingTalk card, independently of its sender. */
+function documentLink(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 2048) return
+  const url = URL.parse(value)
+  if (url?.origin !== 'https://alidocs.dingtalk.com' || url.username || url.password ||
+    !/^\/i\/nodes\/[a-zA-Z0-9_-]{1,512}\/?$/.test(url.pathname)) return
+  return url.origin + url.pathname.replace(/\/$/, '')
+}
+
 function quotedDocumentLinks(quote: z.output<typeof QuotedMessage> | undefined): string[] {
   if (quote?.msgType !== 'interactiveCard') return []
   let content = quote.content
@@ -255,14 +264,47 @@ function quotedDocumentLinks(quote: z.output<typeof QuotedMessage> | undefined):
   const card = content as Record<string, unknown>
   const candidates = Array.isArray(card.cardContent) ? card.cardContent.slice(0, 50)
     .flatMap(node => node?.elementType === 'LINK' ? [node.value] : []) : []
-  const links = [card.biz_custom_action_url, ...candidates].flatMap(value => {
-    if (typeof value !== 'string' || value.length > 2048) return []
-    const url = URL.parse(value)
-    if (!url || url.origin !== 'https://alidocs.dingtalk.com' || url.username || url.password ||
-      !/^\/i\/nodes\/[a-zA-Z0-9_-]{1,512}\/?$/.test(url.pathname)) return []
-    return [url.origin + url.pathname.replace(/\/$/, '')]
-  })
+  const links = [card.biz_custom_action_url, ...candidates].map(documentLink).filter(link => link !== undefined)
   return [...new Set(links)].slice(0, 3)
+}
+
+const DocumentNode = z.object({ name: z.string().min(1), nodeId: z.string().optional(),
+  type: z.string(), category: z.string(), extension: z.string().optional() })
+const DownloadInfo = z.object({ headerSignatureInfo: z.object({
+  resourceUrls: z.array(z.string()).min(1), headers: z.record(z.string(), z.string()).optional(),
+}) })
+function dingTalkNetworkFailure(code: unknown): AttachmentReadError | undefined {
+  if (code === 'Forbidden.AccessDenied.IpNotInWhiteList')
+    return new AttachmentReadError('钉钉开放平台拒绝本机的出口 IP。请让应用管理员在「开发管理 → 服务器出口 IP」中核对并允许本机出口 IP，保存后再试。', 'deployment')
+}
+function documentFailure(stage: string, status: number, code?: unknown): AttachmentReadError {
+  const network = dingTalkNetworkFailure(code)
+  if (network) return network
+  if (stage === '核验发送者身份' && (code === 88 || code === '88'))
+    return new AttachmentReadError('钉钉应用尚未开通成员信息读权限，无法核验当前发送者。请由应用管理员在钉钉开发者后台开通。', 'deployment')
+  const error = typeof code === 'string' ? code : ''
+  if (status === 401 || status === 403 || /permission|forbidden|accessDenied|noPrivilege|noAuthority|Unauthorized/i.test(error))
+    return new AttachmentReadError(`钉钉拒绝${stage}，请检查应用权限和你对该资料的访问权限。`)
+  if (status === 404 || /notExist|notFound/i.test(error)) return new AttachmentReadError(`钉钉找不到${stage === '核验发送者身份' ? '发送者的企业账号' : '这份资料'}。`)
+  if (status === 429) return new AttachmentReadError('钉钉接口暂时限流，请稍后重试。')
+  return new AttachmentReadError(`${stage}失败（钉钉 HTTP ${status}）。`)
+}
+
+function blockText(value: unknown, depth = 0): string {
+  if (!value || typeof value !== 'object' || depth >= 12) return ''
+  if (Array.isArray(value)) return value.map(item => blockText(item, depth + 1)).filter(Boolean).join('')
+  const block = value as Record<string, unknown>
+  if (typeof block.text === 'string') return block.text
+  if (block.text && typeof block.text === 'object') {
+    const text = (block.text as Record<string, unknown>).text
+    if (typeof text === 'string') return text
+    const content = (block.text as Record<string, unknown>).content
+    if (typeof content === 'string') return content
+  }
+  // Inline text, paragraph containers, and nested blocks such as lists and table cells.
+  return Object.entries(block).filter(([key]) =>
+    /^(children|paragraph|heading\d*|list|listItem|bulletList|orderedList|table|tableRow|tableCell|rows|cells|quote|codeBlock)$/i.test(key))
+    .map(([, child]) => blockText(child, depth + 1)).filter(Boolean).join('\n')
 }
 /** Only card TEXT nodes are readable quote content; opaque/encrypted content is never guessed. */
 function quotedText(value: unknown, depth = 0): string {
@@ -462,6 +504,82 @@ export class DingTalk {
     return this.token.value
   }
 
+  linkedDocumentReader(corpId: string | undefined): LinkedDocumentReader {
+    return { recognize: documentLink, read: (message, link, signal) => this.readLinkedDocument(message, link, corpId, signal) }
+  }
+
+  private async readLinkedDocument(message: ProjectMessage, link: string, corpId: string | undefined, lifetime: AbortSignal) {
+    const canonical = documentLink(link)
+    const trigger = this.context.triggers.get(message.messageId)
+    if (!corpId) throw new AttachmentReadError('这套部署尚未配置钉钉在线文档读取的企业 ID。')
+    if (!canonical || !message.actorId || !trigger?.human || trigger.source !== 'dingtalk' || trigger.actor.source !== 'dingtalk' ||
+      message.channel.address.triggerId !== trigger.id || trigger.channel?.thread !== message.channel.thread ||
+      trigger.meta.conversationId !== message.channel.address.conversationId || trigger.meta.senderCorpId !== corpId)
+      throw new AttachmentReadError('无法验证当前发送者属于已配置的钉钉企业。')
+    const nodeId = canonical.split('/').at(-1)!
+    const signal = AbortSignal.any([lifetime, AbortSignal.timeout(20_000)])
+    const token = await this.accessToken().catch(() => { throw new AttachmentReadError('无法取得钉钉应用访问凭证，请检查部署配置。') })
+    signal.throwIfAborted()
+    const directory = new URL('https://oapi.dingtalk.com/topapi/v2/user/get')
+    directory.searchParams.set('access_token', token)
+    const identity = await this.documentJson(directory, '核验发送者身份', signal, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userid: trigger.actor.id }),
+    })
+    const operatorId = z.string().min(1).max(256).safeParse((identity.result as { unionid?: unknown } | undefined)?.unionid).data
+    if (!operatorId) throw new AttachmentReadError('钉钉没有返回发送者的企业成员标识，请检查应用的成员信息读权限。')
+
+    const query = (path: string, stage: string, parameters: Record<string, string>, body?: object) => {
+      const url = new URL(`https://api.dingtalk.com${path}`)
+      url.search = new URLSearchParams(parameters).toString()
+      return this.documentJson(url, stage, signal, {
+        headers: { 'x-acs-dingtalk-access-token': token, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+        ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
+      })
+    }
+    const metadata = await query(`/v2.0/wiki/nodes/${nodeId}`, '读取资料信息', { operatorId })
+    const node = DocumentNode.safeParse(metadata.node).data
+    if (!node || node.nodeId && node.nodeId !== nodeId) throw new AttachmentReadError('钉钉没有返回与资料链接匹配的文件信息。')
+    const name = node.name.trim().slice(0, 180) || '钉钉在线文档'
+    const format = node.extension?.toLowerCase()
+    if (node.type.toUpperCase() !== 'FILE') throw new AttachmentReadError('该链接指向钉钉目录，请提供某一份文件。')
+    if (node.category.toUpperCase() === 'ALIDOC' && format === 'adoc') {
+      const limit = 100
+      const contents = await query(`/v1.0/doc/suites/documents/${nodeId}/blocks`, '读取文档正文',
+        { operatorId, startIndex: '0', endIndex: String(limit) })
+      const blocks = z.object({ success: z.literal(true), result: z.object({ data: z.array(z.unknown()) }) }).safeParse(contents).data?.result.data
+      if (!blocks) throw new AttachmentReadError('钉钉没有返回可识别的文档正文。')
+      const textBlocks = blocks.slice(0, limit).map(block => blockText(block).trim())
+      const excerpt = textBlocks.filter(Boolean).join('\n')
+      if (!excerpt) throw new AttachmentReadError('钉钉文档未返回可提取的文字。')
+      const max = 18_000
+      return { name, text: excerpt.slice(0, max), partial: blocks.length >= limit || excerpt.length > max || textBlocks.some(text => !text) }
+    }
+    if (!format || node.category.toUpperCase() === 'ALIDOC' || !supportedAttachment(`file.${format}`))
+      throw new AttachmentReadError('此钉钉在线资料类型暂不支持正文读取，请导出为 HTML、PPTX、PDF 或文本文件。')
+    const file = await query(`/v2.0/doc/dentries/${nodeId}/queryDentryId`, '定位上传文件', { operatorId })
+    const ids = z.object({ spaceId: z.string().regex(/^[\w-]+$/), dentryId: z.string().regex(/^[\w-]+$/) }).safeParse(file).data
+    if (!ids) throw new AttachmentReadError('钉钉没有返回上传文件的下载标识。')
+    const info = await query(`/v1.0/storage/spaces/${ids.spaceId}/dentries/${ids.dentryId}/downloadInfos/query`, '获取文件下载权限',
+      { unionId: operatorId }, { option: { preferIntranet: false } })
+    const signature = DownloadInfo.safeParse(info).data?.headerSignatureInfo
+    if (!signature) throw new AttachmentReadError('钉钉没有返回可用的文件下载方式。')
+    const bytes = await this.downloadFile(signature.resourceUrls[0]!, signal, signature.headers ?? {})
+    return { name, ...await readAttachmentText(`file.${format}`, bytes, signal) }
+  }
+
+  private async documentJson(url: URL, stage: string, signal: AbortSignal, init: RequestInit): Promise<Record<string, unknown>> {
+    let response: Response
+    try { response = await this.http(url, { ...init, signal, redirect: 'error' }) }
+    catch { throw new AttachmentReadError(signal.aborted ? `${stage}超时。` : `${stage}时无法连接钉钉接口。`) }
+    const bytes = await this.readDownloadBody(response, 2 * 1024 * 1024)
+    let payload: Record<string, unknown> | undefined
+    try { payload = z.record(z.string(), z.unknown()).safeParse(JSON.parse(bytes.toString('utf8'))).data } catch {}
+    if (!response.ok || payload?.code || payload?.errcode && Number(payload.errcode) !== 0 || payload?.success === false)
+      throw documentFailure(stage, response.status, payload?.code ?? payload?.errcode)
+    if (!payload) throw new AttachmentReadError(`${stage}时钉钉返回了无法识别的响应。`)
+    return payload
+  }
+
   async readProjectAttachment(message: ProjectMessage, attachment: MessageAttachment, lifetime: AbortSignal): Promise<Buffer> {
     const { conversationId, triggerId } = message.channel.address
     const payload = triggerId && this.context.state.get(bodies(triggerId))
@@ -481,32 +599,47 @@ export class DingTalk {
     })
     const result = await response.json() as { downloadUrl?: string; code?: string }
     if (!response.ok || !result.downloadUrl) {
+      const network = dingTalkNetworkFailure(result.code)
+      if (network) throw network
       throw new AttachmentReadError(result.code === 'invalidParameter.robotCode.downloadCode'
         ? '钉钉附件下载码无效或已过期，请重新引用这份文件并 @ 机器人。'
         : '钉钉未授权下载这份附件，请重新引用文件或提供机器人可访问的副本。')
     }
-    const url = URL.parse(result.downloadUrl)
+    return this.downloadFile(result.downloadUrl, signal)
+  }
+
+  private async downloadFile(address: string, signal: AbortSignal, headers?: Record<string, string>): Promise<Buffer> {
+    const url = URL.parse(address)
     if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password || url.port ||
       !['dingtalk.com', 'dingtalkapps.com', 'aliyuncs.com'].some(domain => url.hostname === domain || url.hostname.endsWith(`.${domain}`))) {
       throw new AttachmentReadError('钉钉返回了不受支持的附件下载地址。')
     }
     // DingTalk may issue an HTTP URL for an OSS object that also serves the signed URL over HTTPS.
     url.protocol = 'https:'
-    const download = await this.http(url, { signal, redirect: 'error' })
-    if (!download.ok || !download.body) throw new AttachmentReadError('附件链接暂时无法下载，请重新引用这份文件。')
-    if (Number(download.headers.get('Content-Length')) > maxAttachmentBytes) {
-      await download.body.cancel()
+    const download = await this.http(url, { signal, redirect: 'error', ...(headers ? { headers } : {}) })
+    if (!download.ok || !download.body) {
+      await download.body?.cancel()
+      if (headers) throw documentFailure('下载资料', download.status)
+      throw new AttachmentReadError('附件链接暂时无法下载，请重新引用这份文件。')
+    }
+    return this.readDownloadBody(download, maxAttachmentBytes)
+  }
+
+  private async readDownloadBody(response: Response, limit: number): Promise<Buffer> {
+    if (!response.body) return Buffer.alloc(0)
+    if (Number(response.headers.get('Content-Length')) > limit) {
+      await response.body.cancel()
       throw new AttachmentReadError('附件超过大小上限。')
     }
     const chunks: Uint8Array[] = []
     let length = 0
-    const stream = download.body.getReader()
+    const stream = response.body.getReader()
     try {
       while (true) {
         const chunk = await stream.read()
         if (chunk.done) break
         length += chunk.value.length
-        if (length > maxAttachmentBytes) throw new AttachmentReadError('附件超过大小上限。')
+        if (length > limit) throw new AttachmentReadError('附件超过大小上限。')
         chunks.push(chunk.value)
       }
       return Buffer.concat(chunks, length)
