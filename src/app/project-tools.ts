@@ -16,7 +16,7 @@ import type { ProjectProgress } from './project-progress.ts'
 import { taskRemoteFacts } from './repository-delivery.ts'
 import type { ProjectEvent } from '../sources/project-events.ts'
 import { RepositoryFeedback } from '../sources/repository-events.ts'
-import { projectChannel } from './project-notifications.ts'
+import { explicitProjectMention, projectChannel } from './project-notifications.ts'
 import { readConversation, searchConversation } from './project-conversation-history.ts'
 import type { ExecutionAttachment } from './project-attachments.ts'
 
@@ -39,7 +39,7 @@ export interface ProjectToolContext {
   /** Original files retained by the project Agent for this message. Never a model argument. */
   executionAttachments?: readonly ExecutionAttachment[]
 }
-export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef }
+export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef; replyMention?: string }
 export interface ProjectOperation {
   name: string
   description: string
@@ -131,11 +131,22 @@ export class ProjectTools {
           ...(context.text && !context.event ? { original: context.text } : {}),
         }),
       })))
-    this.register(operation('tracking.request', '成员明确要求联系负责人、追一下进度时，发起指定任务的进展检查。只查状态直接回答；任务指代不清楚时追问。只登记检查，不能承诺提醒已送达。不要为了提醒而开工或提交验收。',
+    this.register(operation('tracking.request', '成员明确要求检查并跟进任务进展时，发起指定任务的进展检查。只查状态直接回答；任务指代不清楚时追问。立即通知指定成员用 conversation.mention。只登记检查，不能承诺提醒已送达。',
       z.strictObject({ taskId: id, focus: z.string().trim().max(2000).default('') }), (context, { taskId, focus }) => {
         if (!host.tracking) throw new ProjectError(409, '进展跟进服务尚未启动。')
         const event = host.tracking().request(context, taskId, focus)
         return { summary: '已登记进展检查，是否跟进以实际记录为准。', data: { eventId: event.id, taskId } }
+      }))
+    this.register(operation('conversation.mention', '群成员本条消息明确要求立即 @ 或通知一名项目成员时，给最终的群回复附加原生提及。memberId 来自项目成员，指代不明时先问清。仅在正文提到姓名或建议下一步时直接回复。', z.strictObject({ memberId: id }),
+      (context, { memberId }) => {
+        if (context.event) throw new ProjectError(403, '群内显式 @ 需要成员在当前消息中提出。')
+        try {
+          const target = explicitProjectMention(host.store, context.projectId, context.channel, memberId)
+          return { summary: `本条回复将尝试原生 @「${target.address.mentionUserName}」。`, replyMention: memberId }
+        } catch (error) {
+          if (!(error instanceof ProjectError)) throw error
+          return { summary: error.message }
+        }
       }))
     this.register(operation('follow_up.schedule', '为当前任务预约一次后续检查；到时由事件唤起 Agent，而非持续扫描。每个任务保留一个预约，新预约替换旧预约；自动推进须已授权。',
       z.strictObject({ taskId: id, at: z.iso.datetime(), reason: z.string().trim().min(1).max(2000) }), (context, args) => {

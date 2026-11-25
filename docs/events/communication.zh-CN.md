@@ -147,6 +147,8 @@ Agent 的每轮项目快照包含当前会话偏好和真实运行能力。`runt
 
 在实际群中验收标题、加粗和 @ 的呈现。 [卡片配置](../../cards/README.md) [应用群发接口](https://dingtalk.apifox.cn/api-140274320) [钉钉卡片投放接口](https://open.dingtalk.com/document/orgapp/create-and-deliver-cards)
 
+成员在当前项目群明确要求立即通知某人时，Agent 可通过 `conversation.mention` 给最终答复附加项目成员 ID。钉钉发送使用当前群所属企业的账号绑定。比如「记录截图中的进展，再提醒李顺阳核对两项验收条件」可以同时记录进展并发出一条带原生 @ 的回复。普通状态答复中提到姓名仍以正文发送。找不到当前企业绑定时，工具返回具体原因，其他已授权操作仍可完成。会话 Webhook 已过期且没有卡片模板时，答复会明确标为文字提醒。可通过 `runtime.inspect` 查看最近发送的 `lastDelivery.nativeMention`。
+
 ## 聊天附件
 
 在绑定的钉钉项目群里随消息发图片，或引用文件并 @ 机器人。附件通过同一流程处理：消息来源解析附件描述并下载，项目层依据内容选择文字或视觉预览，再把摘要交给项目 Agent 处理当前请求。原件可以交接给已有或明确委托的 Worker。下载码和临时链接留在来源适配器。 [钉钉机器人消息格式](https://dingtalk.apifox.cn/doc-3550102) [钉钉文件下载接口](https://dingtalk.apifox.cn/api-140599627)

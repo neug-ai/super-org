@@ -43,7 +43,7 @@ import { ProjectIssues } from './project-issues.ts'
 import { resumeProjectActions } from './project-actions.ts'
 import { ProjectProgress } from './project-progress.ts'
 import { ProjectTracking } from './project-tracking.ts'
-import { projectChannel } from './project-notifications.ts'
+import { obsoleteExplicitProjectMention, projectChannel } from './project-notifications.ts'
 import { ProjectRepository as ProjectRepositorySync } from './project-repository.ts'
 import { projectResources } from './repository-delivery.ts'
 import { ProjectHistory } from './project-history.ts'
@@ -207,7 +207,7 @@ export class Runtime extends Service implements SourceHost {
       let communication: Communication | undefined
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused(),
         prepare: message => bindDingTalkReply(runtime.context({ kind: 'dingtalk', health: [] }), communication?.prepare(message) ?? message),
-        obsolete: message => this.projectTracking.obsolete(message),
+        obsolete: message => obsoleteExplicitProjectMention(store, message) || this.projectTracking.obsolete(message),
         acknowledgementId: (ticketId, trigger) => cardAcknowledgementId(runtime.context({ kind: 'dingtalk', health: [] }), ticketId, trigger),
         mirrors: message => githubMentionReplies(runtime.context({ kind: 'dingtalk', health: [] }), message) })
       communication = this.communication = new Communication({ store, events: projectEvents, effects, outbox,

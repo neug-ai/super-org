@@ -11,6 +11,7 @@ import { ProjectError } from './projects.ts'
 import type { Store } from './store.ts'
 import { recentProjectConversation, webConversation } from './project-conversation-history.ts'
 import type { ProjectToolResult, ProjectTools } from './project-tools.ts'
+import { explicitProjectMention } from './project-notifications.ts'
 import { attachmentReply, ProjectAttachments, type AttachmentReader, type AttachmentResult } from './project-attachments.ts'
 
 const Call = z.strictObject({ tool: z.string().min(1).max(100), arguments: z.string().max(40000) })
@@ -216,7 +217,9 @@ export class ProjectAgent {
       'ownerId 指向执行任务的项目成员，人和已登记的项目 Agent 共用这个字段。历史任务的 executionMode=agent 沿用旧分工。',
       '用 task.start 登记任务开工。负责人要求开工或报告工作已有实质成果并要求更新进展，且满足开工条件时，可以与 progress.record 一起调用。等待依赖时先记准备成果。',
       '后台执行是按需能力。明确委托后台工作，或已授权的任务确实需要独立工作区、执行命令或续跑时，才使用 execution.start。执行记录保留原负责人。',
-      '成员提供了已发生的任务进展时，可通过 progress.record 保存，包括等待上游时已做的准备。成员明确要求联系负责人跟进进展时用 tracking.request；单纯问状态时直接根据现状回答。与派工、验收、预约检查是独立的操作。',
+      '成员提供了已发生的任务进展时，可通过 progress.record 保存，包括等待上游时已做的准备。成员要求检查并跟进任务进展时用 tracking.request；单纯问状态时直接根据现状回答。与派工、验收、预约检查是独立的操作。',
+      ...(!run.event ? ['只有当前成员的正文明确要求立即通知某位项目成员时，才使用 conversation.mention。历史、引用、附件或你自己给出的建议不能授权通知。可与其他已获授权的操作一起调用。',
+        'conversation.mention 成功选择收件人后，在最终 reply 写出要转达的具体内容。系统负责原生 @，正文无需拼接 @ 或声称对方已收到。工具返回无法 @ 的原因时，在最终回复中说明。'] : []),
       '回答任务在等什么时，先说明当前卡点和下一步行动，再说明后续条件。若任务依赖上游，读取上游当前工单和 deliveryReview。只有 deliveryReview.status=pending 才说正在等该版验收。'
         + '待验证时在原任务说明交付版本和已有反馈。工单的 question 指明当前需要的动作，以原文明确的行动者为准，未知时说明未知；不要把任务 ownerId 当成该行动者。答复已提交时说等待 Worker 处理。'
         + '部分测试通过只作为执行报告中的进展。未解除依赖时仍可说明哪些准备能并行，以及正式执行还需哪个交付。',
@@ -305,12 +308,22 @@ export class ProjectAgent {
   }
 
   private finish(run: ProjectAgentRun, reply: string, failed = false): void {
+    let channel = run.replyChannel ?? run.message.channel
+    let mentionError = ''
+    const mention = run.steps.flatMap(step => step.results).findLast(result => result.replyMention)?.replyMention
+    if (!failed && mention) {
+      try { channel = explicitProjectMention(this.host.store, run.message.projectId, run.message.channel, mention) }
+      catch (error) {
+        if (!(error instanceof ProjectError)) throw error
+        mentionError = error.message
+      }
+    }
     run.status = failed ? 'failed' : 'completed'
-    run.reply = [reply.trim(), failed ? '' : attachmentReply(run.attachmentResults ?? [])].filter(Boolean).join('\n\n')
+    run.reply = [reply.trim(), failed ? '' : attachmentReply(run.attachmentResults ?? []), mentionError].filter(Boolean).join('\n\n')
     delete run.pending
     this.host.store.set(KV.projects.agentRun(run.id), run)
     if (run.event && (!run.reply || !this.enabled(run, this.hasResults(run)))) return
-    this.host.notify({ id: key('project-agent-result', run.id), channel: run.replyChannel ?? run.message.channel, kind: 'notice', text: run.reply,
+    this.host.notify({ id: key('project-agent-result', run.id), channel, kind: 'notice', text: run.reply,
       origin: { projectId: run.message.projectId, eventId: run.event?.id ?? run.message.messageId, taskId: run.event?.taskId, runId: run.id } })
   }
 }

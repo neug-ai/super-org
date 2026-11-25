@@ -195,7 +195,7 @@ function nativeAttachments(route: Route, messageId: string, payload: NativeBody,
 const senderIdentities = family<string | null, [string]>('dingtalk-sender-identity:')
 const optionalIdentity = z.string().min(1).max(256).optional()
 const AtUser = z.object({ dingtalkId: optionalIdentity, staffId: z.string().min(1).max(128).optional() })
-const deliveries = family<{ messageId: string; format: string; transport: string; messageType: string; at: string }, [string]>('dingtalk-last-delivery:')
+const deliveries = family<{ messageId: string; format: string; transport: string; messageType: string; at: string; nativeMention?: boolean }, [string]>('dingtalk-last-delivery:')
 const Message = z.object({ msgId: z.string().min(1), conversationId: z.string().min(1),
   conversationType: z.string(), isInAtList: z.boolean().optional(), senderStaffId: z.string().min(1),
   senderCorpId: z.string().min(1), senderNick: z.string().optional(), chatbotUserId: z.string().optional(), senderId: z.string().optional(),
@@ -514,11 +514,13 @@ export class DingTalk {
       await this.cards.sendMentionNotice(message.id, {
         conversationId: conversation, robotCode: route?.robotCode ?? this.credentials.clientId, userId: mention, name: mentionName,
       }, { title, text: body })
-      this.context.state.set(deliveries(conversation), { messageId: message.id, format: 'markdown', transport: 'ai-card', messageType: 'card', at: new Date().toISOString() })
+      this.context.state.set(deliveries(conversation), { messageId: message.id, format: 'markdown', transport: 'ai-card', messageType: 'card', at: new Date().toISOString(), nativeMention: true })
       return
     }
     // The application group-send API does not render mentions. Display the recipient's name as ordinary text.
-    const text = active && mention ? `@${mention} ${body}` : mention && mentionName ? `请 ${mentionName} 查看\n\n${body}` : body
+    const recipientText = active && mention ? `@${mention} ${body}` : mention && mentionName ? `请 ${mentionName} 查看\n\n${body}` : body
+    const text = !active && message.channel.address.explicitMentionMemberId
+      ? `${recipientText}\n\n本条为文字提醒，当前会话的原生 @ 不可用。` : recipientText
     if (text.length > 4000) throw new Error('DingTalk result exceeds 4000 characters; provide a brief result and a link')
     const token = await this.accessToken()
     const response = await this.http(active ? url! : 'https://api.dingtalk.com/v1.0/robot/groupMessages/send', {
@@ -532,7 +534,7 @@ export class DingTalk {
     if (!response.ok || (active ? data.errcode !== 0 : !!data.code || !data.processQueryKey)) {
       throw new Error(`DingTalk message send failed (HTTP ${response.status}); check robot permissions and group membership`)
     }
-    this.context.state.set(deliveries(conversation), { messageId: message.id, format: markdown ? 'markdown' : 'text',
+    this.context.state.set(deliveries(conversation), { messageId: message.id, format: markdown ? 'markdown' : 'text', ...(mention && { nativeMention: active }),
       transport: active ? 'session-webhook' : 'application-group-api', messageType: active ? markdown ? 'markdown' : 'text' : markdown ? 'sampleMarkdown' : 'sampleText', at: new Date().toISOString() })
   }
 }
