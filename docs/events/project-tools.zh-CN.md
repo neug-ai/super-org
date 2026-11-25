@@ -11,6 +11,7 @@
 | `project.update` | 名称、描述、目标、planning/active/paused 状态、autoAdvance 中至少一项 | 项目实际状态和目标 |
 | `progress.record` | `taskId`、`summary`、可选 `blocker`、`links`、`corrects` | 追加实际进展和作者来源，可更正本人记录 |
 | `tracking.request` | `taskId`、可选 `focus` | 启动对指定任务的一次只读检查，提醒以回执为准 |
+| `conversation.mention` | `memberId`，当前项目的成员 ID | 按本条群消息的明确请求，为最终答复指定一名原生 @ 收件人；实际发送以回执为准 |
 | `follow_up.schedule` | `taskId`、ISO UTC `at`、`reason` | 保存一次任务检查预约，替换该任务旧预约，时间范围 1 分钟至 30 天 |
 | `follow_up.cancel` | `taskId` | 取消当前任务检查预约，包括撤销尚未落地的到期反应 |
 | `runtime.inspect` | 无 | 核对实际运行能力、消息发送方式及最近发送结果，不能变更原生权限 |

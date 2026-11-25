@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ProjectPlanner } from '../app/project-planning.ts'
+import type { ProjectImage } from '../app/attachment-image.ts'
 
 function run(binary: string, args: string[], cwd: string, prompt: string, signal: AbortSignal): Promise<string> {
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
@@ -22,17 +23,28 @@ export class CodexProjectPlanner implements ProjectPlanner {
   readonly name = 'Codex'
   constructor(private readonly binary: string, private readonly model?: string) {}
 
-  async propose(prompt: string, schema: object, signal: AbortSignal): Promise<unknown> {
+  propose(prompt: string, schema: object, signal: AbortSignal): Promise<unknown> {
+    return this.proposeInput(prompt, schema, signal)
+  }
+
+  proposeWithImage(prompt: string, schema: object, image: ProjectImage, signal: AbortSignal): Promise<unknown> {
+    return this.proposeInput(prompt, schema, signal, image)
+  }
+
+  private async proposeInput(prompt: string, schema: object, signal: AbortSignal, image?: ProjectImage): Promise<unknown> {
     signal.throwIfAborted()
     const directory = await mkdtemp(join(tmpdir(), 'superagent-planner-'))
     const inputSchema = join(directory, 'schema.json')
     const output = join(directory, 'plan.json')
     try {
       await writeFile(inputSchema, JSON.stringify(schema), { mode: 0o600 })
+      const imagePath = image && join(directory, `attachment${image.extension}`)
+      if (image && imagePath) await writeFile(imagePath, image.bytes, { mode: 0o600 })
       const args = ['-a', 'never', 'exec', '--ignore-user-config', '--ignore-rules', '--ephemeral',
         '--skip-git-repo-check', '--sandbox', 'read-only', '--disable', 'shell_tool', '--disable', 'apps',
         '--disable', 'plugins', '-c', 'web_search="disabled"', '-c', 'mcp_servers={}',
         '--output-schema', inputSchema, '--output-last-message', output,
+        ...(imagePath ? [`--image=${imagePath}`] : []),
         ...(this.model ? ['--model', this.model] : []), '-']
       await run(this.binary, args, directory, prompt, signal)
       return JSON.parse(await readFile(output, 'utf8'))

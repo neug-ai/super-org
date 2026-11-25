@@ -6,6 +6,8 @@ import { DWClient } from 'dingtalk-stream'
 import { KV } from '../src/kv.ts'
 import { Commands } from '../src/infra/commands.ts'
 import type { ProjectAgentRun } from '../src/app/project-agent.ts'
+import type { ProjectPlanner } from '../src/app/project-planning.ts'
+import { obsoleteExplicitProjectMention } from '../src/app/project-notifications.ts'
 import { MemberInput, ProjectChange, ProjectInput, Projects } from '../src/app/projects.ts'
 import { projectMessageReceived } from '../src/sources/project-message.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
@@ -18,9 +20,9 @@ let host: Host | undefined
 afterEach(async () => { await host?.stop(); host = undefined })
 const call = (tool: string, args: unknown) => ({ tool, arguments: JSON.stringify(args) })
 const done = (reply = '已处理，请查看任务。') => ({ calls: [], reply })
-async function pilot(knowledgeDir?: string) {
+async function pilot(knowledgeDir?: string, proposeWithImage?: ProjectPlanner['proposeWithImage']) {
   const propose = vi.fn(async (_prompt: string, _schema: object, _signal: AbortSignal): Promise<unknown> => done())
-  const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Test Agent', propose }, knowledgeDir)
+  const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Test Agent', propose, proposeWithImage }, knowledgeDir)
   const projects = new Projects(h.runtime.store)
   const { id } = projects.create(ProjectInput.parse({ name: '2048 事件验收', status: 'planning', dingTalkGroup: 'test-group', autoAdvance: false }))
   projects.addDingTalkSender(id, 'test-corp', 'member', 'Robin')
@@ -522,6 +524,130 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     expect(follow?.steps[0]?.error).toBeUndefined()
     expect(h.relays(worker).at(-1)).toMatchObject({ text: '请打开原始附件并按页分析。', attachments: [first] })
     expect(JSON.stringify(h.relays(worker))).not.toMatch(/幻灯片摘要|slides-code/)
+  } finally { callback.mockRestore(); ack.mockRestore() }
+})
+
+it('reads native, captioned and quoted DingTalk images through the shared attachment flow', async () => {
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+lck0AAAAASUVORK5CYII=', 'base64')
+  const vision: NonNullable<ProjectPlanner['proposeWithImage']> = async (prompt, _schema, image) => {
+    expect(prompt).toContain('实际可见')
+    expect(prompt).not.toMatch(/image-code|signed-url/)
+    expect(image.extension).toBe('.png')
+    expect(image.bytes).toEqual(png)
+    return { summary: '画面显示验收代号 LIME-37 和状态 READY。' }
+  }
+  const describe = vi.fn(vision)
+  const { h, projects, id, member, assignee, change, propose } = await pilot(undefined, describe)
+  change({ kind: 'add-member', memberId: assignee.id })
+  const task = change({ kind: 'task', value: { title: '核对测试画面', ownerId: member.id } }).tasks.at(-1)!
+  let bot: DingTalk
+  const send = vi.fn((message: Parameters<DingTalk['send']>[0]) => bot.send(message))
+  const kind = dingTalkKind(send)
+  h.runtime.sources.register(kind)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } } })
+  let receive!: (frame: { headers: { messageId: string }; data: string }) => Promise<void>
+  const callback = vi.spyOn(DWClient.prototype, 'registerCallbackListener').mockImplementation(function (this: DWClient, _topic, fn) {
+    receive = fn as typeof receive; return this
+  })
+  const ack = vi.spyOn(DWClient.prototype, 'socketCallBackResponse').mockImplementation(() => {})
+  const fetchMedia = vi.fn(async (url: URL | string, options?: RequestInit) => {
+    if (String(url).endsWith('/accessToken')) return Response.json({ accessToken: 'auth-token' })
+    if (String(url).endsWith('/messageFiles/download')) {
+      const input = JSON.parse(String(options?.body))
+      expect(input).toMatchObject({ robotCode: 'robot', downloadCode: expect.stringMatching(/^image-code-/) })
+      return Response.json({ downloadUrl: `http://files.oss-cn-zhangjiakou.aliyuncs.com/${input.downloadCode.endsWith('bad') ? 'bad' : 'image'}?Signature=signed-url` })
+    }
+    expect(new URL(String(url)).protocol).toBe('https:')
+    expect(options?.headers).toBeUndefined()
+    expect(options?.redirect).toBe('error')
+    return String(url).includes('/bad?') ? new Response('<html>Not an image</html>') : new Response(new Uint8Array(png))
+  })
+  const sendToDingTalk = vi.fn((_options: RequestInit | undefined) => Response.json({ errcode: 0 }))
+  const http = async (url: URL | string, options?: RequestInit) => String(url).startsWith('https://oapi.dingtalk.com/robot/send?')
+    ? sendToDingTalk(options) : fetchMedia(url, options)
+  try {
+    const agent = h.runtime.projectAgent!
+    bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, http as typeof fetch,
+      undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, agent))
+    agent.registerAttachmentReader('dingtalk', (message, attachment, signal) => bot.readProjectAttachment(message, attachment, signal))
+    const post = async (msgId: string, content: Record<string, unknown>) => {
+      await receive({ headers: { messageId: msgId }, data: JSON.stringify({ msgId, senderStaffId: 'member', conversationId: 'test-group',
+        conversationType: '2', isInAtList: true, senderCorpId: 'test-corp', robotCode: 'robot',
+        sessionWebhook: 'https://oapi.dingtalk.com/robot/send?fixture', sessionWebhookExpiredTime: Date.now() + 60_000, ...content }) })
+      await h.runtime.idle()
+      return agent.runs(id).find(run => run.message.nativeMessageId === msgId)
+    }
+    const picture = { msgtype: 'picture', content: { downloadCode: 'image-code-native' } }
+    const native = await post('native-image', picture)
+    expect(native?.reply).toContain('已识别「图片 1.png」')
+    expect(native?.reply).toContain('LIME-37')
+    expect(propose).not.toHaveBeenCalled()
+    expect(native?.attachmentResults?.[0]).toMatchObject({ kind: 'image', original: { file: expect.stringMatching(/\.png$/) } })
+    await post('native-image', picture)
+    expect(describe).toHaveBeenCalledTimes(1)
+    expect(send.mock.calls.filter(([message]) => message.text === native?.reply)).toHaveLength(1)
+
+    propose.mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('请用图片记录任务进展')
+      expect(prompt).toContain('LIME-37')
+      expect(prompt).not.toMatch(/image-code|signed-url|iVBORw0KGgo/)
+      return { calls: [call('progress.record', { taskId: task.id, summary: '截图显示验收代号 LIME-37，状态 READY。' }),
+        call('conversation.mention', { memberId: assignee.id })], reply: '' }
+    })
+    propose.mockResolvedValueOnce(done('请核对截图里的测试画面。'))
+    const caption = { msgtype: 'richText', content: JSON.stringify({ richText: [
+      { text: '请用图片记录任务进展，并提醒李顺阳核对测试画面' }, { type: 'picture', pictureDownloadCode: 'image-code-rich' },
+    ] }) }
+    const rich = await post('rich-image', caption)
+    expect(rich?.attachmentResults).toHaveLength(1)
+    expect(projects.detail(id).tasks.at(-1)?.progress).toMatchObject([{ summary: '截图显示验收代号 LIME-37，状态 READY。' }])
+    expect(projects.detail(id).tickets).toEqual([])
+    await post('rich-image', caption)
+    const mentioned = send.mock.calls.map(([message]) => message).filter(message => message.channel.address.mentionUserId)
+    expect(mentioned).toMatchObject([{ text: rich?.reply, channel: { address: {
+      conversationId: 'test-group', mentionUserId: 'assignee', mentionUserName: '李顺阳', explicitMentionMemberId: assignee.id,
+    } } }])
+    expect(mentioned[0]?.channel.address.triggerId).toBeUndefined()
+    const nativePayloads = sendToDingTalk.mock.calls.map(([request]) => JSON.parse(String(request?.body))).filter(payload => payload.at)
+    expect(nativePayloads).toMatchObject([{ msgtype: 'text', text: { content: expect.stringContaining('@assignee 请核对截图里的测试画面。') },
+      at: { atUserIds: ['assignee'] } }])
+    expect(projects.detail(id).tasks.at(-1)?.progress).toHaveLength(1)
+
+    const quote = (msgId: string, content?: unknown) => ({ msgtype: 'text',
+      text: { content: '请读引用的图', isReplyMsg: true, repliedMsg: { msgType: 'picture', msgId, content } } })
+    const embedded = await post('quote-image', quote('not-cached', JSON.stringify({ downloadCode: 'image-code-quote' })))
+    expect(embedded?.reply).toContain('LIME-37')
+    propose.mockResolvedValueOnce(done('下一步可以请李顺阳核对画面。'))
+    const cached = await post('quote-cache', quote('native-image'))
+    expect(cached?.reply).toContain('LIME-37')
+    expect(cached?.reply).toContain('李顺阳')
+    expect(send.mock.calls.find(([message]) => message.text === cached?.reply)?.[0].channel.address).not.toHaveProperty('mentionUserId')
+    const missing = await post('quote-missing', quote('unknown-image'))
+    expect(missing?.reply).toContain('没有可用的图片下载码')
+    const wrongFormat = await post('bad-image', { msgtype: 'picture', content: { downloadCode: 'image-code-bad' } })
+    expect(wrongFormat?.reply).toContain('图片内容无法识别')
+    expect(describe).toHaveBeenCalledTimes(4)
+    await post('outsider-image', { ...picture, senderStaffId: 'outsider' })
+    await post('unaddressed-image', { ...picture, isInAtList: false })
+    expect(describe).toHaveBeenCalledTimes(4)
+    expect(fetchMedia.mock.calls.filter(([url]) => !String(url).endsWith('/accessToken'))).toHaveLength(10)
+    expect(JSON.stringify(agent.runs(id))).not.toMatch(/image-code|signed-url/)
+    expect(obsoleteExplicitProjectMention(h.runtime.store, mentioned[0]!)).toBe(false)
+    change({ kind: 'remove-member', memberId: assignee.id })
+    expect(obsoleteExplicitProjectMention(h.runtime.store, mentioned[0]!)).toBe(true)
+    const unbound = projects.registerDingTalkSender('different-corp', 'different-staff-id', '其他企业成员').member
+    change({ kind: 'add-member', memberId: unbound.id })
+    propose.mockResolvedValueOnce({ calls: [call('progress.record', { taskId: task.id, summary: '已人工核对部分画面。' }),
+      call('conversation.mention', { memberId: unbound.id })], reply: '' })
+    propose.mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('尚未绑定本企业的钉钉账号，无法原生 @')
+      return done('已记录进展。该成员尚未绑定本企业的钉钉账号。')
+    })
+    const withoutBinding = await post('unbound-mention', { msgtype: 'text', text: { content: '我已核对部分画面，请记录并通知其他企业成员。' } })
+    expect(withoutBinding?.reply).toContain('尚未绑定')
+    expect(projects.detail(id).tasks.at(-1)?.progress).toHaveLength(2)
+    expect(send.mock.calls.find(([message]) => message.text === withoutBinding?.reply)?.[0].channel.address).not.toHaveProperty('mentionUserId')
   } finally { callback.mockRestore(); ack.mockRestore() }
 })
 

@@ -5,6 +5,7 @@ import type { Effects } from './effects.ts'
 import { ProjectChange, ProjectError, ProjectInput, Projects, TaskInput, type Member, type ProjectDecision, type ProjectDetail, type ProjectMeetingReply } from './projects.ts'
 import { taskReference } from './project-task-context.ts'
 import type { Store } from './store.ts'
+import type { ProjectImage } from './attachment-image.ts'
 
 const reference = z.string().min(1).max(128)
 const planSchema = z.strictObject({
@@ -28,6 +29,7 @@ const { $schema: _draft, ...outputSchema } = z.toJSONSchema(planSchema)
 export interface ProjectPlanner {
   readonly name: string
   propose(prompt: string, schema: object, signal: AbortSignal): Promise<unknown>
+  proposeWithImage?(prompt: string, schema: object, image: ProjectImage, signal: AbortSignal): Promise<unknown>
 }
 
 export type ProjectPlanResult = { state: 'applied' | 'unchanged' | 'question' | 'failed'; text: string; question?: string }
