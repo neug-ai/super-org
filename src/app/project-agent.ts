@@ -323,7 +323,15 @@ export class ProjectAgent {
     delete run.pending
     this.host.store.set(KV.projects.agentRun(run.id), run)
     if (run.event && (!run.reply || !this.enabled(run, this.hasResults(run)))) return
+    const source = run.message.channel
+    // The reader returns one result per descriptor, in message order.
+    const files = !failed && channel.source === source.source && channel.thread === source.thread
+      ? run.attachmentResults?.flatMap((result, index) => {
+        const attachment = run.message.attachments?.[index]
+        return attachment && result.original ? [{ id: attachment.id, name: result.name }] : []
+      }) : undefined
     this.host.notify({ id: key('project-agent-result', run.id), channel, kind: 'notice', text: run.reply,
+      ...(files?.length && { sourceAttachments: { messageId: run.message.messageId, files } }),
       origin: { projectId: run.message.projectId, eventId: run.event?.id ?? run.message.messageId, taskId: run.event?.taskId, runId: run.id } })
   }
 }

@@ -75,6 +75,8 @@ export interface MessagePresentation {
 export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string
   correlation?: string
   origin?: { projectId: string; taskId?: string; eventId?: string; runId?: string }
+  /** Provider references for the original files. Download URLs are resolved only by the matching transport. */
+  sourceAttachments?: { messageId: string; files: { id: string; name: string }[] }
   format?: 'text' | 'markdown'; title?: string; presentation?: MessagePresentation }
 /** A queued message waits (`pending`), went out (`sent`), or was dropped because its conversation can never receive it (`dropped`). */
 export type ReplyStatus = 'pending' | 'sent' | 'dropped'

@@ -293,7 +293,7 @@ export class DingTalkCards {
     })
   }
 
-  async send(message: OutboundMessage): Promise<void> {
+  async send(message: OutboundMessage, transientSuffix = ''): Promise<void> {
     // The fallback send path must register the event binding before creating a card.
     const incoming = message.channel.address.triggerId
     const event = incoming ? this.context.triggers.get(incoming) : undefined
@@ -328,7 +328,8 @@ export class DingTalkCards {
     const eventLabel = cardOrigin.channel?.address.eventLabel
     const heading = [taskLabel, eventLabel].filter(Boolean).join(' · ')
     const flowStatus = placeholder ? card.informational ? '3' : '2' : card.messages!.at(-1)!.flowStatus
-    const text = [receiptText(cardOrigin), ...card.messages?.map(item => item.text) ?? []].join('\n\n---\n\n')
+    const text = [receiptText(cardOrigin), ...card.messages?.map(item =>
+      item.id === message.id ? item.text + transientSuffix : item.text) ?? []].join('\n\n---\n\n')
     const data = { title: [heading, this.robotName].filter(Boolean).join(' '),
       status: flowStatus === '2' ? '输出中' : '完成',
       markdown: heading ? `${heading}\n\n${text}` : text, flowStatus,

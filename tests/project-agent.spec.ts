@@ -437,18 +437,22 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     receive = fn as typeof receive; return this
   })
   const ack = vi.spyOn(DWClient.prototype, 'socketCallBackResponse').mockImplementation(() => {})
+  const expiry = Math.floor(Date.now() / 1000) + 90
+  const signed = `https://files.oss-cn-zhangjiakou.aliyuncs.com/handout?Signature=fixture%2Btoken&Expires=${expiry}`
   const fetchFile = vi.fn(async (url: URL | string, init?: RequestInit) => {
     if (String(url).endsWith('/accessToken')) return Response.json({ accessToken: 'auth-token' })
+    if (String(url).startsWith('https://oapi.dingtalk.com/robot/send')) return Response.json({ errcode: 0 })
+    if (String(url).endsWith('/robot/groupMessages/send')) return Response.json({ processQueryKey: 'sent' })
     if (String(url).endsWith('/messageFiles/download')) {
       const request = JSON.parse(String(init?.body))
       if (request.downloadCode === 'expired-code') return Response.json({ code: 'invalidParameter.robotCode.downloadCode' }, { status: 400 })
       if (request.downloadCode === 'untrusted-code') return Response.json({ downloadUrl: 'http://aliyuncs.com.example.org/handout' })
       if (request.downloadCode === 'slides-code') return Response.json({ downloadUrl: 'https://files.oss-cn-zhangjiakou.aliyuncs.com/slides' })
       expect(request).toEqual({ robotCode: 'robot', downloadCode: 'temporary-file-secret' })
-      return Response.json({ downloadUrl: 'http://files.oss-cn-zhangjiakou.aliyuncs.com/handout?Signature=fixture%2Btoken' })
+      return Response.json({ downloadUrl: signed.replace('https:', 'http:') })
     }
     if (String(url).endsWith('/slides')) return new Response(new Uint8Array(slides))
-    expect(String(url)).toBe('https://files.oss-cn-zhangjiakou.aliyuncs.com/handout?Signature=fixture%2Btoken')
+    expect(String(url)).toBe(signed)
     expect(init?.headers).toBeUndefined()
     expect(init?.redirect).toBe('error')
     return new Response('<script>malicious script</script><h1>Slide handout</h1><p>Execution evidence by section.</p>')
@@ -469,7 +473,7 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     }
     propose.mockImplementationOnce(async prompt => {
       expect(prompt).toContain('Execution evidence by section')
-      expect(prompt).not.toMatch(/malicious script|temporary-file-secret|task\.begin/)
+      expect(prompt).not.toMatch(/malicious script|temporary-file-secret|fixture%2Btoken|task\.begin/)
       return { summary: '材料按章节列出了执行证据。' }
     }).mockImplementationOnce(async prompt => {
       expect(prompt).toContain('"attachments":[{"name":"handout.html","summary":"材料按章节列出了执行证据。"')
@@ -484,7 +488,7 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     const run = (await post('quote-file'))!
     expect(run.reply).toContain('已读取「handout.html」')
     expect(run.reply).toContain('按章节列出了执行证据')
-    expect(JSON.stringify(run)).not.toContain('temporary-file-secret')
+    expect(JSON.stringify(run)).not.toMatch(/temporary-file-secret|fixture%2Btoken/)
     await post('quote-file')
     const updated = projects.detail(id)
     expect(updated.tasks.find(item => item.id === task.id)).toMatchObject({ status: 'in-progress',
@@ -524,6 +528,26 @@ it('uses DingTalk attachment previews for progress and hands the original to new
     expect(follow?.steps[0]?.error).toBeUndefined()
     expect(h.relays(worker).at(-1)).toMatchObject({ text: '请打开原始附件并按页分析。', attachments: [first] })
     expect(JSON.stringify(h.relays(worker))).not.toMatch(/幻灯片摘要|slides-code/)
+
+    const reply = send.mock.calls.find(([message]) => message.text === run.reply)![0]
+    expect(reply.sourceAttachments).toEqual({ messageId: run.message.messageId,
+      files: [{ id: run.message.attachments![0]!.id, name: 'handout.html' }] })
+    expect(JSON.stringify(reply)).not.toContain('fixture%2Btoken')
+    await bot.send(reply)
+    const plain = JSON.parse(String(fetchFile.mock.lastCall?.[1]?.body))
+    expect(plain.text.content).toContain(`handout.html ${signed}`)
+    await bot.send({ ...reply, format: 'markdown' })
+    const sentBody = JSON.parse(String(fetchFile.mock.lastCall?.[1]?.body))
+    expect(sentBody.markdown.text).toContain(`[handout.html](${signed})`)
+    await bot.send({ ...reply, channel: { ...reply.channel, address: { conversationId: 'unrelated-group' } } })
+    expect(String(fetchFile.mock.lastCall?.[1]?.body)).not.toContain('fixture%2Btoken')
+    const now = vi.spyOn(Date, 'now').mockReturnValue((expiry + 1) * 1000)
+    try {
+      await bot.send(reply)
+      const staleBody = String(fetchFile.mock.lastCall?.[1]?.body)
+      expect(staleBody).toContain('重新引用文件')
+      expect(staleBody).not.toContain('fixture%2Btoken')
+    } finally { now.mockRestore() }
   } finally { callback.mockRestore(); ack.mockRestore() }
 })
 

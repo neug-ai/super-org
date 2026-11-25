@@ -363,6 +363,20 @@ it('reuses the acceptance confirmation on first delivery even without an intake 
   expect(requestBody(1).outTrackId).toBe(requestBody(0).outTrackId)
 })
 
+it('renders a temporary attachment download in the card and drops it from saved card text and quoted context', async () => {
+  const link = 'https://files.oss-cn-hangzhou.aliyuncs.com/doc.pdf?Signature=temporary-test-signature'
+  const suffix = `\n\n原件下载（钉钉临时链接）：[doc.pdf](${link})`
+  const summary = message({ id: 'summary', kind: 'notice', text: '读到了材料摘要。' })
+  await cards.send(summary, suffix)
+  const rendered = requestBody(0).cardData.cardParamMap.markdown as string
+  expect(rendered).toContain(link)
+  expect(JSON.stringify(context.state.get(`dingtalk-card:${receiptId(origin.id)}` as never))).not.toContain(link)
+  const quote = dingTalkTrigger({ ...raw, msgId: 'quoted-summary', text: { content: '请继续', isReplyMsg: true,
+    repliedMsg: { msgId: 'summary', senderId: raw.chatbotUserId, msgType: 'interactiveCard', content: rendered } } }, context)!.trigger
+  expect(quote.meta.replyToBotText).toContain(summary.text)
+  expect(quote.meta.replyToBotText).not.toContain(link)
+})
+
 it('keeps one event card across deliveries, task splits, restarts and retries', async () => {
   context.triggers.targets = () => ['ticket']
   await receipt()

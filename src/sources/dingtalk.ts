@@ -206,6 +206,20 @@ export interface Route { webhook: string; expires: number; robotCode: string; co
 export const ticketReference = (text: string): string | undefined => /(?:^|\s)#([a-f0-9]{12,32})(?=\s|$|[，。,:：])/i.exec(text)?.[1]?.toLowerCase()
 export const label = (id: string): string => `#${id.slice(0, 12)}`
 const picturePlaceholder = '[图片附件]'
+const attachmentLinkLabel = '原件下载（钉钉临时链接）：'
+const attachmentLinkLine = /^[ \t]*原件下载（钉钉临时链接）：[^\n]*$/gm
+
+function ossExpiry(url: URL): number | undefined {
+  const query = url.searchParams
+  const seconds = query.get('Expires') ?? query.get('x-oss-expires')
+  if (!seconds || !/^\d+$/.test(seconds)) return
+  const date = query.get('x-oss-date')
+  if (!date) return Number(seconds) * 1000
+  const utc = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(date)
+  if (!utc) return
+  const [, year, month, day, hour, minute, second] = utc
+  return Date.parse(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`) + Number(seconds) * 1000
+}
 /** Projects the platform's body into text without treating a wire-format type as an admission rule. */
 function contentText(value: unknown): string {
   if (typeof value === 'string') {
@@ -289,7 +303,7 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): {
   const id = key('dingtalk', message.robotCode, message.conversationId, message.msgId)
   const quote = quotedMessage(head)
   const replyToBot = !!quote?.senderId && !!message.chatbotUserId && quote.senderId === message.chatbotUserId
-  const botQuote = replyToBot ? quotedText(quote?.content) : ''
+  const botQuote = replyToBot ? quotedText(quote?.content).replace(attachmentLinkLine, '').trim() : ''
   const directReference = ticketReference(text)
   const reference = directReference ?? ticketReference(botQuote)
   const saved = reference ? context.state.get(tickets(message.conversationId, reference)) : undefined
@@ -334,6 +348,7 @@ export interface DingTalkIntake {
 export class DingTalk {
   private readonly client: DWClient
   private readonly cards?: DingTalkCards
+  private readonly attachmentUrls = new Map<string, { url: string; until: number }>()
   private token?: { value: string; until: number }
   private streamStatus?: ReturnType<typeof setInterval>
   constructor(private readonly context: SourceContext, private readonly credentials: { clientId: string; clientSecret: string },
@@ -485,8 +500,31 @@ export class DingTalk {
         if (length > maxAttachmentBytes) throw new AttachmentReadError('附件超过大小上限。')
         chunks.push(chunk.value)
       }
+      const linkKey = key(conversationId, triggerId, attachment.id)
+      this.attachmentUrls.delete(linkKey)
+      if (this.attachmentUrls.size >= 256) this.attachmentUrls.delete(this.attachmentUrls.keys().next().value!)
+      this.attachmentUrls.set(linkKey, { url: url.href, until: Math.min(ossExpiry(url) ?? Infinity, Date.now() + 300_000) })
       return Buffer.concat(chunks, length)
     } finally { await stream.cancel() }
+  }
+  private attachmentLinkText(message: OutboundMessage, budget: number, markdown: boolean): string {
+    const source = message.sourceAttachments
+    if (!source || message.channel.source !== 'dingtalk') return ''
+    const conversation = message.channel.address.conversationId
+    const trigger = this.context.triggers.get(source.messageId)
+    if (!conversation || trigger?.channel?.source !== 'dingtalk' || trigger.channel.address.conversationId !== conversation) return ''
+    const lines: string[] = []
+    for (const file of source.files) {
+      const link = this.attachmentUrls.get(key(conversation, source.messageId, file.id))
+      if (!link || !(link.until > Date.now()) || /[()<>\s]/.test(link.url)) continue
+      const name = file.name.replace(/[\r\n\[\]\\]/g, ' ').trim() || '打开原件'
+      const download = markdown ? `[${name}](${link.url})` : `${name} ${link.url}`
+      const line = `\n\n${attachmentLinkLabel}${download}`
+      if (line.length <= budget) { lines.push(line); budget -= line.length }
+    }
+    const fallback = '\n\n需要补取原件链接时，请在本群重新引用文件并 @ 机器人。'
+    if (lines.length < source.files.length && budget >= fallback.length) lines.push(fallback)
+    return lines.join('')
   }
   async send(message: OutboundMessage): Promise<void> {
     const conversation = message.channel.address.conversationId!
@@ -495,13 +533,16 @@ export class DingTalk {
     const eventLabel = message.channel.address.eventLabel
     const heading = [message.ticketId ? label(message.ticketId) : '', eventLabel ?? ''].filter(Boolean).join(' · ')
     const mention = message.channel.address.mentionUserId
-    const body = heading ? `${heading}${eventLabel ? '\n' : ' '}${message.text}` : message.text
+    const summary = heading ? `${heading}${eventLabel ? '\n' : ' '}${message.text}` : message.text
+    const card = this.cards && (message.kind !== 'notice' || message.channel.address.triggerId || message.channel.address.cardId || message.ticketId)
     const markdown = message.format === 'markdown'
+    const links = this.attachmentLinkText(message, 3900 - summary.length, markdown || !!card)
+    const body = summary + links
     const title = message.title ?? '项目更新'
     if (body.length > 4000) throw new Error('DingTalk result exceeds 4000 characters; provide a brief result and a link')
     // Project lifecycle notices are sent to the group without threading them under an old request card.
-    if (this.cards && (message.kind !== 'notice' || message.channel.address.triggerId || message.channel.address.cardId || message.ticketId)) {
-      await this.cards.send(message)
+    if (this.cards && card) {
+      await this.cards.send(message, links)
       this.context.state.set(deliveries(conversation), { messageId: message.id, format: 'markdown', transport: 'ai-card', messageType: 'card', at: new Date().toISOString() })
       return
     }
