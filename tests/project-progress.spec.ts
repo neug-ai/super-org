@@ -70,8 +70,7 @@ it('uses available evidence to let the assigned Agent report progress and delive
   expect(project.tickets).toEqual([])
   expect(project.tasks).toMatchObject([
     { ownerId: owner!.id, status: 'in-review', progress: [{ actorId: owner!.id, source: 'agent', summary: expect.stringContaining('青柠 37') }],
-      reviews: [{ taskId: project.tasks[1]!.id, evidence: { summary: expect.stringContaining('青柠 37') } }] },
-    { reviewOf: { taskId: task.id }, status: 'todo' },
+      reviews: [{ evidence: { summary: expect.stringContaining('青柠 37') } }] },
   ])
   expect(ready().filter(event => event.taskId === task.id)).toHaveLength(1)
   expect(h.runtime.projectEvents.list({ projectId: id })).toContainEqual(expect.objectContaining({
@@ -101,7 +100,7 @@ it('uses one optional Worker for work requiring a checkout and records its repor
   await h.runtime.idle()
   const delivered = projects.detail(id)
   expect(delivered.tasks[0]).toMatchObject({ ownerId: owner!.id, ticketId, status: 'in-review',
-    reviews: [{ taskId: delivered.tasks[1]!.id, evidence: { summary: '规则测试通过，已核对输出。', ticketId } }] })
+    reviews: [{ evidence: { summary: '规则测试通过，已核对输出。', ticketId } }] })
   expect(delivered.tickets).toHaveLength(1)
 })
 

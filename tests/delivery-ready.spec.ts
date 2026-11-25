@@ -40,7 +40,7 @@ it('uses the real worker completion event to transition and notify once without 
   expect(h.runtime.projectEvents.list({ projectId: id }).filter(event => event.type === 'delivery.ready')).toMatchObject([
     { type: 'delivery.ready', source: 'execution', status: 'applied', data: { ticketId } },
   ])
-  expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ text: expect.stringContaining('待验收'),
+  expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ text: expect.stringContaining('待验证'),
     channel: expect.objectContaining({ address: { conversationId: 'project-group', mentionUserId: 'reviewer', mentionUserName: 'Reviewer' } }) }))
   h.runtime.deliveryReady.observe(ticketId)
   await h.runtime.idle()
@@ -73,7 +73,7 @@ it('honors an event JSON override and preserves an auditable ignored result', as
 it('applies the delivery without a DingTalk group and retains the successful execution evidence', async () => {
   const { h, id, projects, report, send } = await pilot(null)
   await report(); await h.runtime.idle()
-  expect(projects.detail(id)).toMatchObject({ tasks: [{ status: 'in-review' }, { status: 'todo', reviewOf: { version: 1 } }],
+  expect(projects.detail(id)).toMatchObject({ tasks: [{ status: 'in-review', reviews: [{ version: 1, status: 'pending' }] }],
     tickets: [{ reportState: 'ready', ended: true }] })
   expect(h.runtime.projectEvents.list({ projectId: id })[0]?.status).toBe('applied')
   expect(send).not.toHaveBeenCalled()

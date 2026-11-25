@@ -205,15 +205,12 @@ function PendingWork({ t, project, answers, reviews, checks, taskName, openTask,
     {!!reviews.length && <section className="dt-history-bucket"><h4>{t('project.history.pendingReviews')}</h4>
       <ul className="dt-history-records">{reviews.map(task => {
         const review = currentReview(task)
-        const reviewTask = review?.taskId && project.tasks.find(item => item.id === review.taskId)
-        const reviewerId = reviewTask ? reviewTask.ownerId : review?.requirements.ownerId
-        const owner = reviewerId && memberNames.get(reviewerId)
         return <li key={task.id} className="dt-history-record">
           <span className="dt-history-record-icon"><Icon name="review" /></span>
           <div><strong>{task.title}</strong>
-            <p className="dt-project-meta">{t('project.tracking.awaitingReview', { version: review?.version ?? '—', owner: owner || t('project.unassigned') })}</p>
+            <p className="dt-project-meta">{t('project.tracking.awaitingReview', { version: review?.version ?? '—' })}</p>
           </div>
-          {openTask && <Button size="sm" variant="outline" onClick={() => openTask(reviewTask || task)}>{t('project.history.openTask')}</Button>}
+          {openTask && <Button size="sm" variant="outline" onClick={() => openTask(task)}>{t('project.history.openTask')}</Button>}
         </li>
       })}</ul>
     </section>}

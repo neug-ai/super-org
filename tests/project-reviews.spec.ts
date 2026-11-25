@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { KV } from '../src/kv.ts'
 import { currentReview, reviewReference } from '../src/app/project-deliveries.ts'
 import { ProjectChange, ProjectInput, Projects, TaskInput } from '../src/app/projects.ts'
-import { reviewAccepted, reviewRejected, reviewRequested, type ReviewContext } from '../src/app/project-reviews.ts'
+import { reviewAccepted, reviewFeedback, reviewRejected, reviewRequested, type ReviewContext } from '../src/app/project-reviews.ts'
 import { dingTalkKind, dingTalkRoute } from '../src/sources/dingtalk.ts'
 import { startRuntime, type Host } from './fixtures/host.ts'
 let host: Host | undefined
@@ -41,18 +41,19 @@ async function pilot(group: string | null = 'group') {
   }
   return { h, projects, id, owner, other, task, change, readTask, submit, decide, context, send, propose }
 }
-it('captures manual evidence and requirements once, notifies the bound reviewer and preserves the accepted decision', async () => {
+it('captures manual evidence and requirements once, notifies the owner to coordinate review and preserves the decision', async () => {
   const { h, id, owner, readTask, submit, decide, send, projects } = await pilot()
   const review = await submit()
   expect(readTask()).toMatchObject({ status: 'in-review', deliveryVersion: 1, reviews: [{ status: 'pending', requirements: { ownerId: owner.id, acceptance: 'Reproducible evidence' }, evidence: { summary: 'Experiment output and repeatable results' } }] })
   expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining(reviewReference(review)),
     channel: expect.objectContaining({ address: { conversationId: 'group', mentionUserId: 'owner', mentionUserName: owner.name } }) }))
+  expect(projects.detail(id).tasks).toHaveLength(1)
   expect(await decide(review.id, 'accepted')).toMatchObject({ status: 200 })
   expect(readTask()).toMatchObject({ status: 'done', completedAt: expect.any(String), reviews: [{ status: 'accepted', decision: { actorId: null, source: 'request', reason: 'Checked all evidence' } }] })
   expect(projects.detail(id).tickets).toEqual([])
   expect(h.runtime.projectEvents.list({ projectId: id })).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'review.accepted', status: 'applied' })]))
 })
-it('uses the same task operations for people and the project Agent and completes a version-linked review task', async () => {
+it('verifies both human and Agent deliveries on their original tasks without assigning a reviewer', async () => {
   const { h, id, owner, other, projects, context, change } = await pilot()
   const roster = change({ kind: 'add-agent' })
   const agent = roster.members.find(member => member.accounts.some(account => account.provider === 'agent'))!
@@ -74,21 +75,18 @@ it('uses the same task operations for people and the project Agent and completes
     await h.runtime.idle()
     const parent = projects.detail(id).tasks.find(item => item.id === task.id)!
     const review = currentReview(parent)!
-    const check = projects.detail(id).tasks.find(item => item.id === review.taskId)!
-    expect(review.requirements).not.toHaveProperty('ownerId')
-    expect(check).toMatchObject({ status: 'todo', ownerId: null, reviewOf: { taskId: task.id, reviewId: review.id, version: review.version } })
-    change({ kind: 'task', id: check.id, value: { ...TaskInput.strip().parse(check), ownerId: other.id } })
-    const result = { taskId: check.id, outcome: 'accepted', summary: 'Reproduced the result', links: ['https://example.com/verification'] }
-    expect(() => tools.execute('delivery.submit', result, operation(`self-${person.id}`, person.id))).toThrow('负责人')
-    tools.execute('task.start', { taskId: check.id }, operation(`check-start-${person.id}`, other.id))
-    const saved = tools.execute('delivery.submit', result, operation(`check-result-${person.id}`, other.id))
+    expect(review.taskId).toBeUndefined()
+    expect(projects.detail(id).tasks).toHaveLength(before.tasks.length)
+    const result = { taskId: task.id, reviewId: review.id, outcome: 'accepted', reason: 'Reproduced the result', links: ['https://example.com/verification'] }
+    expect(() => tools.execute('review.decide', result, operation(`self-${person.id}`, person.id))).toThrow('请')
+    const saved = tools.execute('review.decide', result, operation(`check-result-${person.id}`, other.id))
     await h.runtime.idle()
-    expect(tools.execute('delivery.submit', result, operation(`check-result-${person.id}`, other.id)).data).toMatchObject({
+    expect(tools.execute('review.decide', result, operation(`check-result-${person.id}`, other.id)).data).toMatchObject({
       ...(saved.data as { eventId: string }), status: 'applied' })
     const after = projects.detail(id)
     expect(after.tasks.find(item => item.id === task.id)).toMatchObject({ status: 'done', ownerId: person.id })
-    expect(after.tasks.find(item => item.id === check.id)).toMatchObject({ status: 'done', ownerId: other.id })
-    expect(currentReview(after.tasks.find(item => item.id === task.id)!)).toMatchObject({ status: 'accepted', decision: { actorId: other.id, links: result.links } })
+    expect(currentReview(after.tasks.find(item => item.id === task.id)!)).toMatchObject({ status: 'accepted',
+      decision: { actorId: other.id, actorName: other.name, links: result.links } })
   }
 })
 it('retries the same delivery and decision idempotently, and rejects reuse with different evidence', async () => {
@@ -99,25 +97,66 @@ it('retries the same delivery and decision idempotently, and rejects reuse with 
   expect(readTask().reviews).toHaveLength(1)
   expect(await h.api('POST', `projects/${id}/tasks/${task.id}/deliveries`, { messageId: 'delivery', summary: 'Different result' })).toMatchObject({ status: 409 })
 })
-it('checks current member identity, project group and the assigned reviewer on both submission and application', async () => {
+it('settles an existing unassigned legacy verification task from the original delivery', async () => {
+  const { h, id, task, other, submit, context, change, projects } = await pilot()
+  const review = await submit()
+  const legacy = change({ kind: 'task', value: { title: 'Legacy verification' } }).tasks.at(-1)!
+  const stored = h.runtime.store.get(KV.projects.project(id))!
+  currentReview(stored.tasks.find(item => item.id === task.id)!)!.taskId = legacy.id
+  stored.tasks.find(item => item.id === legacy.id)!.reviewOf = { taskId: task.id, reviewId: review.id, version: 1 }
+  h.runtime.store.set(KV.projects.project(id), stored)
+  h.runtime.projectReviews.decide(context('legacy-review', other.id), task.id, review.id, 'accepted', 'Verified from the parent task')
+  await h.runtime.idle()
+  expect(projects.detail(id).tasks.map(item => item.status)).toEqual(['done', 'done'])
+})
+
+it('records feedback and attributed decisions through the local board endpoint', async () => {
+  const { h, id, task, submit, readTask } = await pilot()
+  const review = await submit()
+  const route = `projects/${id}/tasks/${task.id}/reviews/${review.id}`
+  expect(await h.api('POST', route, { messageId: 'note', outcome: 'feedback', reason: 'Still checking the timeline' })).toMatchObject({ status: 200 })
+  await h.runtime.idle()
+  expect(readTask()).toMatchObject({ status: 'in-review', reviews: [{ feedback: [{ actorId: null, reason: 'Still checking the timeline' }] }] })
+  expect(await h.api('POST', route, { messageId: 'result', outcome: 'rejected', reason: 'Data missing', reviewerName: 'QA reviewer' }))
+    .toMatchObject({ status: 200 })
+  await h.runtime.idle()
+  expect(readTask()).toMatchObject({ status: 'in-progress', reviews: [{ decision: { actorId: null, reviewerName: 'QA reviewer' } }] })
+})
+it('checks project and member authority, preserves pending feedback, and distinguishes verifier from recorder', async () => {
   const { h, task, submit, other, owner, context, change, readTask } = await pilot()
   const review = await submit(); const reviews = h.runtime.projectReviews
-  expect(() => reviews.decide(context('other', other.id), task.id, review.id, 'accepted', 'Looks fine')).toThrow('负责人')
+  expect(() => reviews.decide(context('owner'), task.id, review.id, 'accepted', 'Looks fine')).toThrow('实际验证人')
+  expect(() => reviews.decide(context('false-proxy', other.id), task.id, review.id, 'accepted', 'Looks fine', undefined, undefined, 'Someone else')).toThrow('负责人代录')
+  expect(() => reviews.decide(context('self-proxy'), task.id, review.id, 'accepted', 'Looks fine', undefined, undefined, owner.name)).toThrow('其他人')
   expect(() => reviews.decide({ ...context('wrong-group'), channel: { source: 'dingtalk', thread: 'wrong', address: { conversationId: 'wrong' } } }, task.id, review.id, 'accepted', 'Fine')).toThrow('另一个')
   expect(() => reviews.decide(context('unknown', 'unknown'), task.id, review.id, 'accepted', 'Fine')).toThrow('成员')
+  const feedback = reviews.decide(context('feedback', other.id), task.id, review.id, 'feedback', 'Checked the output; timing is still pending')
+  await h.runtime.idle()
+  expect(reviews.decide(context('feedback', other.id), task.id, review.id, 'feedback', 'Checked the output; timing is still pending'))
+    .toEqual({ eventId: feedback.eventId, status: 'applied' })
+  expect(readTask()).toMatchObject({ status: 'in-review', reviews: [{ status: 'pending',
+    feedback: [{ actorId: other.id, actorName: other.name, reason: 'Checked the output; timing is still pending' }] }] })
+  reviews.decide(context('proxy'), task.id, review.id, 'accepted', 'Reproduced on two machines', undefined, undefined, other.name)
+  await h.runtime.idle()
+  expect(readTask()).toMatchObject({ status: 'done', reviews: [{ decision: { actorId: owner.id, actorName: owner.name,
+    reviewerName: other.name, reason: 'Reproduced on two machines' } }] })
+})
+it('rechecks verification after the task scope changes while the decision is queued', async () => {
+  const { h, task, submit, other, owner, context, change, readTask } = await pilot()
+  const review = await submit()
   h.runtime.store.saveSettings({ ...h.runtime.store.settings(), paused: true })
-  reviews.decide(context('owner'), task.id, review.id, 'accepted', 'Verified')
+  h.runtime.projectReviews.decide(context('other', other.id), task.id, review.id, 'accepted', 'Verified')
   change({ kind: 'task', id: task.id, value: { ...TaskInput.strip().parse(readTask()), ownerId: other.id } })
   h.runtime.store.saveSettings({ ...h.runtime.store.settings(), paused: false }); await h.runtime.idle()
   expect(readTask().status).not.toBe('done')
   expect(readTask().reviews?.[0]?.requirements.ownerId).toBe(owner.id)
 })
 it('serializes simultaneous board acceptance and group rejection with exactly one valid decision', async () => {
-  const { h, id, task, submit, context, readTask, send } = await pilot()
+  const { h, id, task, submit, context, readTask, send, other } = await pilot()
   const review = await submit(); send.mockClear()
   h.runtime.store.saveSettings({ ...h.runtime.store.settings(), paused: true })
   h.runtime.projectReviews.decide(context('board', null), task.id, review.id, 'accepted', 'Checked from board')
-  h.runtime.projectReviews.decide(context('group'), task.id, review.id, 'rejected', 'Missing a case')
+  h.runtime.projectReviews.decide(context('group', other.id), task.id, review.id, 'rejected', 'Missing a case')
   h.runtime.store.saveSettings({ ...h.runtime.store.settings(), paused: false }); await h.runtime.idle()
   expect(readTask()).toMatchObject({ status: 'done', reviews: [{ status: 'accepted', decision: { reason: 'Checked from board' } }] })
   const results = h.runtime.projectEvents.list({ projectId: id }).filter(event => ['review.accepted', 'review.rejected'].includes(event.type))
@@ -161,25 +200,25 @@ it('binds a quoted old review before Agent inference and prevents the Agent from
   expect(readTask().status).toBe('in-review')
 })
 it('uses the same Agent tool for an authorized natural-language review with no command keyword gate', async () => {
-  const { h, id, task, context, submit, readTask, propose } = await pilot()
+  const { h, id, task, context, submit, readTask, propose, other } = await pilot()
   const review = await submit()
   propose.mockImplementationOnce(async prompt => {
     expect(prompt).toContain('这些边界我都试过了，这版可以交了')
     expect(prompt).toContain(review.id)
     return { calls: [{ tool: 'review.decide', arguments: JSON.stringify({ taskId: task.id, reviewId: review.id, outcome: 'accepted', reason: '成员已验证全部边界' }) }], reply: '' }
   })
-  const { operationId, ...origin } = context('natural')
+  const { operationId, ...origin } = context('natural', other.id)
   h.runtime.projectAgent!.submit({ ...origin, messageId: operationId, text: '这些边界我都试过了，这版可以交了', quoted: reviewReference(review) })
   await h.runtime.idle()
   expect(readTask()).toMatchObject({ status: 'done', reviews: [{ decision: { source: 'dingtalk', reason: '成员已验证全部边界' } }] })
   expect(h.runtime.projectAgent!.runs(id)[0]?.status).toBe('completed')
 })
 it('sends one final result for a group review instead of an event broadcast plus an Agent echo', async () => {
-  const { h, task, context, submit, propose, send, readTask } = await pilot()
+  const { h, task, context, submit, propose, send, readTask, other } = await pilot()
   const review = await submit(); send.mockClear()
   propose.mockResolvedValueOnce({ calls: [{ tool: 'review.decide', arguments: JSON.stringify({ taskId: task.id, reviewId: review.id, outcome: 'accepted', reason: 'Member checked the evidence' }) }], reply: '' })
     .mockResolvedValueOnce({ calls: [], reply: '**验收通过**，当前任务已完成。' })
-  const { operationId, ...origin } = context('one-final-result')
+  const { operationId, ...origin } = context('one-final-result', other.id)
   h.runtime.projectAgent!.submit({ ...origin, messageId: operationId, text: '检查过了，这版通过。', quoted: reviewReference(review) })
   await h.runtime.idle()
   expect(readTask().status).toBe('done')
@@ -261,7 +300,7 @@ it('recovers legacy pending review state silently without migrating completed hi
   expect(send).not.toHaveBeenCalled()
 })
 it('ships review source defaults with descriptions and a shared configuration guide', () => {
-  for (const event of [reviewRequested, reviewAccepted, reviewRejected]) {
+  for (const event of [reviewRequested, reviewAccepted, reviewRejected, reviewFeedback]) {
     const config = JSON.parse(readFileSync(new URL('../config/events/review.defaults.json', import.meta.url), 'utf8'))
     expect(config.sources.review.on[event.type]).toEqual({ enabled: true, description: event.description })
     expect(readFileSync(new URL(`../${event.documentation}`, import.meta.url), 'utf8')).toContain(event.type)

@@ -8,7 +8,7 @@ import { ProgressInput, ProjectChange, ProjectError, Projects, TaskInput, type P
 import type { ProjectTracking } from './project-tracking.ts'
 import type { ProjectIssues } from './project-issues.ts'
 import type { Store } from './store.ts'
-import { TaskDelivery, type ProjectReviews } from './project-reviews.ts'
+import { ReviewInput, TaskDelivery, type ProjectReviews } from './project-reviews.ts'
 import { isProjectAgent } from './project-member.ts'
 import { deliveryReviewState } from './project-deliveries.ts'
 import { CommunicationPreference, type Communication } from './communication.ts'
@@ -237,14 +237,15 @@ export class ProjectTools {
         return { summary: '讨论回复已登记，实际投递以回执为准。', data: host.reply(context, args.taskId, args.url, args.text),
           ...(context.event ? { replyChannel: projectChannel(host.store, this.projects.detail(context.projectId)) } : {}) }
       }))
-    this.register(operation('delivery.submit', '提交实际任务结果和证据。成员可提交明确提供的成果，项目 Agent 可提交自己受托完成的成果。验收任务须填写 outcome 和检查依据。',
+    this.register(operation('delivery.submit', '提交实际任务成果和证据，让原任务进入待验证。仅历史关联验收任务在此工具填写 outcome；通常使用 review.decide 记录结论。',
       TaskDelivery.extend({ taskId: id }), (context, { taskId, ...evidence }) => ({
         summary: '提交已登记，状态以事件处理结果为准。', data: host.reviews.deliver(context, taskId, evidence, context.reviewId),
       })))
-    this.register(operation('review.decide', '根据成员对具体交付的明确反馈，提交通过或退回验收。必须使用该交付的真实验收 ID、明确理由；只有指定负责人或本地管理者可以验收。不得将旧引用替换为新版，不得代替人自行通过验收。',
-      z.strictObject({ taskId: id, reviewId: id, outcome: z.enum(['accepted', 'rejected']), reason: z.string().trim().min(1).max(8000) }),
-      (context, args) => ({ summary: '验收决定已登记，状态以事件处理结果为准。',
-        data: host.reviews.decide({ ...context, replyOwner: 'agent' }, args.taskId, args.reviewId, args.outcome, args.reason, context.reviewId) })))
+    this.register(operation('review.decide', '在原任务的指定交付版本记录人工验证反馈（feedback）、通过或退回。反馈保留待验证状态。仅当任务负责人明确代录时提供实际验证人的 reviewerName。引用旧版时不得替换为新版；禁止自行宣布通过。',
+      ReviewInput.extend({ taskId: id, reviewId: id }),
+      (context, args) => ({ summary: '验证记录已登记，状态以事件处理结果为准。',
+        data: host.reviews.decide({ ...context, replyOwner: 'agent' }, args.taskId, args.reviewId, args.outcome, args.reason,
+          context.reviewId, args.links, args.reviewerName) })))
     this.register(operation('issue.create', '为当前任务建立或取回 GitHub Issue。使用项目绑定仓库，创建结果通过现有可靠队列回写。',
       z.strictObject({ taskId: id }), (context, args) => {
         const current = task(context, args.taskId)

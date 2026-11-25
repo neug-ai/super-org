@@ -9,7 +9,7 @@ import { KV, type Family } from '../kv.ts'
 import type { Health } from '../sources/host.ts'
 import type { Store } from './store.ts'
 import type { ExecutorLoad } from './views/tickets.ts'
-import { currentReview, deliveryScopeChanged, nextDelivery, type DeliveryEvidence, type ProjectReview } from './project-deliveries.ts'
+import { currentReview, deliveryScopeChanged, nextDelivery, type DeliveryEvidence, type ProjectReview, type ReviewEntry, type ReviewOutcome } from './project-deliveries.ts'
 import { TrackingSchedule } from './tracking-schedule.ts'
 import { isProjectAgent, projectAgentAccount } from './project-member.ts'
 
@@ -484,7 +484,7 @@ export class Projects {
   }
 
   /** Captures an immutable review snapshot for the current delivery. Called by the ordered review event handler. */
-  requestReview(projectId: string, taskId: string, evidence: DeliveryEvidence, at: string, linkedTask: boolean): ProjectDetail {
+  requestReview(projectId: string, taskId: string, evidence: DeliveryEvidence, at: string): ProjectDetail {
     return this.store.atomic(() => {
       const project = this.require(projectId)
       const task = requireRecord(project.tasks, taskId, 'Task')
@@ -497,41 +497,50 @@ export class Projects {
       if (currentReview(task)?.status === 'pending') throw new ProjectError(409, '本版交付已经在等待验收。')
       if (!task.deliveryVersion || currentReview(task)) this.advanceDelivery(project, task)
       const review: ProjectReview = { id: randomUUID(), version: task.deliveryVersion!, requestedAt: at, status: 'pending',
-        requirements: { title: task.title, description: task.description, acceptance: task.acceptance,
-          ...((!linkedTask || task.executionMode !== undefined) && { ownerId: task.ownerId }) }, evidence }
-      if (linkedTask) {
-        const value = TaskInput.parse({ title: `验收「${task.title.slice(0, 170)}」· 第 ${review.version} 版`,
-          acceptance: task.acceptance, description: evidence.summary, milestoneId: task.milestoneId,
-          ownerId: task.executionMode !== undefined && task.ownerId && project.memberIds.includes(task.ownerId) ? task.ownerId : null })
-        const reviewTask: ProjectTask = { ...value, id: randomUUID(), createdAt: at, updatedAt: at, completedAt: null,
-          reviewOf: { taskId, reviewId: review.id, version: review.version } }
-        review.taskId = reviewTask.id
-        project.tasks.push(reviewTask)
-      }
+        requirements: { title: task.title, description: task.description, acceptance: task.acceptance, ownerId: task.ownerId }, evidence }
       ;(task.reviews ??= []).push(review)
       task.status = 'in-review'; task.updatedAt = at; task.completedAt = null
       return this.save(project)
     })
   }
 
-  /** Settles exactly one current review, preserving its evidence and the human decision. */
-  decideReview(projectId: string, taskId: string, reviewId: string, outcome: 'accepted' | 'rejected', decision: NonNullable<ProjectReview['decision']>): ProjectDetail {
+  /** Checks the recorder's authority and returns the authenticated member's name for the audit entry. */
+  checkReviewActor(project: Pick<Project, 'memberIds' | 'tasks'>, task: ProjectTask, review: ProjectReview, actorId: string | null, outcome: ReviewOutcome,
+    reviewerName?: string): string | undefined {
+    if (actorId === null) return
+    const actor = project.memberIds.includes(actorId) ? this.store.get(KV.projects.member(actorId)) : undefined
+    if (!actor || isProjectAgent(actor)) throw new ProjectError(403, '请由人工项目成员记录验证。')
+    const owner = task.ownerId === actorId
+    if (reviewerName && !owner) throw new ProjectError(403, '请由任务负责人代录他人的验证结论或反馈。')
+    const legacyReviewer = review.taskId && project.tasks.find(item => item.id === review.taskId)?.ownerId === actorId
+    if (owner && outcome !== 'feedback' && task.executionMode !== 'agent' && !legacyReviewer &&
+      (!reviewerName || reviewerName.toLowerCase() === actor.name.toLowerCase()))
+      throw new ProjectError(403, '请找其他人验证，或填写实际验证人再代录。')
+    return actor.name
+  }
+
+  /** Records feedback or settles exactly one current review, preserving the human evidence. */
+  decideReview(projectId: string, taskId: string, reviewId: string, outcome: ReviewOutcome, decision: ReviewEntry): ProjectDetail {
     return this.store.atomic(() => {
       const project = this.require(projectId)
       const task = requireRecord(project.tasks, taskId, 'Task')
       const review = currentReview(task)
       if (project.status === 'archived' || task.status !== 'in-review' || !review || review.id !== reviewId || review.status !== 'pending')
         throw new ProjectError(409, '这次验收已结束或交付已更新，请查看当前交付。')
+      const actorName = this.checkReviewActor(project, task, review, decision.actorId, outcome, decision.reviewerName)
+      const entry = { ...decision, ...(actorName && { actorName }) }
+      if (outcome === 'feedback') {
+        ;(review.feedback ??= []).push(entry)
+        task.updatedAt = decision.at
+        return this.save(project)
+      }
       const reviewTask = review.taskId ? requireRecord(project.tasks, review.taskId, 'Review task') : undefined
       if (reviewTask && !active(reviewTask)) throw new ProjectError(409, '当前验收任务已结束。')
       if (reviewTask?.blockedBy.some(id => project.tasks.find(item => item.id === id)?.status !== 'done'))
         throw new ProjectError(409, '请先完成验收任务的前置工作。')
-      if (decision.actorId !== null && (!project.memberIds.includes(decision.actorId) ||
-        (reviewTask ? reviewTask.ownerId : review.requirements.ownerId) !== decision.actorId))
-        throw new ProjectError(403, '请由这项任务当前指定的负责人验收。')
       if (task.blockedBy.some(id => project.tasks.find(item => item.id === id)?.status !== 'done'))
         throw new ProjectError(409, '前置验收已经变化，请先核对依赖。')
-      review.status = outcome; review.decision = decision
+      review.status = outcome; review.decision = entry
       if (reviewTask) {
         reviewTask.status = 'done'
         reviewTask.updatedAt = reviewTask.completedAt = decision.at

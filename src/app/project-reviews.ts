@@ -3,13 +3,14 @@ import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 import { key, type ChannelRef, type OutboundMessage } from '../core/index.ts'
 import type { ProjectEvent, ProjectEventDefinition } from '../sources/project-events.ts'
-import { currentReview, reviewReference, type DeliveryEvidence } from './project-deliveries.ts'
+import { currentReview, reviewReference, type DeliveryEvidence, type ReviewOutcome } from './project-deliveries.ts'
 import { announce } from './project-notifications.ts'
 import { ProjectError, Projects, type ProjectTask } from './projects.ts'
 import type { ProjectEvents } from './project-events.ts'
 import type { Store } from './store.ts'
 import { mergedDelivery } from './repository-delivery.ts'
 import { repositoryFactKey } from './repository-delivery.ts'
+import { isProjectAgent } from './project-member.ts'
 
 const id = z.string().min(1).max(300)
 const Context = z.strictObject({ projectId: id, actorId: id.nullable(), operationId: id,
@@ -20,15 +21,20 @@ export const ReviewEvidence = z.strictObject({ summary: z.string().trim().min(1)
   links: z.array(z.url({ protocol: /^https?$/ })).max(20).default([]) })
 const Evidence = ReviewEvidence.extend({ ticketId: id.optional(), reportAt: z.iso.datetime().optional() })
 const Request = z.strictObject({ context: Context, evidence: Evidence, basis: z.string(), silent: z.boolean().default(false),
+  // Older queued events can still carry this field; the new handler records their delivery inline as well.
   linkedTask: z.literal(true).optional() })
-const Decision = z.strictObject({ context: Context, reviewId: id, reason: z.string().trim().min(1).max(8000), links: ReviewEvidence.shape.links.optional() })
+export const ReviewInput = z.strictObject({ outcome: z.enum(['accepted', 'rejected', 'feedback']), reason: z.string().trim().min(1).max(8000),
+  reviewerName: z.string().trim().min(1).max(200).optional(), links: ReviewEvidence.shape.links.optional() })
+const Decision = ReviewInput.omit({ outcome: true }).extend({ context: Context, reviewId: id })
 export const TaskDelivery = ReviewEvidence.extend({ outcome: z.enum(['accepted', 'rejected']).optional() })
 function definition(type: string, description: string, schema: z.ZodType): ProjectEventDefinition {
   return { type, category: 'reviews', description, schema, defaults: { enabled: true }, documentation: 'docs/events/delivery.zh-CN.md' }
 }
-export const reviewRequested = definition('review.requested', '记录本版交付和验收条件，并通知任务负责人验收。', Request)
-export const reviewAccepted = definition('review.accepted', '当前负责人通过本版验收，完成任务并保留验收依据。', Decision)
-export const reviewRejected = definition('review.rejected', '当前负责人退回本版交付，保留原因并返回进行中。', Decision)
+export const reviewRequested = definition('review.requested', '记录本版交付和验证条件，并通知任务负责人安排验证。', Request)
+export const reviewAccepted = definition('review.accepted', '记录人工通过结论和依据，并完成原任务。', Decision)
+export const reviewRejected = definition('review.rejected', '记录人工退回结论和原因，原任务返回进行中。', Decision)
+export const reviewFeedback = definition('review.feedback', '把反馈附到当前交付版本，保持任务待验证。', Decision)
+const reviewEvents = { accepted: reviewAccepted, rejected: reviewRejected, feedback: reviewFeedback }
 const basis = (task: ProjectTask) => createHash('sha256').update(JSON.stringify([task.deliveryVersion, task.title, task.description,
   task.acceptance, task.ownerId, task.executionMode, task.blockedBy, task.status, task.ticketId, task.executionStartedAt])).digest('hex')
 interface Host { store: Store; events: ProjectEvents; notify(message: OutboundMessage): void }
@@ -38,10 +44,12 @@ export class ProjectReviews {
   private readonly projects: Projects
   constructor(private readonly host: Host) {
     this.projects = new Projects(host.store)
-    host.events.register('review', [reviewRequested, reviewAccepted, reviewRejected])
+    host.events.register('review', [reviewRequested, reviewAccepted, reviewRejected, reviewFeedback])
     host.events.handle(reviewRequested.type, event => this.apply(event, () => this.requested(event)))
-    for (const [definition, outcome] of [[reviewAccepted, 'accepted'], [reviewRejected, 'rejected']] as const)
+    for (const outcome of ['accepted', 'rejected', 'feedback'] as const) {
+      const definition = reviewEvents[outcome]
       host.events.handle(definition.type, event => this.apply(event, () => this.decided(event, outcome)))
+    }
   }
 
   reference(projectId: string, quoted: string): string | undefined {
@@ -58,7 +66,7 @@ export class ProjectReviews {
     if (replay) return replay
     if (context.channel.source !== 'execution' && task.executionMode === 'agent')
       throw new ProjectError(409, 'Agent 任务使用当前工单的成功交付报告发起验收。')
-    return this.publish(reviewRequested, context, taskId, { ...data, basis: basis(task), ...(silent ? {} : { linkedTask: true }) })
+    return this.publish(reviewRequested, context, taskId, { ...data, basis: basis(task) })
   }
 
   deliver(context: ReviewContext, taskId: string, input: z.input<typeof TaskDelivery>, quotedReviewId?: string) {
@@ -69,27 +77,27 @@ export class ProjectReviews {
       if (!outcome) throw new ProjectError(400, '请说明当前交付通过验收还是需要修改。')
       return this.decide(context, task.reviewOf.taskId, task.reviewOf.reviewId, outcome, summary, quotedReviewId, links)
     }
-    if (outcome) throw new ProjectError(400, '验收结论应提交到对应的验收任务。')
+    if (outcome) throw new ProjectError(400, '请在原任务的待验证交付版本上记录结论。')
     if (task.executionMode === undefined && context.actorId !== null && task.ownerId !== context.actorId)
       throw new ProjectError(403, '请由任务负责人提交结果。')
     return this.submit(context, taskId, { summary, links })
   }
 
-  decide(context: ReviewContext, taskId: string, reviewId: string, outcome: 'accepted' | 'rejected', reason: string, quotedReviewId?: string, links?: string[]) {
+  decide(context: ReviewContext, taskId: string, reviewId: string, outcome: ReviewOutcome, reason: string,
+    quotedReviewId?: string, links?: string[], reviewerName?: string) {
     context = Context.strip().parse(context)
     if (context.channel.source === 'execution') throw new ProjectError(403, '工单执行不能替代人工验收。')
     const { project, task } = this.authorize(context, taskId)
-    const definition = outcome === 'accepted' ? reviewAccepted : reviewRejected
-    const data = { reviewId, reason: Decision.shape.reason.parse(reason), ...(links?.length && { links }) }
+    const definition = reviewEvents[outcome]
+    const data = { reviewId, reason: Decision.shape.reason.parse(reason), ...(links?.length && { links }),
+      ...(reviewerName !== undefined && { reviewerName: Decision.shape.reviewerName.parse(reviewerName) }) }
     const replay = this.replay(definition, context, taskId, data)
     if (replay) return replay
     if (quotedReviewId && quotedReviewId !== reviewId) throw new ProjectError(409, '只能处理本条消息引用的验收，不能自动换成本版。')
     const review = currentReview(task)
     if (!review || task.status !== 'in-review' || review.id !== reviewId || review.status !== 'pending')
       throw new ProjectError(409, '引用的验收已结束或交付已更新，请查看当前交付。')
-    const reviewTask = review.taskId ? project.tasks.find(item => item.id === review.taskId) : undefined
-    if (context.actorId !== null && context.actorId !== (review.taskId ? reviewTask?.ownerId : review.requirements.ownerId))
-      throw new ProjectError(403, '请由这项任务当前指定的负责人验收。')
+    this.projects.checkReviewActor(project, task, review, context.actorId, outcome, data.reviewerName)
     return this.publish(definition, context, taskId, data)
   }
 
@@ -113,7 +121,8 @@ export class ProjectReviews {
     if (context.actorId === null) {
       if (!['request', 'execution'].includes(context.channel.source)) throw new ProjectError(403, '缺少有效的成员身份。')
     } else if (!project.memberIds.includes(context.actorId)) throw new ProjectError(403, '请先登记为这个项目的成员。')
-    if (context.channel.source === 'dingtalk' && context.channel.address.conversationId !== project.dingTalkGroup)
+    if (context.channel.source === 'dingtalk' && context.channel.address.conversationId !== project.dingTalkGroup ||
+      context.channel.source === 'feishu' && context.channel.address.chatId !== project.feishuChatId)
       throw new ProjectError(403, '这条验收消息来自另一个项目群。')
     const task = project.tasks.find(item => item.id === taskId)
     if (!task) throw new ProjectError(404, '任务不属于当前项目。')
@@ -142,7 +151,7 @@ export class ProjectReviews {
   }
 
   private requested(event: ProjectEvent) {
-    const { context, evidence, basis: expected, silent, linkedTask } = Request.parse(event.data)
+    const { context, evidence, basis: expected, silent } = Request.parse(event.data)
     const { project, task } = this.authorize(context, event.taskId!)
     if (basis(task) !== expected) throw new ProjectError(409, '提交后任务或交付已变化，请基于当前内容重新提交验收。')
     const merged = mergedDelivery(this.host.store, project, task)
@@ -156,28 +165,29 @@ export class ProjectReviews {
         throw new ProjectError(409, '该工单已不是当前有效交付。')
     }
     const code = merged && { url: merged.url, head: merged.head!, mergeCommit: merged.mergeCommit!, base: merged.base, updatedAt: merged.updatedAt }
-    const updated = this.projects.requestReview(project.id, task.id, { ...evidence, ...(code && { code }) }, event.recordedAt, linkedTask === true)
+    const updated = this.projects.requestReview(project.id, task.id, { ...evidence, ...(code && { code }) }, event.recordedAt)
     if (merged) this.host.store.set(repositoryFactKey(project.id, task.id, updated.tasks.find(item => item.id === task.id)!.deliveryVersion!, merged.url),
       { ...merged, deliveryVersion: updated.tasks.find(item => item.id === task.id)!.deliveryVersion!, projectId: project.id, taskId: task.id })
     const review = currentReview(updated.tasks.find(item => item.id === task.id)!)!
-    const reviewTask = review.taskId && updated.tasks.find(item => item.id === review.taskId)
-    const owner = updated.members.find(item => item.id === (reviewTask ? reviewTask.ownerId : review.requirements.ownerId))
+    const owner = updated.members.find(item => item.id === task.ownerId && !isProjectAgent(item))
     if (!silent) announce(this.host, updated, event.causeId ?? event.id, {
-      title: `「${project.name}」· ${task.title}`, status: `待验收${owner ? ` · ${owner.name}` : ''}`,
-      summary: '本版交付已保存，等待验收。',
-      action: reviewTask ? `请在「${reviewTask.title}」任务中提交检查结论。`
-        : owner ? `请 ${owner.name} 检查交付和验收条件，引用本消息说明通过依据或退回原因。` : '尚未指定负责人，请先明确本任务的验收分工。',
+      title: `「${project.name}」· ${task.title}`, status: '待验证',
+      summary: '本版交付已保存。',
+      action: owner ? `请 ${owner.name} 协调验证。验证人可引用本消息，在原任务上记录反馈或结论，负责人也可注明实际验证人后代录。`
+        : '验证人可引用本消息，在原任务上记录反馈或结论。',
       evidence: JSON.stringify({ result: evidence.summary, acceptance: review.requirements.acceptance, links: evidence.links }),
       reference: reviewReference(review), details: `项目看板 →「${project.name}」→「${task.title}」→ 交付与验收记录。`,
     }, owner)
     return { status: 'applied' as const }
   }
 
-  private decided(event: ProjectEvent, outcome: 'accepted' | 'rejected') {
-    const { context, reviewId, reason, links } = Decision.parse(event.data)
+  private decided(event: ProjectEvent, outcome: ReviewOutcome) {
+    const { context, reviewId, reason, links, reviewerName } = Decision.parse(event.data)
     const { task } = this.authorize(context, event.taskId!)
     const updated = this.projects.decideReview(context.projectId, task.id, reviewId, outcome,
-      { actorId: context.actorId, source: context.channel.source, reason, at: event.recordedAt, ...(links && { links }) })
+      { actorId: context.actorId, source: context.channel.source, reason, at: event.recordedAt, ...(links && { links }),
+        ...(reviewerName && { reviewerName }) })
+    if (outcome === 'feedback') return { status: 'applied' as const }
     const review = currentReview(updated.tasks.find(item => item.id === task.id)!)!
     if (!(context.replyOwner === 'agent' && context.channel.source === 'dingtalk' && context.channel.address.conversationId === updated.dingTalkGroup))
       announce(this.host, updated, event.id, `${reviewReference(review)}「${task.title}」${outcome === 'accepted' ? '验收通过，任务已完成。' : '已退回，任务返回进行中。'}\n原因：${reason.slice(0, 1200)}${outcome === 'rejected' ? '\n请按退回意见修订后再次提交交付。' : ''}`)

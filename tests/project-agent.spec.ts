@@ -141,7 +141,7 @@ it('preserves dependency gates and rolls back kickoff when dispatch fails', asyn
   expect(projects.detail(id)).toMatchObject({ status: 'planning', tickets: [] })
 })
 
-it('tells the Agent whether a reviewer is designated or a real delivery is awaiting review', async () => {
+it('distinguishes an active blocker from a delivered version awaiting verification', async () => {
   const { h, projects, id, member, assignee, change, propose, say } = await pilot()
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy,
@@ -162,7 +162,7 @@ it('tells the Agent whether a reviewer is designated or a real delivery is await
   propose.mockImplementationOnce(async prompt => {
     const context = JSON.parse(prompt.split('\n\n').at(-1)!).projectContext.project
     expect(context.tasks[2]).toMatchObject({ id: downstream.id, blockedBy: [upstream.id], status: 'todo' })
-    expect(context.tasks[1]).toMatchObject({ status: 'in-progress', deliveryReview: { status: 'not-requested', reviewerId: assignee.id } })
+    expect(context.tasks[1]).toMatchObject({ status: 'in-progress', deliveryReview: { status: 'not-requested', reviewerId: null } })
     expect(context.tickets).toContainEqual(expect.objectContaining({ id: ticketId, stage: 'person', action: 'answer', question }))
     expect(prompt).toContain('只有 deliveryReview.status=pending 才说正在等该版验收')
     return done('当前等 Robin 回传真机验证，交付尚未发起验收。')
@@ -177,11 +177,11 @@ it('tells the Agent whether a reviewer is designated or a real delivery is await
   const review = projects.detail(id).tasks[1]!.reviews!.at(-1)!
   propose.mockImplementationOnce(async prompt => {
     const context = JSON.parse(prompt.split('\n\n').at(-1)!).projectContext.project
-    expect(context.tasks[1]).toMatchObject({ status: 'in-review', deliveryReview: { status: 'pending', reviewId: review.id, reviewerId: assignee.id } })
+    expect(context.tasks[1]).toMatchObject({ status: 'in-review', deliveryReview: { status: 'pending', reviewId: review.id, reviewerId: null } })
     expect(context.tasks[2]).toMatchObject({ status: 'todo', blockedBy: [upstream.id] })
-    return done('交付已提交，等李顺阳验收。')
+    return done('交付已提交，等项目成员验证。')
   })
-  expect(await say('wait-for-review', '人工试用现在还在等什么？')).toMatchObject({ status: 'completed', steps: [], reply: '交付已提交，等李顺阳验收。' })
+  expect(await say('wait-for-review', '人工试用现在还在等什么？')).toMatchObject({ status: 'completed', steps: [], reply: '交付已提交，等项目成员验证。' })
 })
 
 it('uses the selected task repository and links the Issue without dispatching a worker', async () => {
