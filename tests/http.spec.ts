@@ -134,6 +134,7 @@ it('requires the HTTPS project proxy and valid credentials before serving the pu
     expect((await call(api, { ...apiHeaders, origin: 'https://other.example.com' })).status).toBe(403)
     expect((await call(api, { authorization })).status).toBe(403)
     expect(JSON.parse((await call(api, apiHeaders)).text)).toEqual([])
+    expect(JSON.parse((await call(`${api}/execution`, apiHeaders)).text)).toMatchObject({ deliveryReviewAvailable: false })
     expect((await call('/orchestrator/api/state', apiHeaders)).status).toBe(404)
   } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
 })
@@ -181,4 +182,25 @@ it('answers a prompt save that lost a race with 409, and a settings body over 12
   expect(await call('PUT', 'settings/executor', { value, revision: 0 })).toEqual({ status: 400,
     body: { error: `Request exceeds ${128 * 1024} bytes` } })
   expect(saves).toEqual([])
+})
+
+it('reports delivery review availability independently of execution and explains unavailable entry points', async () => {
+  const path = 'projects/project/tasks/task/reviews/review'
+  const preview = serve({ store: {}, projectExecution: () => ({ state: 'planning' }) })
+  expect(await preview('GET', 'projects/execution')).toEqual({ status: 200, body: {
+    state: 'planning', deliveryReviewAvailable: false,
+  } })
+  for (const endpoint of [path, 'projects/project/tasks/task/deliveries']) {
+    expect(await preview('POST', endpoint, {})).toEqual({ status: 409, body: {
+      error: '当前入口无法提交交付或验收。请在运行 Super Org 的电脑上使用本机项目面板。',
+    } })
+  }
+
+  const full = serve({ store: {}, projectExecution: () => ({ state: 'paused' }),
+    projectReviews: { decide: () => ({ outcome: 'accepted' }) } })
+  expect(await full('GET', 'projects/execution')).toEqual({ status: 200, body: {
+    state: 'paused', deliveryReviewAvailable: true,
+  } })
+  expect(await full('POST', path, { messageId: 'test', outcome: 'accepted', reason: 'Verified the delivery' }))
+    .toEqual({ status: 200, body: { outcome: 'accepted' } })
 })

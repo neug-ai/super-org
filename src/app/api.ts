@@ -52,7 +52,7 @@ export interface Api {
   'GET projects/events': { query: { projectId?: string; workspaceOnly?: boolean; limit?: number }; response: ProjectEvent[] }
   'POST projects': { body: ProjectInput; response: ProjectDetail }
   'GET projects/issue': { query: { url: string; projectId?: string }; response: { url: string; title: string } }
-  'GET projects/execution': { response: ProjectExecution }
+  'GET projects/execution': { response: ProjectExecution & { deliveryReviewAvailable: boolean } }
   'GET projects/agents': { response: RobotAgentSettings | null }
   'PUT projects/agents': { body: { planner: string }; response: RobotAgentSettings }
   'GET projects/recent-tickets': { response: ProjectTicket[] }

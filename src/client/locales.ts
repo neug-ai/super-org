@@ -460,6 +460,7 @@ const TEXT = {
   'project.deliveryLinks': ['产物链接（每行一个，可留空）', 'Artifact links (one per line, optional)'],
   'project.noCurrentReview': ['当前没有可处理的验收，请刷新任务。', 'No current review. Refresh the task.'],
   'project.localOperator': ['本地管理者', 'Local operator'],
+  'project.reviewEntryUnavailable': ['当前入口可以查看交付和验收记录。请在运行 Super Org 的电脑上打开本机项目面板，提交交付或验收结果。', 'You can view deliveries and reviews here. To submit a delivery or review, open the local project panel on the computer running Super Org.'],
   'project.localReviewHelp': ['此操作以本地管理者身份记录，只处理打开窗口时所见的这版交付。', 'Recorded as the local operator for the delivery shown when this dialog opened.'],
   'project.review.pending': ['待验证', 'Pending review'],
   'project.review.accepted': ['已通过', 'Accepted'],

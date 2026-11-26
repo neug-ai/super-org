@@ -99,7 +99,7 @@ it('opens project sections, sends a message and saves an internal task over HTTP
   const call = vi.fn(async (route: string, request?: { body: { change: { value: Pick<ProjectTask, 'title' | 'issueUrl'> } } }) => {
     if (route === 'GET projects') return [project]
     if (route === 'GET members') return []
-    if (route === 'GET projects/execution') return { state: 'ready', github: { authenticated: true, watchingRepository: true, repositories: [
+    if (route === 'GET projects/execution') return { deliveryReviewAvailable: true, state: 'ready', github: { authenticated: true, watchingRepository: true, repositories: [
       { repository: 'acme/shared', projects: 2, configured: false, health: { state: 'ready', detail: '' } },
       { repository: 'acme/separate', projects: 1, configured: false, health: { state: 'error', detail: 'Repository access denied' } },
     ] },
@@ -204,7 +204,7 @@ it('saves automatic checks in project settings and records progress from a waiti
     if (route === 'GET projects') return [project]
     if (route === 'GET members') return []
     if (route === 'GET projects/agents') return null
-    if (route === 'GET projects/execution') return { state: 'ready', planner: 'Codex' }
+    if (route === 'GET projects/execution') return { deliveryReviewAvailable: true, state: 'ready', planner: 'Codex' }
     if (route === 'POST projects/:id/tasks/:taskId/progress') {
       task.progress = [{ ...request!.body, id: 'entry', summary: String(request!.body.summary), links: [],
         messageId: 'web-1', author: '本地操作者', actorId: null, source: 'request', at: '2026-11-19T08:00:00Z' }]
@@ -244,7 +244,8 @@ it.each([
   ['accepted', zh['project.acceptTask']],
   ['feedback', zh['project.addReviewFeedback']],
   ['rejected', zh['project.rejectDelivery']],
-] as const)('opens the %s review form over HTTP and keeps the original delivery and request IDs on retry', async (outcome, label) => {
+  ['preview', undefined],
+] as const)('handles %s review actions according to entry-point capabilities', async (outcome, label) => {
   vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) })
   const task: ProjectTask = { id: 'task', title: 'Check delivery', status: 'in-review', priority: 'do',
     description: '', ownerId: null, milestoneId: null, blockedBy: [], dueDate: null, acceptance: 'Current criteria', ticketId: null,
@@ -257,7 +258,7 @@ it.each([
     if (route === 'GET projects') return [project]
     if (route === 'GET members') return []
     if (route === 'GET projects/agents') return null
-    if (route === 'GET projects/execution') return { state: 'ready' }
+    if (route === 'GET projects/execution') return { deliveryReviewAvailable: outcome !== 'preview', state: 'ready' }
     if (route === 'POST projects/:id/tasks/:taskId/reviews/:reviewId') throw new ApiError('This review has changed', 409)
     return project
   })
@@ -268,6 +269,18 @@ it.each([
     expect(detail.textContent).toContain('Actual evidence from this delivery')
     expect(detail.textContent).toContain('Original review criteria')
     expect(detail.querySelector('a[href="https://example.com/result"]')).not.toBeNull()
+    if (!label) {
+      expect(detail.textContent).toContain(zh['project.reviewEntryUnavailable'])
+      expect(detail.textContent).not.toContain(zh['project.rejectDelivery'])
+      expect(detail.textContent).not.toContain(zh['project.acceptTask'])
+      expect(detail.textContent).not.toContain(zh['project.addReviewFeedback'])
+      const status = detail.querySelector<HTMLSelectElement>('.dt-work-status select')!
+      expect([...status.options].find(option => option.value === 'done')?.disabled).toBe(true)
+      expect([...status.options].find(option => option.value === 'in-progress')?.disabled).toBe(true)
+      expect(detail.querySelector('[name="reviewerName"]')).toBeNull()
+      expect(call.mock.calls.some(([route]) => route.startsWith('POST '))).toBe(false)
+      return
+    }
     expect(detail.textContent).toContain(zh['project.rejectDelivery'])
     await act(async () => { [...detail.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === label)!.click() })
     const form = document.querySelector<HTMLFormElement>('[role="dialog"] form')!
@@ -289,7 +302,7 @@ it.each([
 
 it('opens workspace Agent status with an empty project list', async () => {
   const call = vi.fn(async (route: string) => {
-    if (route === 'GET projects/execution') return { state: 'ready', planner: 'Codex',
+    if (route === 'GET projects/execution') return { deliveryReviewAvailable: true, state: 'ready', planner: 'Codex',
       connections: { dingtalk: { state: 'ready' } }, agent: { main: 'idle', load: { running: 0, queued: 0, maxWorkers: 2 } } }
     if (route === 'GET projects/agents') return { selected: 'codex', agents: [] }
     return []

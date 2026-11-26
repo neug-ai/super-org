@@ -319,8 +319,13 @@ function TicketSelect({ t, call, ticketId, issue, related }: Basic & {
   </>
 }
 
-function TaskDetail({ t, project, task, execution, pending, editor, move, inspect, openTicket, showTitle = true }: Basic & {
-  project: ProjectDetail; task: ProjectTask; execution: ProjectExecution | undefined; pending: boolean; editor: (value: ProjectEditor) => void;
+function needsDeliveryAction(task: ProjectTask, status: ProjectTask['status']): boolean {
+  return status !== task.status && (status === 'done' || status === 'in-review' ||
+    (task.status === 'in-review' && status === 'in-progress'))
+}
+
+function TaskDetail({ t, project, task, execution, reviewAvailable, pending, editor, move, inspect, openTicket, showTitle = true }: Basic & {
+  project: ProjectDetail; task: ProjectTask; execution: ProjectExecution | undefined; reviewAvailable?: boolean; pending: boolean; editor: (value: ProjectEditor) => void;
   move: (status: ProjectTask['status']) => void; inspect: (task: ProjectTask) => void; openTicket?: (id: string) => void; showTitle?: boolean
 }) {
   const issue = task.issueUrl
@@ -411,15 +416,18 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, inspec
           <MarkdownContent t={t} text={reviewedDelivery.decision.reason} />
           {reviewedDelivery.decision.links?.map(url => <p key={url}><a href={url} target="_blank" rel="noreferrer">{url}</a></p>)}
         </div>}
-        {task.executionMode !== 'agent' && ['todo', 'in-progress'].includes(task.status) &&
-          <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'delivery' })}>{t('project.submitDelivery')}</Button>}
+        {task.executionMode !== 'agent' && ['todo', 'in-progress'].includes(task.status) && (reviewAvailable === true ?
+          <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'delivery' })}>{t('project.submitDelivery')}</Button> :
+          reviewAvailable === false && <p className="dt-hint">{t('project.reviewEntryUnavailable')}</p>)}
         {task.status === 'in-review' && reviewTask &&
           <Button variant="outline" size="sm" onClick={() => inspect(reviewTask)}>{t('project.openReviewTask')}</Button>}
         {task.status === 'in-review' && review?.status === 'pending' && <div className="dt-work-actions">
           <span>{t('project.tracking.awaitingReview', { version: review.version })}</span>
-          <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'feedback' })}>{t('project.addReviewFeedback')}</Button>
-          <Button variant="primary" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'accepted' })}>{t('project.acceptTask')}</Button>
-          <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'rejected' })}>{t('project.rejectDelivery')}</Button>
+          {reviewAvailable === true ? <>
+            <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'feedback' })}>{t('project.addReviewFeedback')}</Button>
+            <Button variant="primary" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'accepted' })}>{t('project.acceptTask')}</Button>
+            <Button variant="outline" size="sm" disabled={pending} onClick={() => editor({ ...base, type: 'review', outcome: 'rejected' })}>{t('project.rejectDelivery')}</Button>
+          </> : reviewAvailable === false && <p className="dt-hint">{t('project.reviewEntryUnavailable')}</p>}
         </div>}
         {!!task.reviews?.length && <section aria-label={t('project.deliveryHistory')}>
           <h4>{t('project.deliveryHistory')}</h4>
@@ -471,7 +479,8 @@ function TaskDetail({ t, project, task, execution, pending, editor, move, inspec
       <select className="dt-select" disabled={pending} aria-label={t('project.move', { title: task.title })} value={task.status}
         onChange={event => move(event.target.value as ProjectTask['status'])}>
         {TASK_STATES.map(state => <option key={state} value={state}
-          disabled={state === 'done' && (review?.status !== 'pending' || !!review.taskId) ||
+          disabled={reviewAvailable !== true && needsDeliveryAction(task, state) ||
+            state === 'done' && (review?.status !== 'pending' || !!review.taskId) ||
             state === 'in-review' && (task.executionMode === 'agent' || !!task.reviewOf) ||
             state === 'cancelled' && !!task.reviewOf}>{t(`project.state.${state}`)}</option>)}
       </select>
@@ -522,10 +531,10 @@ function ProjectConversation({ t, call, id }: Basic & { call: Call; id: string }
   </section>
 }
 
-function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directoryChanged, execution,
+function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directoryChanged, execution, reviewAvailable,
   section, selectSection }: Basic & {
   call: Call; id: string; directory: Member[]; openTicket?: (id: string) => void; changed: () => Promise<void>
-  directoryChanged: () => Promise<void>; execution: ProjectExecution | undefined
+  directoryChanged: () => Promise<void>; execution: ProjectExecution | undefined; reviewAvailable?: boolean
   section: ProjectSection; selectSection: (section: ProjectSection) => void
 }) {
   const { data: project, error, reload } = usePoll(() => call('GET projects/:id', { id }), [call, id])
@@ -583,6 +592,10 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
   }
   const moveTask = (task: ProjectTask, status: ProjectTask['status']) => {
     if (status === task.status) return
+    if (needsDeliveryAction(task, status) && reviewAvailable !== true) {
+      setFailure(t(reviewAvailable === false ? 'project.reviewEntryUnavailable' : 'loading'))
+      return
+    }
     const review = currentReview(task)
     if (task.reviewOf && (status === 'done' || status === 'in-review')) { setEditor({ type: 'delivery', task, revision: project.revision }); return }
     if (review?.taskId && (status === 'done' || (task.status === 'in-review' && status === 'in-progress'))) {
@@ -605,7 +618,7 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
     } catch (error) { setFailure(errorText(error)) } finally { setPending(false) }
   }
   const renderTask = (task: ProjectTask, showTitle: boolean) => <TaskDetail key={task.id}
-    t={t} project={project} task={task} execution={execution} pending={pending} editor={setEditor} openTicket={openTicket}
+    t={t} project={project} task={task} execution={execution} reviewAvailable={reviewAvailable} pending={pending} editor={setEditor} openTicket={openTicket}
     showTitle={showTitle} move={status => moveTask(task, status)} inspect={inspect} />
   const taskCounts = [project.tasks.filter(task => task.status !== 'cancelled').length,
     project.tasks.filter(task => task.status === 'in-progress').length, project.tasks.filter(task => task.status === 'in-review').length,
@@ -639,6 +652,7 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
       </select></Field>
     </Editor>; break
     case 'delivery': dialog = <Editor t={t} title={t('project.submitDelivery')} close={close} save={async data => {
+      if (reviewAvailable !== true) throw new Error(t('project.reviewEntryUnavailable'))
       await call('POST projects/:id/tasks/:taskId/deliveries', { id, taskId: editor.task.id,
         body: { messageId: field(data, 'messageId'), summary: field(data, 'summary'), links: field(data, 'links').split(/\s+/).filter(Boolean),
           ...(editor.task.reviewOf && { outcome: field(data, 'outcome') as 'accepted' | 'rejected' }) } })
@@ -678,6 +692,7 @@ function ProjectWorkspace({ t, call, id, directory, openTicket, changed, directo
     case 'review': dialog = <Editor t={t} title={t(editor.outcome === 'feedback' ? 'project.addReviewFeedback'
       : editor.outcome === 'accepted' ? 'project.acceptTask' : 'project.rejectDelivery')} close={close}
       save={async data => {
+        if (reviewAvailable !== true) throw new Error(t('project.reviewEntryUnavailable'))
         const review = currentReview(editor.task)
         if (!review) throw new Error(t('project.noCurrentReview'))
         await call('POST projects/:id/tasks/:taskId/reviews/:reviewId', { id, taskId: editor.task.id, reviewId: review.id,
@@ -907,7 +922,7 @@ export function ProjectsPage({ t, call, openTicket, openExecution }: Basic & { c
         </li>)}</ul>}
       </section> : selection ? <ProjectWorkspace key={selection} t={t} call={call} id={selection} directory={directory.data ?? []}
         openTicket={openTicket} changed={projects.reload} directoryChanged={directory.reload}
-        execution={execution.error ? undefined : execution.data} section={section} selectSection={setSection} />
+        execution={execution.error ? undefined : execution.data} reviewAvailable={execution.data?.deliveryReviewAvailable} section={section} selectSection={setSection} />
         : projects.data ? <section className="dt-work-empty dt-work-welcome">
           <Icon name="inbox" size={28} /><h2>{t('project.noProjects')}</h2><p>{t('project.welcome')}</p>
           <Button variant="primary" icon={<Icon name="plus" />} onClick={() => setCreating(true)}>{t('project.create')}</Button>

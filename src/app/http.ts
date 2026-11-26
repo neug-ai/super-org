@@ -194,6 +194,10 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     if (!host) throw new ProjectError(409, 'Start the full Super-Org service to run project tasks')
     return host
   }
+  const reviews = () => {
+    if (!host?.projectReviews) throw new ProjectError(409, '当前入口无法提交交付或验收。请在运行 Super Org 的电脑上使用本机项目面板。')
+    return host.projectReviews
+  }
   const ticketId = z.string().min(1).max(128)
   const events = () => {
     if (!host?.projectEvents) throw new ProjectError(409, 'Start the full Super-Org service to manage project events')
@@ -217,9 +221,9 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
       return host.communication.update({ projectId: project.id, actorId: null, operationId: value.requestId, channel }, value.revision, value.value, target)
     },
     'POST projects/:id/tasks/:taskId/deliveries': async ({ params, body }) => {
-      if (!host?.projectReviews) throw new ProjectError(409, '验收服务尚未启动。')
+      const reviewService = reviews()
       const { messageId, ...evidence } = TaskDelivery.extend({ messageId: ticketId }).parse(await body())
-      return host.projectReviews.deliver({ projectId: params.id, actorId: null, operationId: messageId,
+      return reviewService.deliver({ projectId: params.id, actorId: null, operationId: messageId,
         channel: { source: 'request', thread: params.id, address: { projectId: params.id } } }, params.taskId, evidence)
     },
     'POST projects/:id/tasks/:taskId/progress': async ({ params, body }) => {
@@ -233,9 +237,9 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
         channel: { source: 'request', thread: params.id, address: {} } }, params.taskId, focus)
     },
     'POST projects/:id/tasks/:taskId/reviews/:reviewId': async ({ params, body }) => {
-      if (!host?.projectReviews) throw new ProjectError(409, '验收服务尚未启动。')
+      const reviewService = reviews()
       const value = ReviewInput.extend({ messageId: ticketId }).parse(await body())
-      return host.projectReviews.decide({ projectId: params.id, actorId: null, operationId: value.messageId,
+      return reviewService.decide({ projectId: params.id, actorId: null, operationId: value.messageId,
         channel: { source: 'request', thread: params.id, address: { projectId: params.id } } }, params.taskId, params.reviewId, value.outcome,
         value.reason, undefined, value.links, value.reviewerName)
     },
@@ -295,7 +299,8 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     'POST projects': async ({ body }) => projects.create(ProjectInput.parse(await body())),
     'GET projects/issue': ({ query }) => runtime().projectIssue(z.string().trim().min(1).max(512).parse(query.url),
       z.string().min(1).max(128).optional().parse(query.projectId)),
-    'GET projects/execution': () => host?.projectExecution() ?? { state: 'planning' },
+    'GET projects/execution': () => ({ ...(host?.projectExecution() ?? { state: 'planning' }),
+      deliveryReviewAvailable: !!host?.projectReviews }),
     'GET projects/agents': () => host?.robotAgentSettings() ?? null,
     'PUT projects/agents': async ({ body }) => runtime().selectRobotPlanner(z.strictObject({ planner: z.string().min(1).max(80) }).parse(await body()).planner),
     'GET projects/recent-tickets': () => projects.recentTickets(),
