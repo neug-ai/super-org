@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { DWClient } from 'dingtalk-stream'
 import { KV } from '../src/kv.ts'
 import { Commands } from '../src/infra/commands.ts'
+import type { CalendarExecutor } from '../src/app/project-calendar.ts'
 import type { ProjectAgentRun } from '../src/app/project-agent.ts'
 import type { ProjectPlanner } from '../src/app/project-planning.ts'
 import { materialReference, resolveProjectReferences } from '../src/app/project-references.ts'
@@ -21,9 +22,9 @@ let host: Host | undefined
 afterEach(async () => { await host?.stop(); host = undefined })
 const call = (tool: string, args: unknown) => ({ tool, arguments: JSON.stringify(args) })
 const done = (reply = '已处理，请查看任务。') => ({ calls: [], reply })
-async function pilot(knowledgeDir?: string, proposeWithImage?: ProjectPlanner['proposeWithImage']) {
+async function pilot(knowledgeDir?: string, proposeWithImage?: ProjectPlanner['proposeWithImage'], calendar?: CalendarExecutor) {
   const propose = vi.fn(async (_prompt: string, _schema: object, _signal: AbortSignal): Promise<unknown> => done())
-  const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Test Agent', propose, proposeWithImage }, knowledgeDir)
+  const h = host = await startRuntime(undefined, undefined, undefined, undefined, undefined, { name: 'Test Agent', propose, proposeWithImage }, knowledgeDir, calendar)
   const projects = new Projects(h.runtime.store)
   const { id } = projects.create(ProjectInput.parse({ name: '2048 事件验收', status: 'planning', dingTalkGroup: 'test-group', autoAdvance: false }))
   projects.addDingTalkSender(id, 'test-corp', 'member', 'Robin')
@@ -941,4 +942,65 @@ it('ships a matching default JSON for the message event and its configuration do
   const defaults = JSON.parse(readFileSync(new URL('../config/events/dingtalk.defaults.json', import.meta.url), 'utf8'))
   expect(defaults.sources.dingtalk.on['project.message.received']).toEqual({ enabled: true, description: projectMessageReceived.description })
   expect(readFileSync(new URL(`../${projectMessageReceived.documentation}`, import.meta.url), 'utf8')).toContain('project.message.received')
+})
+
+it('queues a DingTalk meeting for its authorized sender, requires current mentions and does not duplicate a callback', async () => {
+  const create = vi.fn<CalendarExecutor['create']>().mockResolvedValue({ state: 'verified', eventId: 'event-id', roomCode: '123 456 789' })
+  const receipt = vi.fn<CalendarExecutor['receipt']>().mockResolvedValue({ state: 'uncertain' })
+  const { h, id, projects, assignee, change, propose } = await pilot(undefined, undefined,
+    { corpId: 'test-corp', organizers: ['member'], create, receipt })
+  change({ kind: 'add-member', memberId: assignee.id })
+  const send = vi.fn()
+  const kind = dingTalkKind(async message => { send(message) })
+  h.runtime.sources.register(kind)
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } } })
+  let receive!: (frame: { headers: { messageId: string }; data: string }) => Promise<void>
+  const callback = vi.spyOn(DWClient.prototype, 'registerCallbackListener').mockImplementation(function (this: DWClient, _topic, fn) {
+    receive = fn as typeof receive; return this
+  })
+  const ack = vi.spyOn(DWClient.prototype, 'socketCallBackResponse').mockImplementation(() => {})
+  try {
+    const bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, fetch,
+      undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, h.runtime.projectAgent))
+    const post = async (msgId: string, senderStaffId: string, includeAttendee = true) => {
+      await receive({ headers: { messageId: msgId }, data: JSON.stringify({ msgId, senderStaffId, conversationId: 'test-group',
+        conversationType: '2', isInAtList: true, senderCorpId: 'test-corp', robotCode: 'robot', chatbotUserId: 'bot', msgtype: 'text',
+        atUsers: [{ dingtalkId: 'bot' }, ...(includeAttendee ? [{ staffId: 'assignee' }] : [])],
+        text: { content: '请创建测试会议，邀请已 @ 的项目成员。' },
+        sessionWebhook: 'https://oapi.dingtalk.com/robot/send?fixture', sessionWebhookExpiredTime: Date.now() + 60_000 }) })
+      await h.runtime.idle()
+    }
+    const event = { title: '测试会议', start: new Date(Date.now() + 3_600_000).toISOString(),
+      end: new Date(Date.now() + 7_200_000).toISOString(), inviteMemberIds: [assignee.id] }
+    const action = { calls: [call('calendar.create_event', event)], reply: '' }
+    propose.mockImplementationOnce(async prompt => {
+      expect(prompt).toContain('calendar.create_event')
+      return { ...action, calls: [...action.calls, ...action.calls] }
+    }).mockResolvedValueOnce(done('日程请求已提交。'))
+    await post('calendar-ok', 'member')
+    await post('calendar-ok', 'member')
+    expect(create).toHaveBeenCalledExactlyOnceWith(expect.any(String),
+      expect.objectContaining({ projectId: id, organizer: 'member', attendees: ['assignee'], event }), expect.any(AbortSignal))
+    expect(send.mock.calls.filter(([message]) => message.text.includes('123 456 789'))).toHaveLength(1)
+
+    propose.mockResolvedValueOnce(action).mockResolvedValueOnce(done())
+    await post('calendar-without-mention', 'member', false)
+    propose.mockResolvedValueOnce(action).mockResolvedValueOnce(done())
+    await post('calendar-not-authorized', 'assignee')
+    expect(create).toHaveBeenCalledTimes(1)
+    const agent = h.runtime.projectAgent!
+    expect(agent.runs(id).find(run => run.message.nativeMessageId === 'calendar-without-mention')?.steps[0]?.error).toContain('明确 @')
+    expect(agent.runs(id).find(run => run.message.nativeMessageId === 'calendar-not-authorized')?.steps[0]?.error).toContain('已获授权')
+    // Recover an attempt interrupted after its write was started. It must only read the existing receipt.
+    const [attemptKey] = h.runtime.store.keys(KV.projects.calendarAttempt)
+    const saved = h.runtime.store.get(attemptKey!)!
+    h.runtime.store.set(KV.projects.calendarAttempt('interrupted'), { request: saved.request, state: 'started' })
+    h.runtime.effects.enqueue('project-calendar', 'interrupted', {})
+    await h.runtime.idle()
+    expect(receipt).toHaveBeenCalledWith('interrupted')
+    expect(h.runtime.store.get(KV.projects.calendarAttempt('interrupted'))?.receipt).toEqual({ state: 'uncertain' })
+    expect(create).toHaveBeenCalledTimes(1)
+    expect(bot).toBeDefined()
+  } finally { callback.mockRestore(); ack.mockRestore() }
 })

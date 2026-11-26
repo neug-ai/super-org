@@ -74,3 +74,11 @@ pnpm import:mission-control /path/to/mission-control/data /path/to/super-org-sta
 导入项目、任务、归档、目标和项目决定。目标映射为里程碑，首个顶层目标用作当前目标，无项目归属的记录进入导入收件箱。同一来源的已导入记录会被跳过。旧执行分派保留为任务文字，导入后由团队确认成员和分工。跨项目、缺失或成环的依赖需在源快照修正后重新导入。
 
 开发用 `pnpm check` 做完整检查。真实模型专项可使用 `CODEX_SMOKE_BINARY=/path/to/codex pnpm test tests/codex-harness.spec.ts -t 'real read-only'`，运行于隔离状态目录并使用模拟的钉钉输出。
+
+### 钉钉项目日程和会议
+
+先在服务主机安装 `manage-aliding-meetings` 技能及其 Python SDK 依赖。将技能所需的阿里云凭证保存在仅服务账号可读的环境文件中。
+
+用 `SUPERAGENT_DINGTALK_CALENDAR` 启用日程工具，参考 [配置示例](../.env.template)。配置包括 Python、技能目录、凭证文件的绝对路径，以及允许发起日程的钉钉企业 ID 和员工 ID。只添加已获准使用该凭证创建日程的发起人。
+
+在项目钉钉群明确要求创建会议，提供标题、日期、起止时间，并 @ 每位要邀请的已登记成员。只创建本人日程时可说明「不邀请其他人」。服务以消息发送者作为日历账号，调用技能创建带原生钉钉会议的日程，并在同一会话反馈读回核验的会议号。若请求结果不确定，先在钉钉日历核对。服务不会自动重复提交。

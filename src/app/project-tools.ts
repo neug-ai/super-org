@@ -20,6 +20,9 @@ import { explicitProjectMention, projectChannel } from './project-notifications.
 import { readConversation, searchConversation } from './project-conversation-history.ts'
 import type { ExecutionMaterials } from './project-references.ts'
 
+import { CalendarEvent, type ProjectCalendar } from './project-calendar.ts'
+import type { ProjectMessage } from '../sources/project-message.ts'
+
 const id = z.string().min(1).max(128)
 const editable = TaskInput.omit({ status: true, ticketId: true, executionMode: true })
 const patch = z.strictObject(Object.fromEntries(Object.entries(editable.shape)
@@ -35,6 +38,7 @@ export interface ProjectToolContext {
   channel: ChannelRef
   reviewId?: string
   text?: string
+  mentions?: ProjectMessage['mentions']
   event?: ProjectEvent
   /** Original files and links resolved for this turn by the project Agent. */
   executionMaterials?: ExecutionMaterials
@@ -53,6 +57,7 @@ export interface ProjectToolsHost {
   communication: Communication
   capabilities(channel?: ChannelRef): unknown
   knowledgeDir?: string
+  calendar?: ProjectCalendar
   authorizeHistory?(context: Pick<ProjectToolContext, 'channel' | 'actorId'>): boolean
   progress?(): ProjectProgress | undefined
   tracking?(): ProjectTracking
@@ -80,6 +85,13 @@ export class ProjectTools {
       if (!found) throw new ProjectError(404, 'Task does not belong to this project')
       return found
     }
+    const calendar = host.calendar
+    if (calendar) this.register(operation('calendar.create_event',
+      '仅在当前钉钉项目成员明确要求创建日程或会议，且标题、日期、起止时间和参会者已确认时调用。以发起者自己的日历创建带原生钉钉会议的日程。按当前时间与北京时间解析相对日期，开始和结束使用含时区偏移的 ISO 时间。inviteMemberIds 只选当前消息中明确要求邀请的 @ 成员 ID。未指明是否邀请或人员有歧义时先问清。成功提交后等待服务回执。',
+      CalendarEvent, (context, event) => {
+        if (context.event) throw new ProjectError(403, '自动事件不能创建日程。')
+        return { summary: calendar.request(context, event) }
+      }))
     this.register(operation('project.inspect', '读取当前项目、任务、执行报告、成员及团队目录。', z.strictObject({}), context => ({
       summary: '已读取项目现状', data: this.snapshot(context.projectId, context.channel),
     })))

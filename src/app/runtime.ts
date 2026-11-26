@@ -51,6 +51,7 @@ import { ProjectHistory } from './project-history.ts'
 import { ProjectEvents } from './project-events.ts'
 import { DeliveryReady, deliveryReady } from './events/delivery-ready.ts'
 import { TaskBlocked, taskBlocked } from './events/task-blocked.ts'
+import { ProjectCalendar, type CalendarExecutor } from './project-calendar.ts'
 import { ProjectAgent } from './project-agent.ts'
 import { ProjectTools } from './project-tools.ts'
 import { Communication } from './communication.ts'
@@ -128,7 +129,7 @@ export class Runtime extends Service implements SourceHost {
   constructor(ctx: Context, readonly machine: Machine, restart: () => void, private readonly notificationGroup?: string,
     received?: (trigger: Trigger) => void,
     workerDelivery?: (ticketId: string, deliveryId: string, triggerId: string) => { card_id: string; ticket_id: string; trigger_id: string } | undefined,
-    projectPlanner?: ProjectPlanner, private readonly robotAgents?: RobotAgents) {
+    projectPlanner?: ProjectPlanner, private readonly robotAgents?: RobotAgents, calendarExecutor?: CalendarExecutor) {
     super(ctx, 'orchestrator')
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
@@ -249,8 +250,10 @@ export class Runtime extends Service implements SourceHost {
         const planning = this.projectPlanning = new ProjectPlanning(store, effects, planner, message => outbox.send(message), this.lifetime)
         const issues = new ProjectIssues(store, effects, commands, message => outbox.send(message),
           () => setup.configured() && !!setup.deployment.github.cli)
+        const calendar = calendarExecutor && new ProjectCalendar(store, effects, calendarExecutor, message => outbox.send(message), this.lifetime,
+          channel => sources.channelAllowed(channel), () => setup.configured() && !this.paused() && !this.closing())
         const tools = this.projectTools = new ProjectTools({ store, issues, reviews: this.projectReviews, communication: this.communication,
-          capabilities: channel => this.runtimeCapabilities(channel), knowledgeDir: machine.knowledgeDir,
+          capabilities: channel => this.runtimeCapabilities(channel), knowledgeDir: machine.knowledgeDir, calendar,
           authorizeHistory: ({ channel, actorId }) => {
             if (!sources.channelAllowed(channel)) return false
             if (channel.source !== 'feishu') return true
