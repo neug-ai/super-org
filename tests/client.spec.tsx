@@ -84,7 +84,8 @@ it('routes board and matrix drops to distinct changes on the same Issue-linked t
   expect(movePriority).toHaveBeenCalledExactlyOnceWith(task, 'do')
 })
 
-it('opens one project section at a time and saves an internal task without an issue', async () => {
+it('opens project sections, sends a message and saves an internal task over HTTP', async () => {
+  vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) })
   const project: ProjectDetail = { id: 'workspace', name: 'Research', status: 'active', objective: '', description: '', repository: 'acme/research',
     revision: 0, createdAt: '', updatedAt: '', issueUrl: null, memberIds: [], members: [], tasks: [], milestones: [],
     decisions: [{ id: 'decision', question: 'Use main?', taskId: null, context: 'The baseline is stable.',
@@ -112,6 +113,7 @@ it('opens one project section at a time and saves an internal task without an is
       diskAvailableBytes: 1024 ** 3, diskLow: false, walLarge: false }
     if (route === 'GET projects/:id/conversation') return [{ id: 'turn-1', at: '2026-11-16T00:00:00Z',
       status: 'completed', text: 'What did we decide about the rollout?', reply: 'Start with the pilot group.' }]
+    if (route === 'POST projects/:id/messages') return { id: 'turn-2', status: 'queued' }
     if (route === 'POST projects/:id/changes') {
       project.tasks.push({ id: 'task', ...request!.body.change.value, description: '', status: 'todo', priority: 'eliminate',
         acceptance: '', ownerId: null, milestoneId: null, dueDate: null, blockedBy: [], ticketId: null,
@@ -129,7 +131,14 @@ it('opens one project section at a time and saves an internal task without an is
     expect(call.mock.calls.some(([route]) => route === 'GET projects/:id/conversation')).toBe(false)
     await act(async () => { nav(zh['project.conversation']).click() })
     expect(content()).toContain('Start with the pilot group.')
-    expect(page.container.querySelector('.dt-work-main textarea')).not.toBeNull()
+    const message = page.container.querySelector<HTMLTextAreaElement>('.dt-work-main textarea')!
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(message, 'What should I do next?')
+      message.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => { message.form!.requestSubmit() })
+    expect(call).toHaveBeenCalledWith('POST projects/:id/messages', { id: project.id,
+      body: { messageId: expect.any(String), text: 'What should I do next?' } })
     await act(async () => { nav(zh['project.decisions']).click() })
     expect(nav(zh['project.decisions']).getAttribute('aria-current')).toBe('page')
     expect(content()).toContain('Use the latest stable commit.')
@@ -186,6 +195,7 @@ it('opens one project section at a time and saves an internal task without an is
 })
 
 it('saves automatic checks in project settings and records progress from a waiting task', async () => {
+  vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) })
   const task: ProjectTask = { id: 'task', title: '试玩准备', status: 'todo', priority: 'do', description: '', ownerId: null,
     milestoneId: null, blockedBy: [], dueDate: null, acceptance: '', ticketId: null, issueUrl: null, createdAt: '', updatedAt: '', completedAt: null }
   const project: ProjectDetail = { id: 'project', name: 'Tracking', status: 'active', objective: '', description: '',
@@ -230,7 +240,12 @@ it('saves automatic checks in project settings and records progress from a waiti
   } finally { page.dispose() }
 })
 
-it('shows review evidence and retains the original delivery ID and request ID when a stale review form is retried', async () => {
+it.each([
+  ['accepted', zh['project.acceptTask']],
+  ['feedback', zh['project.addReviewFeedback']],
+  ['rejected', zh['project.rejectDelivery']],
+] as const)('opens the %s review form over HTTP and keeps the original delivery and request IDs on retry', async (outcome, label) => {
+  vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) })
   const task: ProjectTask = { id: 'task', title: 'Check delivery', status: 'in-review', priority: 'do',
     description: '', ownerId: null, milestoneId: null, blockedBy: [], dueDate: null, acceptance: 'Current criteria', ticketId: null,
     issueUrl: null, createdAt: '', updatedAt: '', completedAt: null, deliveryVersion: 1, reviews: [{ id: 'review-original', version: 1,
@@ -254,12 +269,13 @@ it('shows review evidence and retains the original delivery ID and request ID wh
     expect(detail.textContent).toContain('Original review criteria')
     expect(detail.querySelector('a[href="https://example.com/result"]')).not.toBeNull()
     expect(detail.textContent).toContain(zh['project.rejectDelivery'])
-    await act(async () => { [...detail.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === zh['project.acceptTask'])!.click() })
+    await act(async () => { [...detail.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === label)!.click() })
     const form = document.querySelector<HTMLFormElement>('[role="dialog"] form')!
     const reason = form.querySelector<HTMLTextAreaElement>('[name="reason"]')!
     expect(reason.required).toBe(true)
     reason.value = 'I checked this delivery against its criteria'
     const requestId = form.querySelector<HTMLInputElement>('[name="messageId"]')!.value
+    expect(requestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
     project.tasks = [{ ...task, deliveryVersion: 2, reviews: [{ ...task.reviews![0]!, id: 'review-new', version: 2 }] }]
     await act(async () => { form.requestSubmit() })
     expect(form.textContent).toContain('This review has changed')
@@ -267,7 +283,7 @@ it('shows review evidence and retains the original delivery ID and request ID wh
     const writes = call.mock.calls.filter(([route]) => route === 'POST projects/:id/tasks/:taskId/reviews/:reviewId')
     expect(writes).toHaveLength(2)
     for (const write of writes) expect(write[1]).toEqual({ id: 'project', taskId: 'task', reviewId: 'review-original',
-      body: { messageId: requestId, outcome: 'accepted', reason: 'I checked this delivery against its criteria' } })
+      body: { messageId: requestId, outcome, reason: 'I checked this delivery against its criteria' } })
   } finally { page.dispose() }
 })
 

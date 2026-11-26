@@ -3,7 +3,7 @@ import type { Member, MemberInput, Project, ProjectChange, ProjectDecision, Proj
 import { taskContext } from '../app/project-task-context.ts'
 import { currentReview } from '../app/project-deliveries.ts'
 import { isProjectAgent } from '../app/project-member.ts'
-import { usePoll, type Call } from './api.ts'
+import { newRequestId, usePoll, type Call } from './api.ts'
 import { ProjectHistory } from './project-history.tsx'
 import { AgentStatus } from './agent-status.tsx'
 import { WorkspaceRecords } from './workspace-records.tsx'
@@ -45,7 +45,7 @@ function Editor({ t, title, close, save, children, submitLabel }: Basic & {
 }) {
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
-  const [requestId] = useState(() => crypto.randomUUID())
+  const [requestId] = useState(newRequestId)
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (pending) return
@@ -489,7 +489,7 @@ function ProjectConversation({ t, call, id }: Basic & { call: Call; id: string }
     event.preventDefault()
     const message = text.trim()
     if (!message || pending) return
-    const messageId = draftId ?? crypto.randomUUID()
+    const messageId = draftId ?? newRequestId()
     setDraftId(messageId)
     setPending(true)
     setFailure('')
