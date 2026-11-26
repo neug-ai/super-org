@@ -7,9 +7,16 @@ export const MessageAttachment = z.strictObject({
   id, name: z.string().min(1).max(300), nativeMessageId: id, kind: z.literal('image').optional(),
 })
 export type MessageAttachment = z.output<typeof MessageAttachment>
+export const ProjectQuotePreview = z.strictObject({
+  title: z.string().trim().min(1).max(300).optional(),
+  summary: z.string().trim().min(1).max(1500).optional(),
+}).refine(value => !!(value.title || value.summary), 'A quote preview needs a title or summary')
+export type ProjectQuotePreview = z.output<typeof ProjectQuotePreview>
+
 export const ProjectMessage = z.strictObject({
   projectId: id, messageId: id, actorId: id.nullable(), text: z.string().trim().min(1).max(26000),
   quoted: z.string().max(16000).default(''),
+  quotedPreview: ProjectQuotePreview.optional(),
   reviewId: id.optional(),
   sentAt: z.iso.datetime().optional(),
   nativeMessageId: id.optional(),

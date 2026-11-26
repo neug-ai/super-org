@@ -9,7 +9,7 @@ import { enrollmentIntent, isMeetingMinutes, meetingClarification, meetingEviden
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream'
 import { z } from 'zod'
 import { type ProjectConversationSource, type SourceDelivery, type SourceKind } from './kind.ts'
-import { maxProjectAttachments, projectMessageReceived, type MessageAttachment, type ProjectMessage } from './project-message.ts'
+import { maxProjectAttachments, ProjectQuotePreview, projectMessageReceived, type MessageAttachment, type ProjectMessage } from './project-message.ts'
 import { DingTalkCards } from './dingtalk-cards.ts'
 import { AttachmentReadError, maxAttachmentBytes, readAttachmentText, supportedAttachment } from '../app/attachment-text.ts'
 import type { LinkedDocumentReader } from '../app/project-attachments.ts'
@@ -68,6 +68,7 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
     const mentions = Array.isArray(trigger.meta.mentionedStaffIds) ? trigger.meta.mentionedStaffIds.map(id => typeof id === 'string' ? id : null) : []
     const result = submitProjectConversation(agent, projects, projectId, memberId, corpId, {
       messageId: trigger.id, channel: trigger.channel, text: trigger.text,
+      quotedPreview: ProjectQuotePreview.safeParse(trigger.meta.quotedPreview).data,
       quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '',
       sentAt: trigger.at, nativeMessageId: typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined,
       replyToNativeMessageId: typeof trigger.meta.replyToMessageId === 'string' ? trigger.meta.replyToMessageId : undefined,
@@ -240,6 +241,22 @@ function quotedDocumentLinks(quote: z.output<typeof QuotedMessage> | undefined):
   return [...new Set(links)].slice(0, 3)
 }
 
+/** Forwarded chat history contains a preview in the callback, not the selected messages. */
+function chatRecordPreview(quote: z.output<typeof QuotedMessage> | undefined): ProjectQuotePreview | undefined {
+  if (quote?.msgType !== 'chatRecord') return
+  let content = quote.content
+  if (typeof content === 'string') {
+    if (content.length > 8192) return
+    try { content = JSON.parse(content) } catch { return }
+  }
+  if (!content || typeof content !== 'object') return
+  const { title, summary } = content as Record<string, unknown>
+  return ProjectQuotePreview.safeParse({
+    title: (typeof title === 'string' && title.trim().slice(0, 300)) || undefined,
+    summary: (typeof summary === 'string' && summary.trim().slice(0, 1500)) || undefined,
+  }).data
+}
+
 const DocumentNode = z.object({ name: z.string().min(1), nodeId: z.string().optional(),
   type: z.string(), category: z.string(), extension: z.string().optional() })
 const DownloadInfo = z.object({ headerSignatureInfo: z.object({
@@ -325,8 +342,9 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): {
   const id = key('dingtalk', message.robotCode, message.conversationId, message.msgId)
   const quote = quotedMessage(head)
   const documentLinks = quotedDocumentLinks(quote)
+  const preview = chatRecordPreview(quote)
   const replyToBot = !!quote?.senderId && !!message.chatbotUserId && quote.senderId === message.chatbotUserId
-  const botQuote = replyToBot ? quotedText(quote?.content) : ''
+  const botQuote = replyToBot && quote.msgType !== 'chatRecord' ? quotedText(quote.content) : ''
   const directReference = ticketReference(text)
   const reference = directReference ?? ticketReference(botQuote)
   const saved = reference ? context.state.get(tickets(message.conversationId, reference)) : undefined
@@ -350,6 +368,7 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): {
         ...(message.senderNick?.trim() ? { senderNick: message.senderNick.trim().slice(0, 200) } : {}),
         ...(quote ? { replyToMessageId: quote.msgId, replyToMessageType: quote.msgType, replyToBot } : {}),
         ...(documentLinks.length && { quotedDocumentLinks: documentLinks }),
+        ...(preview && { quotedPreview: preview }),
         ...(botQuote ? { replyToBotText: botQuote.slice(0, 8000) } : {}),
         ...(reference ? { referenceSource: directReference ? 'text' : 'quote' } : {}),
         ...(reference ? { ticketReference: reference, referenceResolved: matches.length === 1 } : {}) } },
