@@ -197,6 +197,8 @@ const TEXT = {
   'project.allTasks': ['所有任务', 'All tasks'],
   'project.notification.pending': ['等待发送', 'Pending delivery'],
   'project.notification.sent': ['接口已接受', 'Accepted by transport'],
+  'project.notification.nativeMention': ['原生 @', 'Native mention'],
+  'project.notification.textMention': ['文字提醒', 'Text reminder'],
   'project.notification.dropped': ['无法投递', 'Undeliverable'],
   'project.sync.pending': ['等待同步', 'Pending'],
   'project.sync.retrying': ['结果待确认 · 自动重试', 'Unconfirmed · retrying'],

@@ -127,12 +127,13 @@ export class ProjectHistory {
       return { event, label: label ?? (event.type === changed.type ? '项目变更已提交' : event.type === imported.type ? '存量基线已导入' : event.type),
         reason: event.reason || (typeof data.reason === 'string' ? data.reason : typeof data.text === 'string' ? data.text : undefined),
         ...(receipt && { delivery: { status: receipt.status, dropped: receipt.dropped,
+          ...(receipt.nativeMention !== undefined && { nativeMention: receipt.nativeMention }),
           failure: receipt.status === 'pending' ? this.store.receipts.failure(receipt.id) : undefined } }),
         decisions: linked.map((run: ProjectAgentRun) => ({ id: run.id, status: run.status, reply: run.reply, trigger: run.event?.type ?? 'project.message.received',
           steps: run.steps.map(step => ({ provider: step.provider, calls: step.calls, results: step.results, error: step.error })) })) }
     })
     return { entries, next: matched.length > events.length ? events.at(-1)!.seq : null,
-      notifications: this.store.receipts.forProject(projectId).map(item => ({ id: item.id, origin: item.origin!, status: item.status,
+      notifications: this.store.receipts.forProject(projectId).map(item => ({ id: item.id, origin: item.origin!, status: item.status, nativeMention: item.nativeMention,
         source: item.channel.source, format: item.format ?? 'text', text: item.text, dropped: item.dropped,
         ...(item.status === 'pending' && this.store.get(KV.projects.trackingReminder(item.id)) && { failure: this.store.receipts.failure(item.id) }) })),
       synchronization: this.store.keys(KV.projects.issueSync).map(entry => this.store.get(entry)!).filter(item => item.projectId === projectId),

@@ -7,18 +7,21 @@ import { type Agent } from '@deepseek-ai/dsh-agent'
 import { type ImageAttachmentRef, type ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-llm'
 import { type Commands, validItems, CliError, type Tally } from '../infra/commands.ts'
-import { type ContextMessage, type ThreadContext, type ChannelLink, type ChannelLinks, type Localized, type SourceKind } from './kind.ts'
+import { type ContextMessage, type ThreadContext, type ChannelLink, type ChannelLinks, type Localized, type SourceDelivery, type SourceKind } from './kind.ts'
 import { checkedImText, escapeRegExp } from '../infra/text.ts'
 import { type SourceContext, health, sourceContext } from './host.ts'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type FeishuBot, FeishuBotSchema } from '../deployment.ts'
-import { KV } from '../kv.ts'
+import { family, KV } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import { type Context } from '@deepseek-ai/cordis'
 import { type SourceRegistry } from './registry.ts'
-import { projectMessageReceived } from './project-message.ts'
+import { maxProjectAttachments, projectMessageReceived, type MessageAttachment } from './project-message.ts'
+import { AttachmentReadError, maxAttachmentBytes } from '../app/attachment-text.ts'
+import { tmpdir } from 'node:os'
+import { allowedSender } from '../policy.ts'
 
 // feishu-trigger: provider implementation
 export const SOURCE = 'feishu'
@@ -27,9 +30,9 @@ export const feishuChannel = (chatId: string, messageId: string, direct = false)
   ({ source: SOURCE, thread: `feishu:${chatId}`, address: { chatId, messageId, ...direct ? { direct: 'true' } : {} } })
 /** A message as the live event consumer prints it; the history and topic-page paths normalize what they read into this shape. */
 const EventSchema = z.object({ message_id: z.string(), chat_id: z.string(), chat_type: z.enum(['p2p', 'group']),
-  sender_id: z.string(), sender_type: z.enum(['user', 'bot']), content: z.string(), create_time: z.string(),
+  sender_id: z.string(), sender_name: z.string().optional(), sender_type: z.enum(['user', 'bot']), content: z.string(), create_time: z.string(),
   mentions: z.array(z.object({ id: z.string(), key: z.string().optional(), name: z.string().optional() })).default([]),
-  root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(), message_app_link: z.url().optional() })
+  msg_type: z.string().optional(), root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(), message_app_link: z.url().optional() })
 export type FeishuEvent = z.infer<typeof EventSchema>
 export const feishuThreadId = (chatId: string, rootId: string | undefined, messageId: string): string => `${chatId}:${rootId ?? messageId}`
 /** Deterministic trigger ID for a Feishu message; every read path for this message produces the same ID. */
@@ -67,7 +70,11 @@ export function feishuTrigger(input: unknown, botId: string, botAppId: string): 
     ...(direct ? { addressed: 'direct' as const } : mentioned ? { addressed: 'mention' as const } : {}),
     at: feishuTime(event.create_time), text: withMentionNames(event.content, event.mentions),
     channel: feishuChannel(event.chat_id, event.message_id, direct), ...(event.message_app_link ? { url: event.message_app_link } : {}),
-    meta: { chatId: event.chat_id, messageId: event.message_id, direct, mentioned, ...(event.root_id ? { rootId: event.root_id } : {}),
+    meta: { chatId: event.chat_id, messageId: event.message_id, direct, mentioned,
+      ...(event.sender_name?.trim() ? { senderName: event.sender_name.trim().slice(0, 200) } : {}),
+      ...(event.msg_type && event.msg_type !== 'text' ? { messageType: event.msg_type } : {}),
+      ...(event.mentions.length ? { projectMentionIds: event.mentions.map(item => item.id).filter(id => id !== botId && id !== botAppId) } : {}),
+      ...(event.root_id ? { rootId: event.root_id } : {}),
       ...(event.parent_id ? { parentId: event.parent_id } : {}), ...(event.thread_id ? { threadId: event.thread_id } : {}) } }
 }
 export const feishuParent = (trigger: Trigger): string | undefined =>
@@ -81,7 +88,7 @@ export function feishuRef(trigger: Trigger): FeishuRef | undefined {
 export const HistoricalMessageSchema = z.looseObject({
   message_id: z.string(), chat_id: z.string(), create_time: z.string(),
   root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(),
-  deleted: z.boolean().optional(), message_app_link: z.string().optional(),
+  deleted: z.boolean().optional(), message_app_link: z.string().optional(), msg_type: z.string().optional(),
   sender: z.looseObject({ id: z.string().default(''), sender_type: z.string() }),
   body: z.looseObject({ content: z.string() }).optional(),
   mentions: z.array(z.looseObject({ id: z.string(), key: z.string().optional(), name: z.string().optional() })).optional(),
@@ -101,7 +108,7 @@ export function historyText(message: HistoricalMessage): string {
 export function historyEvent(message: HistoricalMessage, chatId: string, direct: boolean): unknown {
   return { message_id: message.message_id, chat_id: chatId, chat_type: direct ? 'p2p' : 'group', create_time: message.create_time,
     sender_id: message.sender.id, sender_type: message.sender.sender_type === 'user' ? 'user' : 'bot', content: historyText(message),
-    mentions: message.mentions ?? [], root_id: message.root_id, parent_id: message.parent_id, thread_id: message.thread_id,
+    mentions: message.mentions ?? [], msg_type: message.msg_type, root_id: message.root_id, parent_id: message.parent_id, thread_id: message.thread_id,
     message_app_link: message.message_app_link }
 }
 /**
@@ -111,7 +118,7 @@ export function historyEvent(message: HistoricalMessage, chatId: string, direct:
 export function topicEvent(message: FeishuMessage, chatId: string, direct: boolean, root: string): unknown {
   return { message_id: message.message_id, chat_id: chatId, chat_type: direct ? 'p2p' : 'group', create_time: message.create_time,
     sender_id: message.sender.open_bot_id ?? message.sender.id, sender_type: message.sender.sender_type === 'user' ? 'user' : 'bot',
-    content: message.content ?? '', mentions: message.mentions ?? [], parent_id: message.parent_id, thread_id: message.thread_id,
+    content: message.content ?? '', msg_type: message.msg_type, mentions: message.mentions ?? [], parent_id: message.parent_id, thread_id: message.thread_id,
     root_id: message.root_id ?? (message.message_id === root ? undefined : root), message_app_link: message.message_app_link }
 }
 
@@ -119,6 +126,50 @@ export function topicEvent(message: FeishuMessage, chatId: string, direct: boole
 /** Extracts Feishu image keys from message text so keys remain paired with the originating message; arbitrary remote IDs are not accepted. */
 export function admissionImageKeys(text: string): string[] {
   return [...new Set(text.match(/\bimg_[a-zA-Z0-9_-]+\b/g) ?? [])]
+}
+type ProjectFile = MessageAttachment & { fileKey: string }
+const quotedProjectFiles = family<ProjectFile[], [string]>('feishu-project-files:')
+const attachmentDescriptor = ({ fileKey: _fileKey, ...attachment }: ProjectFile) => attachment
+function projectFiles(trigger: Trigger): ProjectFile[] {
+  const ref = feishuRef(trigger)
+  if (!ref) return []
+  let body: Record<string, unknown> | undefined
+  try { body = z.record(z.string(), z.unknown()).safeParse(JSON.parse(trigger.text)).data } catch {}
+  const fileKey = trigger.meta.messageType === 'file' && typeof body?.file_key === 'string' &&
+    /^file_[\w-]{1,240}$/.test(body.file_key) ? body.file_key : undefined
+  if (fileKey) return [{ id: key(ref.messageId, fileKey), nativeMessageId: ref.messageId, fileKey,
+    name: typeof body?.file_name === 'string' ? body.file_name.slice(0, 180) || '飞书附件' : '飞书附件' }]
+  if (!['image', 'post'].includes(String(trigger.meta.messageType)) && !body?.image_key) return []
+  const keys = [...admissionImageKeys(trigger.text)].slice(0, maxProjectAttachments)
+  return keys.map((fileKey, index) => ({ id: key(ref.messageId, fileKey), nativeMessageId: ref.messageId,
+    fileKey, kind: 'image', name: `图片 ${index + 1}` }))
+}
+
+function feishuDocumentLink(link: string): string | undefined {
+  const url = URL.parse(link)
+  if (!url || url.protocol !== 'https:' || url.username || url.password || url.port ||
+    !/^[\w-]+\.(?:feishu\.cn|larksuite\.com)$/i.test(url.hostname) ||
+    !/^\/docx\/[a-zA-Z0-9_-]{1,150}\/?$/.test(url.pathname)) return
+  return url.origin + url.pathname.replace(/\/$/, '')
+}
+
+const DocumentCollaborators = z.object({ items: z.array(z.object({ member_type: z.string(), member_id: z.string(), perm: z.string() })) })
+const DocumentText = z.object({ content: z.string().trim().min(1) })
+
+async function downloadMessageResource(commands: Commands, messageId: string, fileKey: string, type: 'image' | 'file',
+  stateDir: string, limit: number, signal: AbortSignal) {
+  const id = z.string().regex(/^om_[\w-]+$/).parse(messageId)
+  const directory = await mkdtemp(join(stateDir, 'message-resource-'))
+  try {
+    const result = z.object({ saved_path: z.string() }).parse(await commands.withSignal(signal).lark([
+      'im', '+messages-resources-download', '--message-id', id, '--file-key', fileKey, '--type', type, '--output', type === 'image' ? './image' : './file',
+    ], directory))
+    const path = await realpath(result.saved_path)
+    if (dirname(path) !== await realpath(directory)) throw new Error('Resource download returned a path outside its temporary directory')
+    const file = await stat(path)
+    if (!file.isFile() || file.size > limit) throw new Error('Message resource exceeds the byte limit or is not a regular file')
+    return { data: await readFile(path, { signal }), extension: extname(path).toLowerCase() }
+  } finally { await rm(directory, { recursive: true, force: true }) }
 }
 export interface AdmissionImage {
   source_message_id: string
@@ -138,26 +189,15 @@ export async function readAdmissionImage(agent: Agent, commands: Commands, ref: 
   const info = await llm.resolveModelInfo(provider, model, signal)
   if (!info.inputModalities?.includes('image')) throw new Error(`Model ${model} does not support image input; the image has not been inspected`)
   signal.throwIfAborted()
-  const directory = await mkdtemp(join(stateDir, 'admission-image-'))
-  try {
-    const result = z.object({ saved_path: z.string() }).parse(await commands.withSignal(signal).lark([
-      'im', '+messages-resources-download', '--message-id', messageId, '--file-key', imageKey, '--type', 'image', '--output', './image',
-    ], directory))
-    const path = await realpath(result.saved_path)
-    if (dirname(path) !== await realpath(directory)) throw new Error('Image download returned a path outside its temporary directory')
-    const mediaTypes: Record<string, ImageMediaType> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' }
-    const mediaType = mediaTypes[extname(path).toLowerCase()]
-    if (!mediaType) throw new Error('The downloaded resource is not a supported PNG/JPEG/WebP/GIF image')
-    const file = await stat(path)
-    if (!file.isFile() || file.size > Math.min(attachments.imageLimits.maxImageBytes, attachments.imageLimits.maxMessageImageBytes)) throw new Error('The image exceeds the deployment byte limit or is not a regular file')
-    const data = await readFile(path, { signal })
-    signal.throwIfAborted()
-    const image = await attachments.saveImage({ data, mediaType, name: `${imageKey}${extname(path)}` })
-    signal.throwIfAborted()
-    return { source_message_id: messageId, image_key: imageKey, image }
-  } finally {
-    await rm(directory, { recursive: true, force: true })
-  }
+  const { data, extension } = await downloadMessageResource(commands, messageId, imageKey, 'image', stateDir,
+    Math.min(attachments.imageLimits.maxImageBytes, attachments.imageLimits.maxMessageImageBytes), signal)
+  const mediaTypes: Record<string, ImageMediaType> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' }
+  const mediaType = mediaTypes[extension]
+  if (!mediaType) throw new Error('The downloaded resource is not a supported PNG/JPEG/WebP/GIF image')
+  signal.throwIfAborted()
+  const image = await attachments.saveImage({ data, mediaType, name: `${imageKey}${extension}` })
+  signal.throwIfAborted()
+  return { source_message_id: messageId, image_key: imageKey, image }
 }
 
 // feishu-read: provider implementation
@@ -331,16 +371,21 @@ export const feishuChatLink = (brand: 'feishu' | 'lark', chatId: string): string
 const gone = (error: unknown): boolean => error instanceof CliError && error.code !== undefined && (error.code === 230011
   || /withdrawn/i.test(error.message) || (Math.floor(error.code / 100) === 2300 && /not found/i.test(error.message)))
 /** Replies in the topic of the target message; Feishu keeps at most one reply per idempotency key (the outgoing message's `message.id`). */
-export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
+export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone' | SourceDelivery> {
   const { messageId, chatId, mentionUserId } = message.channel.address
   const text = checkedImText(message.text)
   let args: string[]
   if (messageId) args = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text, '--reply-in-thread']
-  else if (message.kind === 'notice' && /^oc_[\w-]+$/.test(chatId ?? '') && /^ou_[\w-]+$/.test(mentionUserId ?? '')) {
-    const content = `<at user_id="${mentionUserId}"></at> ${text.replaceAll('<', '＜')}`
+  else if (message.kind === 'notice' && /^oc_[\w-]+$/.test(chatId ?? '') && (!mentionUserId || /^ou_[\w-]+$/.test(mentionUserId))) {
+    const content = mentionUserId ? `<at user_id="${mentionUserId}"></at> ${text.replaceAll('<', '＜')}` : text
     args = ['im', '+messages-send', '--chat-id', chatId!, '--msg-type', 'text', '--content', JSON.stringify({ text: content })]
   } else throw new Error('Missing Feishu message target')
-  try { await host.commands.lark([...args, '--idempotency-key', message.id]) }
+  try {
+    const receipt = await host.commands.lark<{ message_id?: unknown } | undefined>([...args, '--idempotency-key', message.id])
+    if (typeof receipt?.message_id === 'string' && /^om_[\w-]{1,295}$/.test(receipt.message_id))
+      return { nativeMessageId: receipt.message_id, ...(mentionUserId && { nativeMention: !messageId }) }
+    if (mentionUserId) return { nativeMention: !messageId }
+  }
   catch (error) {
     if (gone(error)) return 'gone'
     throw error
@@ -625,6 +670,7 @@ const FeishuConfigSchema = FeishuBotSchema.extend({
     .default([]),
   directMessages: z.boolean().default(true),
   otherChats: z.enum(['none', 'mentions']).default('none'),
+  projectIntakeChat: z.string().regex(/^(oc_[a-zA-Z0-9]+)?$/).default(''),
 }).strict()
 export type FeishuConfig = z.infer<typeof FeishuConfigSchema>
 export const feishuKind: SourceKind<FeishuConfig> = {
@@ -645,14 +691,112 @@ export const feishuKind: SourceKind<FeishuConfig> = {
     { key: 'otherChats', type: 'select', label: { zh: '其他群', en: 'Other chats' }, options: [{ value: 'none', label: { zh: '不接收', en: 'Not received' } }, { value: 'mentions', label: { zh: '仅 @', en: '@ only' } }],
       hint: { zh: '机器人已加入、但没列在上面的群。“仅 @”接收那里 @ 机器人的消息；谁的消息能发起工作看策略里的准入。', en: 'Chats the bot has joined that are not listed above. "@ only" receives messages there that mention the bot; whose messages may originate work is the Policy\'s admission.' } },
     { key: 'directMessages', type: 'switch', label: { zh: '接收私聊', en: 'Direct messages' } },
+    { key: 'projectIntakeChat', type: 'text', pattern: '^(oc_[a-zA-Z0-9]+)?$', advanced: true,
+      label: { zh: '项目建项群', en: 'Project intake chat' },
+      hint: { zh: '可选。允许已获来源授权的成员在此群登记并提交首次会议纪要。', en: 'Optional chat for admitted members to enroll and submit initial project minutes.' } },
     { key: 'readPageSize', type: 'number', advanced: true, min: 1, max: 50, label: { zh: '每页消息数', en: 'Messages per page' }, hint: { zh: '智能体读取线程和群历史时，每页的消息数。', en: 'Messages per page when agents read Threads and chat history.' } },
     { key: 'linkTimeoutMs', type: 'number', advanced: true, min: 1, max: 90000, label: { zh: '原消息链接的查询时限 / 毫秒', en: 'Original message link time limit / ms' },
       hint: { zh: '查询原消息链接最多等待的时间；超时后智能体改为直接读取原消息。', en: 'How long to wait for an original message\'s link; after that, agents read the message itself.' } },
   ],
   health: ['feishu', 'history'],
   projectEvents: [projectMessageReceived],
+  projectConversation: {
+    binding: project => project.feishuChatId,
+    room: channel => channel.address.direct === 'true' ? undefined : channel.address.chatId,
+    channel(host, project, recipient) {
+      const chatId = project.feishuChatId
+      const appId = host.deployment.feishu?.appId
+      if (!chatId || !appId) return
+      const accounts = recipient?.accounts.filter(account => account.provider === SOURCE && account.scope === appId && /^ou_[\w-]+$/.test(account.accountId))
+      if (recipient && accounts?.length !== 1) return
+      return { source: SOURCE, thread: `feishu:${chatId}`, address: { chatId,
+        ...(accounts?.length ? { mentionUserId: accounts[0]!.accountId, mentionUserName: recipient!.name } : {}) } }
+    },
+    incoming(host, trigger) {
+      const appId = host.deployment.feishu?.appId
+      const nativeMessageId = trigger.channel?.address.messageId
+      const chatId = trigger.channel?.address.chatId
+      if (!appId || !nativeMessageId || !chatId || trigger.channel?.address.direct === 'true') return
+      const parent = typeof trigger.meta.parentId === 'string' ? trigger.meta.parentId : undefined
+      const quoted = parent ? host.triggers.get(feishuTriggerId(parent)) : undefined
+      const direct = projectFiles(trigger)
+      const sources = [...direct, ...(quoted?.channel?.thread === trigger.channel?.thread && quoted ? projectFiles(quoted) : [])]
+      const attachments = sources.slice(0, maxProjectAttachments).map(attachmentDescriptor)
+      return { scope: appId, ...(host.config<FeishuConfig>(SOURCE)?.projectIntakeChat === chatId && { intake: { feishuChatId: chatId } }),
+        senderName: typeof trigger.meta.senderName === 'string' ? trigger.meta.senderName : undefined,
+        mentioned: Array.isArray(trigger.meta.projectMentionIds)
+        ? trigger.meta.projectMentionIds.filter((id): id is string => typeof id === 'string') : [],
+        message: { nativeMessageId, replyToNativeMessageId: parent,
+          sourceUrl: /^https?:\/\//i.test(trigger.url ?? '') ? trigger.url : undefined, attachments,
+          ...(direct.length && trigger.meta.messageType === 'image' ? { attachmentOnly: true } : {}) } }
+    },
+    authorize(host, channel, member) {
+      const id = channel.address.projectSenderId
+      const appId = host.deployment.feishu?.appId
+      return !!id && !!appId && host.isAllowedSender?.({ source: SOURCE, id }) === true &&
+        member.accounts.some(account => account.provider === SOURCE && account.scope === appId && account.accountId === id)
+    },
+    async quotedAttachments(host, message, signal) {
+      const parent = message.replyToNativeMessageId
+      const original = host.triggers.get(message.messageId)
+      const ref = original && feishuRef(original)
+      const bot = host.deployment.feishu
+      if (!parent || !ref || !bot || original?.meta.parentId !== parent || host.triggers.get(feishuTriggerId(parent)) ||
+        original?.channel?.thread !== message.channel.thread) return []
+      try {
+        const result = await readFeishu(host.commands.withSignal(signal), ref, feishuReferences(ref).parent, 1)
+        const quote = 'message' in result ? result.message : undefined
+        if (!quote || quote.message_id !== parent || quote.chat_id !== ref.chatId) return []
+        const trigger = feishuTrigger(topicEvent(quote, ref.chatId, false, parent), bot.botId, bot.appId)
+        if (!trigger) return []
+        const files = projectFiles(trigger)
+        host.state.set(quotedProjectFiles(message.messageId), files)
+        return files.map(attachmentDescriptor)
+      } catch { signal.throwIfAborted(); return [] }
+    },
+    async attachment(host, message, attachment, signal) {
+      const current = host.triggers.get(message.messageId)
+      const original = host.triggers.get(feishuTriggerId(attachment.nativeMessageId))
+      if (!current || current.channel?.thread !== message.channel.thread ||
+        (attachment.nativeMessageId !== current.meta.messageId && current.meta.parentId !== attachment.nativeMessageId))
+        throw new AttachmentReadError('无法核对飞书附件的会话来源。')
+      const files = original?.channel?.thread === message.channel.thread ? projectFiles(original)
+        : host.state.get(quotedProjectFiles(message.messageId)) ?? []
+      const file = files.find(item => item.id === attachment.id && item.nativeMessageId === attachment.nativeMessageId)
+      if (!file) throw new AttachmentReadError('原飞书消息没有可验证的附件。')
+      try {
+        return (await downloadMessageResource(host.commands, file.nativeMessageId, file.fileKey,
+          file.kind === 'image' ? 'image' : 'file', tmpdir(), maxAttachmentBytes, signal)).data
+      } catch { signal.throwIfAborted(); throw new AttachmentReadError('飞书附件下载失败，请检查机器人权限或发送导出的副本。') }
+    },
+    document(host) {
+      return {
+        recognize: feishuDocumentLink,
+        async read(message, link, signal) {
+          const canonical = feishuDocumentLink(link)
+          const chat = message.channel.source === SOURCE && message.channel.address.chatId
+          if (!canonical || !chat || message.channel.address.direct === 'true')
+            throw new AttachmentReadError('请在该飞书文档已共享的项目群里请求读取。')
+          const token = new URL(canonical).pathname.split('/').at(-1)!
+          const commands = host.commands.withSignal(AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+          let collaborators: z.output<typeof DocumentCollaborators>
+          try { collaborators = DocumentCollaborators.parse(await commands.lark([
+            'api', 'GET', `/open-apis/drive/v1/permissions/${token}/members`, '--params', '{"type":"docx"}',
+          ])) } catch { signal.throwIfAborted(); throw new AttachmentReadError('无法核验飞书文档的群协作权限，请检查应用权限。') }
+          if (!collaborators.items.some(item => item.member_type === 'openchat' && item.member_id === chat
+            && ['view', 'edit', 'full_access'].includes(item.perm)))
+            throw new AttachmentReadError('文档未向当前飞书群授予阅读权限，请共享给本群或提供副本。')
+          try {
+            const { content } = DocumentText.parse(await commands.lark([
+              'api', 'GET', `/open-apis/docx/v1/documents/${token}/raw_content`,
+            ]))
+            return { name: '飞书文档', text: content.slice(0, 18_000), partial: content.length > 18_000 }
+          } catch { signal.throwIfAborted(); throw new AttachmentReadError('飞书文档正文读取失败，请检查机器人对该文档的读取权限。') }
+        },
+      }
+    },
+  },
   scope({ meta }, config) {
-    if (meta.projectConversation === true) return { listened: false, reason: 'Feishu project conversation' }
     if (meta.direct === true) return config.directMessages ? { listened: true, observed: false, row: 'direct' } : { listened: false, reason: 'direct_messages_not_allowed' }
     const chat = config.chats.find(item => item.chatId === meta.chatId)
     if (chat) return { listened: true, observed: chat.listen === 'all', row: chat.chatId }

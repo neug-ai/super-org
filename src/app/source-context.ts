@@ -19,6 +19,7 @@ export interface SourceContextDeps {
   readonly deployment: Deployment
   readonly ready: Promise<void>
   configured(): boolean
+  isAllowedSender?: SourceContext['isAllowedSender']
   projectRepositories?: SourceContext['projectRepositories']
   projectResources?: SourceContext['projectResources']
   /** Setup problem whose `place` matches the Source kind receives it on `context.problem`. */
@@ -42,6 +43,7 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
     commands: deps.commands,
     ready: deps.ready,
     configured: () => deps.configured(),
+    isAllowedSender: deps.isAllowedSender,
     projectRepositories: deps.projectRepositories,
     projectResources: deps.projectResources,
     outgoingMessage: id => {

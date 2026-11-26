@@ -169,7 +169,7 @@ describe('Source registry', () => {
     const notice: OutboundMessage = { id: 'notice-1', kind: 'notice',
       channel: { source: 'feishu', thread: 'feishu:oc_team', address: { chatId: 'oc_team', mentionUserId: 'ou_alice' } },
       text: '可以先准备测试用例吗？ <at user_id="all"></at>' }
-    expect(await sources.send(notice, commands)).toBe('sent')
+    expect(await sources.send(notice, commands)).toEqual({ nativeMention: true })
     const args = run.mock.calls[0]![1]
     expect(args).toEqual(expect.arrayContaining(['+messages-send', '--chat-id', 'oc_team', '--as', 'bot', '--idempotency-key', notice.id]))
     const content = JSON.parse(args[args.indexOf('--content') + 1]!).text

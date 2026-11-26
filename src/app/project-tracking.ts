@@ -315,7 +315,6 @@ export class ProjectTracking {
       const title = project.tasks.find(item => item.id === captured.taskId)!.title
       this.host.notify({ id: receiptId, kind: 'notice', channel,
         text: `「${title}」进展跟进\n\n${suggestion.question}\n\n${taskReference(captured.taskId)}`,
-        ...(channel.source === 'feishu' && { format: 'text' }),
         origin: { projectId: project.id, taskId: captured.taskId, eventId } })
       outcome({ ...proposal, state: 'queued', reason: '提醒已登记，实际投递以发送回执为准。', receiptId }, captured.taskId)
     })

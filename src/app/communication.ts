@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { projectWebChannel, type ProjectChannels } from './project-channels.ts'
 import { key, type ChannelRef, type OutboundMessage, type MessagePresentation } from '../core/index.ts'
 import { KV } from '../kv.ts'
 import type { ProjectEventDefinition } from '../sources/project-events.ts'
@@ -25,7 +26,7 @@ const scopeKey = (channel: Pick<ChannelRef, 'source' | 'thread'>) => key(channel
 const defaults: CommunicationPreference = { format: 'text', instruction: '先给结论，突出状态、负责人及下一步；详细证据留在任务详情。' }
 export interface PreferenceContext { projectId: string; actorId: string | null; channel: ChannelRef; operationId: string }
 interface Host {
-  store: Store; events: ProjectEvents; effects: Effects; outbox: Outbox
+  store: Store; channels: ProjectChannels; events: ProjectEvents; effects: Effects; outbox: Outbox
   planner(): ProjectPlanner | undefined
   lifetime: AbortSignal
   runnable(): boolean
@@ -67,6 +68,10 @@ export class Communication {
 
   read(channel: Pick<ChannelRef, 'source' | 'thread'>): ConversationPreference {
     return this.host.store.get(KV.communication.preference(scopeKey(channel))) ?? { revision: 0, value: defaults, actorId: null, updatedAt: '' }
+  }
+
+  projectChannel(projectId: string): ChannelRef {
+    return this.host.channels.target(new Projects(this.host.store).detail(projectId)) ?? projectWebChannel(projectId)
   }
 
   update(context: PreferenceContext, revision: number, value: CommunicationPreference, target = context.channel) {
@@ -123,14 +128,14 @@ export class Communication {
     if (!this.host.formats(context.target.source).includes(context.value.format)) throw new ProjectError(400, '当前消息适配器不支持这种格式，不能承诺已经启用。')
     const project = new Projects(this.host.store).detail(context.projectId)
     if (context.actorId === null && context.channel.source === 'request') {
-      if (context.target.source !== 'request' && !(context.target.source === 'dingtalk' && context.target.address.conversationId === project.dingTalkGroup))
+      if (context.target.source === 'request' ? context.target.thread !== project.id : !this.host.channels.matches(project, context.target))
         throw new ProjectError(403, '目标会话未绑定当前项目。')
       return
     }
     if (!context.actorId || !project.memberIds.includes(context.actorId)) throw new ProjectError(403, '请先登记为当前项目成员。')
     if (project.status === 'archived') throw new ProjectError(403, '项目已归档，请通过当前群绑定的项目调整会话设置。')
     if (context.target.source !== context.channel.source || context.target.thread !== context.channel.thread ||
-      context.channel.source === 'dingtalk' && context.channel.address.conversationId !== project.dingTalkGroup)
+      !this.host.channels.authorize(project, context.channel, project.members.find(item => item.id === context.actorId)!))
       throw new ProjectError(403, '只能调整当前项目群的沟通偏好。')
   }
 

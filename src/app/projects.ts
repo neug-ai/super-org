@@ -52,6 +52,7 @@ export const ProjectInput = z.strictObject({
   repository: ProjectRepository.nullable().optional(),
   dingTalkGroup: z.string().trim().min(1).max(300).nullable().optional(),
   feishuChatId: z.string().trim().max(300).regex(/^oc_[a-zA-Z0-9]+$/).nullable().optional(),
+  conversationBindings: z.record(z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), z.string().trim().min(1).max(300)).optional(),
   autoAdvance: z.boolean().optional(),
   tracking: TrackingSchedule.nullable().optional(),
 })
@@ -225,6 +226,16 @@ export class Projects {
       throw new ProjectError(409, 'This DingTalk group is already linked to another project')
   }
 
+  private checkConversationBindings(bindings: Project['conversationBindings'], projectId?: string): void {
+    if (!bindings) return
+    if ('dingtalk' in bindings || 'feishu' in bindings || 'request' in bindings)
+      throw new ProjectError(400, '请使用钉钉或飞书的现有群绑定字段。')
+    for (const project of this.records(KV.projects.project)) {
+      if (project.id !== projectId && Object.entries(bindings).some(([source, address]) => project.conversationBindings?.[source] === address))
+        throw new ProjectError(409, '群会话已经绑定到其他项目。')
+    }
+  }
+
   memberForAccount(projectId: string, provider: string, scope: string, accountId: string): Member | undefined {
     const project = this.require(projectId)
     const member = this.directoryMemberForAccount(provider, scope, accountId)
@@ -237,18 +248,26 @@ export class Projects {
   }
 
   registerDingTalkSender(corpId: string, staffId: string, name: string): { member: Member; added: boolean } {
+    return this.registerAccountSender('dingtalk', corpId, staffId, name)
+  }
+
+  registerAccountSender(provider: string, scope: string, accountId: string, name: string): { member: Member; added: boolean } {
     return this.store.atomic(() => {
-      const existing = this.directoryMemberForAccount('dingtalk', corpId, staffId)
+      const existing = this.directoryMemberForAccount(provider, scope, accountId)
       return existing ? { member: existing, added: false } : { added: true,
-        member: this.saveMember(MemberInput.parse({ name, accounts: [{ provider: 'dingtalk', scope: corpId, accountId: staffId }] })) }
+        member: this.saveMember(MemberInput.parse({ name, accounts: [{ provider, scope, accountId }] })) }
     })
   }
 
-  /** Enroll a sender observed by the configured project group, using the platform identity across projects. */
   addDingTalkSender(projectId: string, corpId: string, staffId: string, name: string): { projectName: string; added: boolean } {
+    return this.addAccountSender(projectId, 'dingtalk', corpId, staffId, name)
+  }
+
+  /** Enroll a sender observed by the configured project group, using the platform identity across projects. */
+  addAccountSender(projectId: string, provider: string, scope: string, accountId: string, name: string): { projectName: string; added: boolean } {
     return this.store.atomic(() => {
       const project = this.require(projectId)
-      const { member } = this.registerDingTalkSender(corpId, staffId, name)
+      const { member } = this.registerAccountSender(provider, scope, accountId, name)
       if (project.memberIds.includes(member.id)) return { projectName: project.name, added: false }
       project.memberIds.push(member.id)
       this.save(project)
@@ -316,6 +335,7 @@ export class Projects {
     return this.store.atomic(() => {
       this.checkDingTalkGroup(value.dingTalkGroup)
       this.checkFeishuChat(value.feishuChatId)
+      this.checkConversationBindings(value.conversationBindings)
       const at = isoNow()
       const project = { ...value, repository: value.repository ?? null, ...(value.repository && { repositoryLinkedAt: at }),
         issueUrl: null, id: randomUUID(), revision: 0, createdAt: at, updatedAt: at,
@@ -562,6 +582,7 @@ export class Projects {
         case 'project':
           this.checkDingTalkGroup(change.value.dingTalkGroup, project.id)
           this.checkFeishuChat(change.value.feishuChatId, project.id)
+          this.checkConversationBindings(change.value.conversationBindings, project.id)
           if (change.value.repository !== undefined && change.value.repository !== project.repository)
             project.repositoryLinkedAt = change.value.repository ? at : undefined
           for (const [key, value] of Object.entries(change.value)) {

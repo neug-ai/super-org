@@ -36,7 +36,7 @@ CODEX_SANDBOX=workspace-write
 
 当前机器人处理群内 @ 消息。建项入口群在绑定项目之前，`登记项目成员`（也可说「把我登记加入」）和 `项目会议纪要：…` 走建项流程，其他 @ 消息按钉钉来源准入规则交给通用 Agent。普通问答可直接回复，并延续当前群最近的问答。项目群成员也可直接聊天或查询知识库。配置 `SUPERAGENT_KNOWLEDGE_DIR` 可让项目 Agent 只读查阅该目录下的 Markdown。引用任务、交付或卡片时，客户端需提供可解析的引用字段。可在正文带任务短引用或明确名称。同一项目的后续通知按实际群绑定发送。会话 webhook 过期时由应用群发送接口投递，需要相应权限。项目回复支持会话级 Markdown 偏好。 [沟通事件](events/communication.zh-CN.md)
 
-`DINGTALK_CARD_TEMPLATE_ID` 用于可选的回执卡片。 `DINGTALK_GITHUB_NOTIFY_CONVERSATION_ID` 是独立 GitHub 通知与本地通用请求的回复群，不是每个项目的群绑定。 [钉钉卡片配置](../cards/README.md)
+`DINGTALK_CARD_TEMPLATE_ID` 启用钉钉卡片。定时跟进会尝试原生 @ 已绑定钉钉账号的负责人。会话 webhook 过期后，机器人通过卡片发送原生 @。此时如果未配置卡片，会发送标有成员姓名的文字提醒，实际结果可在「推进记录 → 通知回执」查看。 `DINGTALK_GITHUB_NOTIFY_CONVERSATION_ID` 供独立 GitHub 通知和本地通用请求使用，项目群在各自的项目设置中绑定。 [钉钉卡片配置](../cards/README.md)
 
 每条外部输入使用自己的卡片。任务拆分、交接和投递重试沿用这条输入的卡片。执行工单从当前输入的 `reply_card` 读取 `card_id`，通过 `orchestrator_report` 将它交给负责回复的主会话。每张卡片需要一次处理确认和明确的最终回复，等待回执由传输层自动发送。工单交接后由接手方继续处理原卡片。
 

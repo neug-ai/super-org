@@ -41,7 +41,7 @@ it('routes a real local worker blocker to its project group with the actual memb
   await report(); await h.runtime.idle()
   expect(events()).toMatchObject([{ source: 'execution', status: 'applied', data: { ticketId, assignmentId: expect.any(String) } }])
   expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ kind: 'notice', text: expect.stringContaining('正在等待人工回答'),
-    channel: expect.objectContaining({ source: 'dingtalk', address: { conversationId: 'project-group', mentionUserId: 'owner', mentionUserName: 'Owner' } }) }))
+    channel: expect.objectContaining({ source: 'dingtalk', address: expect.objectContaining({ conversationId: 'project-group', mentionUserId: 'owner', mentionUserName: 'Owner' }) }) }))
   expect(send.mock.calls[0]?.[0]).toMatchObject({ text: expect.stringContaining('可写的工作目录') })
   expect(projects.detail(id).tasks[0]).toMatchObject({ status: 'in-progress' })
   expect(h.runtime.store.tickets.get(ticketId)?.ended).toBeUndefined()

@@ -19,6 +19,28 @@ const Receipt = z.object({
   error_code: z.string().optional(),
 })
 
+export function dingTalkCalendarIdentity(corpId: string, organizers: readonly string[]):
+  Pick<CalendarExecutor, 'provider' | 'label' | 'timeZone' | 'organizer' | 'attendee' | 'legacyScope'> {
+  const matching = (account: { provider: string; scope: string }) => account.provider === 'dingtalk' && account.scope === corpId
+  return {
+    provider: 'dingtalk', label: '钉钉', timeZone: 'Asia/Shanghai',
+    organizer(context, project, trigger, member) {
+      const { channel, messageId } = context
+      if (!trigger?.human || trigger.source !== 'dingtalk' || trigger.actor.source !== 'dingtalk' ||
+        channel.address.triggerId !== messageId || channel.address.conversationId !== project.dingTalkGroup ||
+        trigger.channel?.thread !== channel.thread || trigger.meta.conversationId !== project.dingTalkGroup ||
+        trigger.meta.senderCorpId !== corpId || !organizers.includes(trigger.actor.id) ||
+        !member.accounts.some(account => matching(account) && account.accountId === trigger.actor.id)) return
+      return { id: trigger.actor.id, scope: corpId }
+    },
+    attendee(member, scope) {
+      const accounts = scope === corpId ? member.accounts.filter(matching) : []
+      return accounts.length === 1 ? accounts[0]!.accountId : undefined
+    },
+    legacyScope: trigger => typeof trigger?.meta.senderCorpId === 'string' ? trigger.meta.senderCorpId : undefined,
+  }
+}
+
 /** Runs only the administrator-selected skill entry point. Credentials remain in its local environment file. */
 export function alidingCalendar(raw: string | undefined, stateDir: string, actionsScript: string): CalendarExecutor | undefined {
   if (!raw?.trim()) return
@@ -68,7 +90,7 @@ export function alidingCalendar(raw: string | undefined, stateDir: string, actio
     return receipt(id, request)
   }
   return {
-    corpId: config.corpId, organizers: config.organizers, receipt,
+    ...dingTalkCalendarIdentity(config.corpId, config.organizers), receipt,
     create(id, request, signal) {
       const { title, start, end } = request.event!
       return execute(id, request, script, [`--title=${title}`, `--start=${start}`, `--end=${end}`], signal)

@@ -20,6 +20,10 @@
 
 在项目设置填写飞书群 `chat_id`，并在飞书来源设置中允许接收该群。把成员的飞书外部账号登记为 `provider=feishu`、`scope=机器人应用的 app_id`、`accountId=该应用下成员的 open_id`。来源策略允许发起工作的项目成员可以在该群内 @ 机器人进入项目会话。已订阅工单线程仍按原有工单路径处理。已有飞书机器人连接是使用这一入口的前提。
 
+飞书来源的高级配置可指定一个项目建项群。该群还需允许接收机器人消息，发起者须在来源授权名单中。成员登记后可以提交首次项目纪要，沿用项目层的建项流程。
+
+飞书项目群可以引用图片、普通附件，或分享新版飞书文档链接。读取在线文档时，当前群必须在文档协作者中具有阅读权限，应用需有读取协作者列表和文档正文的权限。交付通知会在当前项目群发送，可以引用通知并 @ 机器人记录该版本的验收。 [飞书协作者接口](https://open.feishu.cn/document/server-docs/docs/permission/permission-member/list) [飞书文档接口](https://open.feishu.cn/document/ukTMukTMukTM/uUDN04SN0QjL1QDN/docs)
+
 ## 默认配置
 
 [默认 JSON](../../config/events/dingtalk.defaults.json) 提供内置指导。使用空配置即可采用默认值，也可以只填写：
@@ -143,7 +147,7 @@ Agent 的每轮项目快照包含当前会话偏好和真实运行能力。`runt
 
 ## 钉钉呈现
 
-有效会话 Webhook 按消息格式发送文本或 Markdown，并用正文标记和 `at.atUserIds` 触发原生 @。会话 Webhook 不可用时，需要 @ 成员的主动通知会使用已配置的卡片模板，通过群投放接口提交成员 ID 和姓名。未配置卡片模板时，应用群发接口发送普通文本或 Markdown，并在有姓名时把它写入正文。这一路径仅显示收件人姓名。
+有效会话 Webhook 按消息格式发送文本或 Markdown，并用正文标记和 `at.atUserIds` 触发原生 @。会话 Webhook 不可用时，需要 @ 成员的主动通知会使用已配置的卡片模板，通过群投放接口提交成员 ID 和姓名。未配置卡片模板时，应用群发接口会明确把它标为文字提醒，并显示收件人姓名。「推进记录 → 通知回执」会标出实际使用了原生 @ 还是文字提醒。
 
 在实际群中验收标题、加粗和 @ 的呈现。 [卡片配置](../../cards/README.md) [应用群发接口](https://dingtalk.apifox.cn/api-140274320) [钉钉卡片投放接口](https://open.dingtalk.com/document/orgapp/create-and-deliver-cards)
 

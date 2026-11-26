@@ -17,6 +17,7 @@ export const taskBlocked: ProjectEventDefinition = {
 }
 export interface ProjectBlockage { ticketId: string; assignmentId: string; signature: string; noticeId: string }
 interface Host {
+  channels: import('../project-channels.ts').ProjectChannels
   store: Store
   events: ProjectEvents
   notify(message: OutboundMessage): void

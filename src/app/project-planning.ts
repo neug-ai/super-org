@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { key, type ChannelRef, type OutboundMessage } from '../core/index.ts'
 import { KV } from '../kv.ts'
+import type { IntakeBinding } from './project-intake.ts'
 import type { Effects } from './effects.ts'
 import { ProjectChange, ProjectError, ProjectInput, Projects, TaskInput, type Member, type ProjectDecision, type ProjectDetail, type ProjectMeetingReply } from './projects.ts'
 import { taskReference } from './project-task-context.ts'
@@ -91,12 +92,14 @@ export class ProjectPlanning {
   get planner(): ProjectPlanner { return typeof this.provider === 'function' ? this.provider() : this.provider }
 
   /** Create a planning-only project from confirmed metadata and queue its first discussion in the same transaction. */
-  submitFirstMinutes(metadata: Pick<ProjectInput, 'name' | 'repository' | 'dingTalkGroup'>, message: MeetingMessage) {
+  submitFirstMinutes(metadata: Pick<ProjectInput, 'name' | 'repository'> & IntakeBinding, message: MeetingMessage) {
     return this.store.atomic(() => {
       const memberId = message.memberId
       if (!memberId || !this.store.get(KV.projects.member(memberId))) return
       const value = ProjectInput.parse({ ...metadata, status: 'planning', autoAdvance: false })
-      const existing = value.dingTalkGroup && this.projects.forDingTalkGroup(value.dingTalkGroup)
+      const existing = this.store.keys(KV.projects.project).map(key => this.store.get(key)!).find(project => project.status !== 'archived' &&
+        (value.dingTalkGroup && value.dingTalkGroup === project.dingTalkGroup || value.feishuChatId && value.feishuChatId === project.feishuChatId ||
+          Object.entries(value.conversationBindings ?? {}).some(([source, room]) => project.conversationBindings?.[source] === room)))
       if (existing) return this.submitMinutes({ ...message, projectId: existing.id })
       const project = this.projects.create(value)
       this.projects.change(project.id, ProjectChange.parse({ revision: project.revision, change: { kind: 'add-member', memberId } }))
