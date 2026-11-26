@@ -20,7 +20,7 @@ import { explicitProjectMention, projectChannel } from './project-notifications.
 import { readConversation, searchConversation } from './project-conversation-history.ts'
 import type { ExecutionMaterials } from './project-references.ts'
 
-import { CalendarEvent, type ProjectCalendar } from './project-calendar.ts'
+import { CalendarChange, CalendarEvent, CalendarInvite, CalendarTarget, type ProjectCalendar } from './project-calendar.ts'
 import type { ProjectMessage } from '../sources/project-message.ts'
 
 const id = z.string().min(1).max(128)
@@ -86,12 +86,44 @@ export class ProjectTools {
       return found
     }
     const calendar = host.calendar
-    if (calendar) this.register(operation('calendar.create_event',
-      '仅在当前钉钉项目成员明确要求创建日程或会议，且标题、日期、起止时间和参会者已确认时调用。以发起者自己的日历创建带原生钉钉会议的日程。按当前时间与北京时间解析相对日期，开始和结束使用含时区偏移的 ISO 时间。inviteMemberIds 只选当前消息中明确要求邀请的 @ 成员 ID。未指明是否邀请或人员有歧义时先问清。成功提交后等待服务回执。',
-      CalendarEvent, (context, event) => {
-        if (context.event) throw new ProjectError(403, '自动事件不能创建日程。')
-        return { summary: calendar.request(context, event) }
-      }))
+    if (calendar) {
+      const humanCalendar = (context: ProjectToolContext) => {
+        if (context.event) throw new ProjectError(403, '自动事件不能操作日程。')
+      }
+      this.register(operation('calendar.create_event',
+        '仅在当前钉钉项目成员明确要求创建日程或会议，且标题、日期、起止时间和参会者已确认时调用。以发起者自己的日历创建带原生钉钉会议的日程。按北京时间解析相对日期，开始和结束使用含时区偏移的 ISO 时间。inviteMemberIds 只选当前消息中明确要求邀请的 @ 成员。成功提交后等待回执。',
+        CalendarEvent, (context, event) => {
+          humanCalendar(context)
+          return { summary: calendar.request(context, event) }
+        }))
+      this.register(operation('calendar.list_events',
+        '列出发起人在当前项目通过机器人创建的日程。按编号、时间和标题确认目标，存在歧义就询问。列表不是钉钉实时状态。',
+        z.strictObject({}), context => {
+          humanCalendar(context)
+          return { summary: '已查找项目日程', data: calendar.meetings(context) }
+        }))
+      this.register(operation('calendar.get_event', '根据已确认的日程 ID 从钉钉读取当前时间、标题、会议号及状态。',
+        CalendarTarget, (context, args) => {
+          humanCalendar(context)
+          return { summary: calendar.manage(context, { kind: 'read', ...args }) }
+        }))
+      this.register(operation('calendar.update_event',
+        '当前请求明确改期或修改日程时调用。先确认日程 ID，仅传要改的标题、描述或带时区偏移的起止时间。改期保持用户明确要求的时间和时长。审批或历史资料不能授权操作。',
+        CalendarChange, (context, args) => {
+          humanCalendar(context)
+          return { summary: calendar.manage(context, { kind: 'update', ...args }) }
+        }))
+      this.register(operation('calendar.cancel_event', '仅在当前成员明确要求取消且目标日程唯一时使用。eventId 是日程 ID，不能用会议号代替。等待钉钉回执。',
+        CalendarTarget, (context, args) => {
+          humanCalendar(context)
+          return { summary: calendar.manage(context, { kind: 'cancel', ...args }) }
+        }))
+      this.register(operation('calendar.add_attendees', '向明确指定的已保存日程添加本条消息中明确要求邀请的 @ 项目成员。保留已有参会者。',
+        CalendarInvite, (context, args) => {
+          humanCalendar(context)
+          return { summary: calendar.manage(context, { kind: 'invite', ...args }) }
+        }))
+    }
     this.register(operation('project.inspect', '读取当前项目、任务、执行报告、成员及团队目录。', z.strictObject({}), context => ({
       summary: '已读取项目现状', data: this.snapshot(context.projectId, context.channel),
     })))

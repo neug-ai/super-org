@@ -26,7 +26,8 @@
     "README.md",
     "prompts",
     "skills",
-    "scripts/export-github-admins"
+    "scripts/export-github-admins",
+    "scripts/aliding-calendar-actions.py"
   ],
   "dsh": {
     "bundle": {

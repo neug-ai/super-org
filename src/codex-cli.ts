@@ -229,7 +229,8 @@ async function main(): Promise<void> {
   const robotAgents = new RobotAgents({ codex: process.env.CODEX_BINARY, qwen: process.env.QWEN_BINARY, codexModel: model,
     qwenModel: process.env.QWEN_MODEL, qoder: process.env.QODER_BINARY, qoderModel: process.env.QODER_MODEL })
   const binary = robotAgents.binary('codex') ?? process.env.CODEX_BINARY ?? 'codex'
-  const calendar = alidingCalendar(process.env.SUPERAGENT_DINGTALK_CALENDAR, stateDir)
+  const calendar = alidingCalendar(process.env.SUPERAGENT_DINGTALK_CALENDAR, stateDir,
+    fileURLToPath(new URL('../scripts/aliding-calendar-actions.py', import.meta.url)))
   const harness = new CodexHarness(ctx, { binary, model, sandbox, port })
   let runtime: Runtime | undefined, robot: DingTalk | undefined
   const githubController = new AbortController()
