@@ -947,8 +947,13 @@ it('ships a matching default JSON for the message event and its configuration do
 it('queues a DingTalk meeting for its authorized sender, requires current mentions and does not duplicate a callback', async () => {
   const create = vi.fn<CalendarExecutor['create']>().mockResolvedValue({ state: 'verified', eventId: 'event-id', roomCode: '123 456 789' })
   const receipt = vi.fn<CalendarExecutor['receipt']>().mockResolvedValue({ state: 'uncertain' })
+  const manage = vi.fn<NonNullable<CalendarExecutor['manage']>>().mockImplementation(async (_id, request) => ({
+    state: 'confirmed', eventId: request.action.eventId,
+    snapshot: request.action.kind === 'cancel' ? { title: '', status: 'cancelled' } :
+      { title: '调整后会议', roomCode: '123 456 789' },
+  }))
   const { h, id, projects, assignee, change, propose } = await pilot(undefined, undefined,
-    { corpId: 'test-corp', organizers: ['member'], create, receipt })
+    { corpId: 'test-corp', organizers: ['member'], create, manage, receipt })
   change({ kind: 'add-member', memberId: assignee.id })
   const send = vi.fn()
   const kind = dingTalkKind(async message => { send(message) })
@@ -992,13 +997,35 @@ it('queues a DingTalk meeting for its authorized sender, requires current mentio
     const agent = h.runtime.projectAgent!
     expect(agent.runs(id).find(run => run.message.nativeMessageId === 'calendar-without-mention')?.steps[0]?.error).toContain('明确 @')
     expect(agent.runs(id).find(run => run.message.nativeMessageId === 'calendar-not-authorized')?.steps[0]?.error).toContain('已获授权')
+    const calendarCall = (name: string, args: object) => {
+      propose.mockResolvedValueOnce({ calls: [call(name, args)], reply: '' }).mockResolvedValueOnce(done())
+    }
+    calendarCall('calendar.update_event', { eventId: 'event-id', title: '调整后会议' })
+    await post('calendar-update', 'member')
+    calendarCall('calendar.add_attendees', { eventId: 'event-id', inviteMemberIds: [assignee.id] })
+    await post('calendar-invite', 'member')
+    calendarCall('calendar.get_event', { eventId: 'event-id' })
+    await post('calendar-read', 'member')
+    calendarCall('calendar.cancel_event', { eventId: 'some-other-event' })
+    await post('calendar-wrong-target', 'member')
+    calendarCall('calendar.cancel_event', { eventId: 'event-id' })
+    await post('calendar-cancel', 'member')
+    await post('calendar-cancel', 'member')
+    calendarCall('calendar.add_attendees', { eventId: 'event-id', inviteMemberIds: [assignee.id] })
+    await post('calendar-invite-after-cancel', 'member')
+    expect(manage.mock.calls.map(([, request]) => request.action.kind)).toEqual(['update', 'invite', 'read', 'cancel'])
+    expect(manage.mock.calls[1]?.[1].attendees).toEqual(['assignee'])
+    for (const text of ['已修改并核验日程', '已添加并核验参会人', '已查询日程', '已取消并核验日程'])
+      expect(send.mock.calls.some(([message]) => message.text.includes(text))).toBe(true)
+
     // Recover an attempt interrupted after its write was started. It must only read the existing receipt.
-    const [attemptKey] = h.runtime.store.keys(KV.projects.calendarAttempt)
+    const attemptKey = h.runtime.store.keys(KV.projects.calendarAttempt)
+      .find(key => !!h.runtime.store.get(key)?.request.event)
     const saved = h.runtime.store.get(attemptKey!)!
     h.runtime.store.set(KV.projects.calendarAttempt('interrupted'), { request: saved.request, state: 'started' })
     h.runtime.effects.enqueue('project-calendar', 'interrupted', {})
     await h.runtime.idle()
-    expect(receipt).toHaveBeenCalledWith('interrupted')
+    expect(receipt).toHaveBeenCalledWith('interrupted', expect.objectContaining({ organizer: 'member' }))
     expect(h.runtime.store.get(KV.projects.calendarAttempt('interrupted'))?.receipt).toEqual({ state: 'uncertain' })
     expect(create).toHaveBeenCalledTimes(1)
     expect(bot).toBeDefined()
