@@ -26,9 +26,13 @@ const PARENT = `coalesce(${MESSAGE} ->> '$.replyToNativeMessageId', source.value
   source.value ->> '$.meta.parentId')`
 
 const DELIVERED_REPLY = `
-  LEFT JOIN outbox reply ON reply.value ->> '$.origin.runId' = run.value ->> '$.id' AND ${SENT}
-    AND reply.value ->> '$.origin.projectId' = ${PROJECT} AND reply.value ->> '$.channel.source' = ${SOURCE}
-    AND reply.value ->> '$.channel.thread' = ${THREAD}`
+  LEFT JOIN outbox reply ON reply.rowid = (
+    SELECT reply.rowid FROM outbox reply
+    WHERE reply.value ->> '$.origin.runId' = run.value ->> '$.id' AND ${SENT}
+      AND reply.value ->> '$.origin.projectId' = ${PROJECT} AND reply.value ->> '$.channel.source' = ${SOURCE}
+      AND reply.value ->> '$.channel.thread' = ${THREAD}
+    ORDER BY reply.rowid DESC LIMIT 1
+  )`
 
 const TURN = (from = 'kv run') => `
   SELECT run.value ->> '$.id' AS id,

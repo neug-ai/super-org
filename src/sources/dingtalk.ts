@@ -103,7 +103,8 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
       ...(Array.isArray(quotedLinks) && quotedLinks.length && { quotedDocumentLinks: quotedLinks }),
       ...(attachments?.length && { attachments, ...(trigger.meta.attachmentOnly === true && { attachmentOnly: true as const }) }),
       ...(mentions.size || unresolvedCount ? { mentions: { members: [...mentions.values()], unresolvedCount } } : {}) })
-    return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' : '已收到，正在结合项目现状处理。'
+    return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' :
+      { text: '已收到，正在结合项目现状处理。', kind: 'acknowledgement' as const }
   }
   const enroll = (trigger: Trigger) => {
     const { corpId, name } = sender(trigger)
@@ -387,14 +388,15 @@ export function dingTalkTrigger(raw: unknown, context: SourceContext): {
       content: quote ? { content: message.content, quote } : message.content } } : {}),
   }
 }
+type ProjectIntakeReply = string | { kind: 'acknowledgement'; text: string }
 export interface DingTalkIntake {
   conversationId?: string
   forConversation?: (conversationId: string) => DingTalkIntake | undefined
   project?: { id: string; repository: string | null }
   onSender?: (trigger: Trigger) => string | undefined
   onStored?: (trigger: Trigger) => void
-  onMeeting?: (trigger: Trigger) => string
-  discussion?: (trigger: Trigger) => (() => string) | undefined
+  onMeeting?: (trigger: Trigger) => ProjectIntakeReply
+  discussion?: (trigger: Trigger) => (() => ProjectIntakeReply) | undefined
 }
 /** Translates DingTalk Stream callbacks and group sends through the original SourceContext boundary. */
 export class DingTalk {
@@ -449,8 +451,9 @@ export class DingTalk {
           const result = context.receive(trigger)
           if (result instanceof Promise) throw new Error('DingTalk intake must commit synchronously')
           if ((handle || discussion) && result === 'filtered' && trigger.channel) {
-            const text = discussion ? discussion() : handle?.(trigger)
-            if (text) context.notify({ id: key('dingtalk-project-receipt', trigger.id), channel: trigger.channel, kind: 'notice', text })
+            const reply = discussion ? discussion() : handle?.(trigger)
+            if (reply) context.notify({ id: key('dingtalk-project-receipt', trigger.id), channel: trigger.channel,
+              ...(typeof reply === 'string' ? { kind: 'notice' as const, text: reply } : reply) })
           } else if (result === 'stored') {
             handlers?.onStored?.(trigger)
             this.received(trigger)

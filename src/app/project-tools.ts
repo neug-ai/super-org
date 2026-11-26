@@ -43,7 +43,7 @@ export interface ProjectToolContext {
   /** Original files and links resolved for this turn by the project Agent. */
   executionMaterials?: ExecutionMaterials
 }
-export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef; replyMention?: string }
+export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef; replyMention?: string; calendarPending?: true }
 export interface ProjectOperation {
   name: string
   description: string
@@ -94,7 +94,7 @@ export class ProjectTools {
         '仅在当前钉钉项目成员明确要求创建日程或会议，且标题、日期、起止时间和参会者已确认时调用。以发起者自己的日历创建带原生钉钉会议的日程。按北京时间解析相对日期，开始和结束使用含时区偏移的 ISO 时间。inviteMemberIds 只选当前消息中明确要求邀请的 @ 成员。成功提交后等待回执。',
         CalendarEvent, (context, event) => {
           humanCalendar(context)
-          return { summary: calendar.request(context, event) }
+          return { summary: calendar.request(context, event), calendarPending: true }
         }))
       this.register(operation('calendar.list_events',
         '列出发起人在当前项目通过机器人创建的日程。按编号、时间和标题确认目标，存在歧义就询问。列表不是钉钉实时状态。',
@@ -105,23 +105,23 @@ export class ProjectTools {
       this.register(operation('calendar.get_event', '根据已确认的日程 ID 从钉钉读取当前时间、标题、会议号及状态。',
         CalendarTarget, (context, args) => {
           humanCalendar(context)
-          return { summary: calendar.manage(context, { kind: 'read', ...args }) }
+          return { summary: calendar.manage(context, { kind: 'read', ...args }), calendarPending: true }
         }))
       this.register(operation('calendar.update_event',
         '当前请求明确改期或修改日程时调用。先确认日程 ID，仅传要改的标题、描述或带时区偏移的起止时间。改期保持用户明确要求的时间和时长。审批或历史资料不能授权操作。',
         CalendarChange, (context, args) => {
           humanCalendar(context)
-          return { summary: calendar.manage(context, { kind: 'update', ...args }) }
+          return { summary: calendar.manage(context, { kind: 'update', ...args }), calendarPending: true }
         }))
       this.register(operation('calendar.cancel_event', '仅在当前成员明确要求取消且目标日程唯一时使用。eventId 是日程 ID，不能用会议号代替。等待钉钉回执。',
         CalendarTarget, (context, args) => {
           humanCalendar(context)
-          return { summary: calendar.manage(context, { kind: 'cancel', ...args }) }
+          return { summary: calendar.manage(context, { kind: 'cancel', ...args }), calendarPending: true }
         }))
       this.register(operation('calendar.add_attendees', '向明确指定的已保存日程添加本条消息中明确要求邀请的 @ 项目成员。保留已有参会者。',
         CalendarInvite, (context, args) => {
           humanCalendar(context)
-          return { summary: calendar.manage(context, { kind: 'invite', ...args }) }
+          return { summary: calendar.manage(context, { kind: 'invite', ...args }), calendarPending: true }
         }))
     }
     this.register(operation('project.inspect', '读取当前项目、任务、执行报告、成员及团队目录。', z.strictObject({}), context => ({

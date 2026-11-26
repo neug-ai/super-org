@@ -344,12 +344,17 @@ export class ProjectAgent {
     if (replyChannel) run.replyChannel = replyChannel
     run.steps.push(step); run.turn++
     host.store.set(KV.projects.agentRun(run.id), run)
-    if (run.turn >= 6) this.finish(run, '已达到本次处理的工具调用轮数。请查看下面的实际结果，补充仍需处理的部分。', true)
+    if (step.results.some(result => result.calendarPending)) {
+      // Once the calendar effect is committed, it owns the outcome. Send only the factual queued
+      // acknowledgement in this transaction, before any effect can produce a final receipt.
+      const summary = [...new Set(step.results.map(result => result.summary))].join('\n')
+      this.finish(run, summary, false, 'acknowledgement')
+    } else if (run.turn >= 6) this.finish(run, '已达到本次处理的工具调用轮数。请查看下面的实际结果，补充仍需处理的部分。', true)
     else host.effects.enqueue('project-agent', run.id, { runId: run.id })
     return { status: 'applied' as const }
   }
 
-  private finish(run: ProjectAgentRun, reply: string, failed = false): void {
+  private finish(run: ProjectAgentRun, reply: string, failed = false, kind: OutboundMessage['kind'] = 'notice'): void {
     let channel = run.replyChannel ?? run.message.channel
     let mentionError = ''
     const mention = run.steps.flatMap(step => step.results).findLast(result => result.replyMention)?.replyMention
@@ -373,7 +378,8 @@ export class ProjectAgent {
     delete run.pending
     this.host.store.set(KV.projects.agentRun(run.id), run)
     if (run.event && (!run.reply || !this.enabled(run, this.hasResults(run)))) return
-    this.host.notify({ id: key('project-agent-result', run.id), channel, kind: 'notice', text: run.reply,
-      origin: { projectId: run.message.projectId, eventId: run.event?.id ?? run.message.messageId, taskId: run.event?.taskId, runId: run.id } })
+    this.host.notify({ id: key('project-agent-result', run.id), channel, kind, text: run.reply,
+      origin: { projectId: run.message.projectId, eventId: run.event?.id ?? run.message.messageId, taskId: run.event?.taskId,
+        ...(kind !== 'acknowledgement' && { runId: run.id }) } })
   }
 }

@@ -26,6 +26,12 @@ export const receiptId = (triggerId: string) => key('dingtalk-received', trigger
 const receiptText = (trigger: Trigger) => `已收到 ${trigger.channel?.address.eventLabel ?? trigger.source} 消息。`
 const triggerKey = (conversation: string, trigger: string) => triggerCards(key(conversation, trigger, ''))
 const closed = (card: Card) => card.closed ?? card.messages?.at(-1)?.flowStatus === '3'
+// These callbacks were filtered out of general intake and have their own project reply handler.
+function projectOwned(trigger: Trigger | undefined): boolean {
+  const meta = trigger?.meta
+  return trigger?.source === 'dingtalk' &&
+    (meta?.projectDiscussion === true || meta?.projectEnrollment === true || meta?.projectMeeting === true)
+}
 const acknowledged = (card: Card) => !!card.acknowledgementId || !!card.messages?.some(message => message.flowStatus === '2')
 
 const belongsTo = (card: Card, ticketId: string) => card.ticketId === ticketId || !!card.ticketIds?.includes(ticketId)
@@ -48,6 +54,7 @@ export function hasCardBinding(context: SourceContext, ticketId?: string, trigge
 export function resolveCardReply(context: SourceContext, id: string, ticketId?: string) {
   const card = context.state.get(cards(id))
   if (!card || ticketId && !belongsTo(card, ticketId)) throw new Error('Card is not bound to this task')
+  if (projectOwned(context.triggers.get(card.triggerId))) throw new Error('This card is handled by the project')
   if (!closed(card) && !pendingCardReplies(context, ticketId).some(pending => pending.card_id === id)) {
     throw new Error('This card has no open processing round; do not send another final reply')
   }
@@ -114,7 +121,8 @@ export function githubMentionReplies(context: SourceContext, message: OutboundMe
 export function pendingCardReplies(context: SourceContext, ticketId?: string) {
   return context.state.keys(cards).flatMap(name => {
     const card = context.state.get(name)
-    if (!card || closed(card) || ticketId && !belongsTo(card, ticketId)) return []
+    if (!card || closed(card) || ticketId && !belongsTo(card, ticketId) ||
+      projectOwned(context.triggers.get(card.triggerId))) return []
     const id = name.slice(cards.prefix.length)
     // Leave historical cards from the FIFO implementation untouched.
     const bound = context.state.get(triggerKey(card.conversationId, card.triggerId)) === id
@@ -128,7 +136,7 @@ export function pendingCardReplies(context: SourceContext, ticketId?: string) {
 
 export function remindCardReply(context: SourceContext, id: string): boolean {
   const card = context.state.get(cards(id))
-  if (!card || closed(card) || card.replyReminded) return false
+  if (!card || closed(card) || card.replyReminded || projectOwned(context.triggers.get(card.triggerId))) return false
   context.state.set(cards(id), { ...card, replyReminded: true })
   return true
 }
@@ -312,12 +320,17 @@ export class DingTalkCards {
     const saved = this.context.state.get(cards(id))
     // A model may enqueue its acknowledgement before the receipt was delivered. Never overwrite that feedback with a late placeholder.
     if (placeholder && saved?.used) return
+    const ownedByProject = projectOwned(origin)
+    // Delivery retries can bring an older acknowledgement back after a verified project outcome.
+    // Keep retries of the final outcome deliverable, but never reopen its card for new progress.
+    if (ownedByProject && message.kind === 'acknowledgement' && saved?.messages?.some(item => item.flowStatus === '3')) return
     this.context.state.set(deliveries(message.id), id)
     const card: Card = saved ?? { triggerId: origin.id, conversationId, templateId: this.templateId, used: false, sent: false }
     card.templateId ||= this.templateId
     bindTicket(card, message.ticketId)
     if (!placeholder) {
       card.used = true
+      if (ownedByProject && message.kind !== 'acknowledgement') card.closed = true
       card.messages ??= []
       if (!card.messages.some(item => item.id === message.id)) card.messages.push({ id: message.id, text: message.text,
         flowStatus: message.kind === 'acknowledgement' ? '2' : '3' })
