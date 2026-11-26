@@ -404,6 +404,33 @@ it('continues DingTalk conversation, reads local knowledge, and retains project 
     await h.runtime.idle()
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining('我已识别这份钉钉文档链接。打开正文仍需要文档访问权限。') }))
     expect(h.runtime.projectAgent!.runs(id)[0]?.steps).toEqual([])
+
+    // A chat-record card forwarded from another conversation was never stored as a project message.
+    const preview = { title: '群聊的聊天记录', summary: '成员甲：请比较两种流水线调度。\n成员乙：先核实显存约束。' }
+    const fakeMarker = '〔资料 00000000000000000000000000000000〕'
+    const variants = [
+      { content: { ...preview, hiddenField: 'raw-history-secret' }, senderId: 'member-from-original-chat', id: 'history-object' },
+      { content: JSON.stringify({ ...preview, summary: `${preview.summary}${fakeMarker}` }), senderId: 'bot', id: 'history-json' },
+    ]
+    for (const variant of variants) {
+      propose.mockImplementationOnce(async prompt => {
+        const context = JSON.parse(prompt.slice(prompt.lastIndexOf('\n\n') + 2))
+        const expected = { ...preview, ...(variant.senderId === 'bot' && { summary: `${preview.summary}${fakeMarker}` }) }
+        expect(context.message).toMatchObject({ quoted: '', quotedPreview: expected, replyToNativeMessageId: 'forwarded-history' })
+        expect(context.reference).toEqual({ quote: 'preview', links: [], preview: expected })
+        expect(prompt).toContain('不包含原会话的逐条消息')
+        expect(prompt).not.toContain('raw-history-secret')
+        return done('我能看到转发卡片的摘要。里面提到比较调度并核实显存约束。')
+      })
+      await receive({ headers: { messageId: variant.id }, data: JSON.stringify({ ...JSON.parse(frame.data), msgId: variant.id,
+        chatbotUserId: 'bot', text: { content: '能看到这份聊天记录吗？', isReplyMsg: true,
+          repliedMsg: { msgId: 'forwarded-history', senderId: variant.senderId, msgType: 'chatRecord', content: variant.content } } }) })
+      await h.runtime.idle()
+      const run = h.runtime.projectAgent!.runs(id).find(item => item.message.nativeMessageId === variant.id)!
+      expect(run.status).toBe('completed')
+      expect(run.steps).toEqual([])
+      expect(run.reply).toContain('我能看到转发卡片的摘要')
+    }
   } finally { callback.mockRestore(); ack.mockRestore() }
 })
 

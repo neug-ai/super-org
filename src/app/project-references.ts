@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { KV } from '../kv.ts'
-import { maxProjectAttachments, type ProjectMessage } from '../sources/project-message.ts'
+import { maxProjectAttachments, type ProjectMessage, type ProjectQuotePreview } from '../sources/project-message.ts'
 import type { ProjectAgentRun } from './project-agent.ts'
 import type { AttachmentResult, ExecutionAttachment } from './project-attachments.ts'
 import { findConversationTurn } from './project-conversation-history.ts'
@@ -16,7 +16,8 @@ export interface ProjectReferences {
   links: string[]
   attachments: AttachmentResult[]
   message?: { id: string; text: string }
-  quote: 'none' | 'inline' | 'resolved' | 'unavailable'
+  preview?: ProjectQuotePreview
+  quote: 'none' | 'inline' | 'preview' | 'resolved' | 'unavailable'
 }
 
 export const materialReference = (runId: string): string => `〔资料 ${runId}〕`
@@ -54,9 +55,10 @@ export function resolveProjectReferences(store: Store, message: ProjectMessage, 
     [...(source.message.quotedDocumentLinks ?? []), ...sharedLinks(source.message.text)] : [])
   const links = [...new Set([...quotedDocumentLinks, ...sharedLinks(text), ...sourceLinks])].slice(0, limit)
   const inline = !!(quotedDocumentLinks.length || quoted.trim() || message.attachments?.length)
-  return { links, attachments: source ? referencedAttachments(source) : [],
+  const preview = message.quotedPreview ?? source?.references?.preview ?? source?.message.quotedPreview
+  return { links, ...(preview && { preview }), attachments: source ? referencedAttachments(source) : [],
     ...(source && { message: { id: source.id, text: source.message.text.slice(0, 1500) } }),
-    quote: source ? 'resolved' : inline ? 'inline' : replyToNativeMessageId ? 'unavailable' : 'none' }
+    quote: source ? 'resolved' : inline ? 'inline' : preview ? 'preview' : replyToNativeMessageId ? 'unavailable' : 'none' }
 }
 
 export function referencedAttachments(run: ProjectAgentRun): AttachmentResult[] {
