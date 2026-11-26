@@ -83,14 +83,14 @@ export class ProjectCalendar {
   request(context: CalendarContext, event: CalendarEvent): string {
     const { projectId, actorId, messageId, channel, mentions } = context
     const id = key('project-calendar', projectId, messageId)
-    if (this.store.get(KV.projects.calendarAttempt(id)))
-      return '这条消息的日程请求已登记，请查看同一会话的处理回执。'
+    const pending = '正在创建钉钉日程。创建结果和会议号以钉钉回执为准。'
+    if (this.store.get(KV.projects.calendarAttempt(id))) return pending
     if (Date.parse(event.start) <= Date.now()) throw new ProjectError(400, '请提供将来的会议开始时间。')
     const identities = this.authorize(context, event.inviteMemberIds)
     this.store.set(KV.projects.calendarAttempt(id), { state: 'queued',
       request: { projectId, actorId, messageId, channel, mentions, event, ...identities } })
     this.effects.enqueue('project-calendar', id, {})
-    return '已提交钉钉日程创建请求。日程和会议号以随后收到的核验回执为准。'
+    return pending
   }
 
   meetings(context: CalendarContext, id?: string) {
@@ -130,11 +130,13 @@ export class ProjectCalendar {
     if (!this.meetings(context, action.eventId).some(meeting => !meeting.cancelled || action.kind === 'read' || action.kind === 'cancel'))
       throw new ProjectError(404, '在当前项目和你的日历记录里找不到可操作的日程。请先查找已有日程并确认目标。')
     const id = key('project-calendar', projectId, messageId, action.kind)
-    if (this.store.get(KV.projects.calendarAttempt(id))) return '这条消息的同类日程请求已登记，请查看回执。'
+    const pending = { read: '正在查询钉钉日程。', update: '正在修改钉钉日程。',
+      cancel: '正在取消钉钉日程。', invite: '正在添加钉钉参会人。' }[action.kind]
+    if (this.store.get(KV.projects.calendarAttempt(id))) return pending
     this.store.set(KV.projects.calendarAttempt(id), { state: 'queued',
       request: { projectId, actorId, messageId, channel, mentions, action, ...identities } })
     this.effects.enqueue('project-calendar', id, {})
-    return '已登记日程操作，请查看随后的钉钉回执。'
+    return pending
   }
 
   private async run(id: string) {
@@ -171,7 +173,8 @@ export class ProjectCalendar {
     this.store.atomic(() => {
       this.store.set(KV.projects.calendarAttempt(id), { state: 'settled', request, receipt, settledAt: new Date().toISOString() })
       this.notify({ id: key('project-calendar-result', id), channel: request.channel, kind: 'notice', text,
-        origin: { projectId: request.projectId, eventId: request.messageId } })
+        origin: { projectId: request.projectId, eventId: request.messageId,
+          runId: key('project-agent', request.channel.source, request.messageId) } })
     })
   }
 

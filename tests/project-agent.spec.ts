@@ -978,11 +978,11 @@ it('queues a DingTalk meeting for its authorized sender, requires current mentio
     }
     const event = { title: '测试会议', start: new Date(Date.now() + 3_600_000).toISOString(),
       end: new Date(Date.now() + 7_200_000).toISOString(), inviteMemberIds: [assignee.id] }
-    const action = { calls: [call('calendar.create_event', event)], reply: '' }
+    const action = { calls: [call('calendar.create_event', event)], reply: '会议未创建。' }
     propose.mockImplementationOnce(async prompt => {
       expect(prompt).toContain('calendar.create_event')
       return { ...action, calls: [...action.calls, ...action.calls] }
-    }).mockResolvedValueOnce(done('日程请求已提交。'))
+    })
     await post('calendar-ok', 'member')
     await post('calendar-ok', 'member')
     expect(create).toHaveBeenCalledExactlyOnceWith(expect.any(String),
@@ -997,8 +997,9 @@ it('queues a DingTalk meeting for its authorized sender, requires current mentio
     const agent = h.runtime.projectAgent!
     expect(agent.runs(id).find(run => run.message.nativeMessageId === 'calendar-without-mention')?.steps[0]?.error).toContain('明确 @')
     expect(agent.runs(id).find(run => run.message.nativeMessageId === 'calendar-not-authorized')?.steps[0]?.error).toContain('已获授权')
-    const calendarCall = (name: string, args: object) => {
-      propose.mockResolvedValueOnce({ calls: [call(name, args)], reply: '' }).mockResolvedValueOnce(done())
+    const calendarCall = (name: string, args: object, accepted = true) => {
+      propose.mockResolvedValueOnce({ calls: [call(name, args)], reply: '会议未创建。' })
+      if (!accepted) propose.mockResolvedValueOnce(done())
     }
     calendarCall('calendar.update_event', { eventId: 'event-id', title: '调整后会议' })
     await post('calendar-update', 'member')
@@ -1006,17 +1007,32 @@ it('queues a DingTalk meeting for its authorized sender, requires current mentio
     await post('calendar-invite', 'member')
     calendarCall('calendar.get_event', { eventId: 'event-id' })
     await post('calendar-read', 'member')
-    calendarCall('calendar.cancel_event', { eventId: 'some-other-event' })
+    calendarCall('calendar.cancel_event', { eventId: 'some-other-event' }, false)
     await post('calendar-wrong-target', 'member')
     calendarCall('calendar.cancel_event', { eventId: 'event-id' })
     await post('calendar-cancel', 'member')
     await post('calendar-cancel', 'member')
-    calendarCall('calendar.add_attendees', { eventId: 'event-id', inviteMemberIds: [assignee.id] })
+    calendarCall('calendar.add_attendees', { eventId: 'event-id', inviteMemberIds: [assignee.id] }, false)
     await post('calendar-invite-after-cancel', 'member')
     expect(manage.mock.calls.map(([, request]) => request.action.kind)).toEqual(['update', 'invite', 'read', 'cancel'])
     expect(manage.mock.calls[1]?.[1].attendees).toEqual(['assignee'])
     for (const text of ['已修改并核验日程', '已添加并核验参会人', '已查询日程', '已取消并核验日程'])
       expect(send.mock.calls.some(([message]) => message.text.includes(text))).toBe(true)
+
+    // The executor can settle immediately. Only the server-authored pending and verified messages may arrive.
+    for (const [nativeId, pending, final] of [
+      ['calendar-ok', '正在创建钉钉日程', '已创建并核验钉钉日程'],
+      ['calendar-cancel', '正在取消钉钉日程', '已取消并核验日程'],
+    ] as const) {
+      const run = agent.runs(id).find(item => item.message.nativeMessageId === nativeId)!
+      const delivered = send.mock.calls.map(([message]) => message)
+        .filter(message => message.channel.address.triggerId === run.message.messageId)
+      expect(delivered).toMatchObject([
+        { kind: 'acknowledgement', text: '已收到，正在结合项目现状处理。' },
+        { kind: 'acknowledgement', text: expect.stringContaining(pending) },
+        { kind: 'notice', text: expect.stringContaining(final), origin: { runId: run.id } },
+      ])
+    }
 
     // Recover an attempt interrupted after its write was started. It must only read the existing receipt.
     const attemptKey = h.runtime.store.keys(KV.projects.calendarAttempt)

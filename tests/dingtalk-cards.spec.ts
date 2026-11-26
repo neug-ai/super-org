@@ -1,7 +1,7 @@
 import { beforeEach, expect, it, vi, type Mock } from 'vitest'
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream'
 import { DingTalk, dingTalkKind, dingTalkRoute, dingTalkTrigger } from '../src/sources/dingtalk.ts'
-import { acknowledgeCard, DingTalkCards, pendingCardReplies, receiptId, replyToCard, resolveCardReply } from '../src/sources/dingtalk-cards.ts'
+import { acknowledgeCard, DingTalkCards, pendingCardReplies, receiptId, remindCardReply, replyToCard, resolveCardReply } from '../src/sources/dingtalk-cards.ts'
 import type { SourceContext } from '../src/sources/host.ts'
 import type { OutboundMessage, Trigger } from '../src/core/index.ts'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -446,4 +446,28 @@ it('uses a stable card ID on retry and never lets a delayed placeholder overwrit
   const before = http.mock.calls.length
   await cards.send(pending)
   expect(http).toHaveBeenCalledTimes(before)
+})
+
+it.each(['projectDiscussion', 'projectMeeting', 'projectEnrollment'])('lets the project own %s cards and ignores late progress after the outcome', async flag => {
+  origin.meta[flag] = true
+  const first = await receipt()
+  const cardId = first.channel.address.cardId!
+  expect(pendingCardReplies(context)).toEqual([])
+  expect(remindCardReply(context, cardId)).toBe(false)
+  expect(() => resolveCardReply(context, cardId)).toThrow('handled by the project')
+  expect(() => acknowledgeCard(context, cardId, '补答')).toThrow('no open delivery binding')
+
+  await cards.send(message({ id: 'project-processing', ticketId: undefined, text: '正在处理日程' }))
+  expect(requestBody(1).cardData.cardParamMap.flowStatus).toBe('2')
+  expect(() => replyToCard(context, cardId, '会议未创建')).toThrow('no current delivery binding')
+  const final = message({ id: 'project-outcome', ticketId: undefined, kind: 'notice', text: '已核验日程结果' })
+  await cards.send(final)
+  await cards.send(message({ id: 'late-project-progress', ticketId: undefined, text: '正在处理日程，请等待' }))
+  expect(http).toHaveBeenCalledTimes(3)
+  // Replaying a final delivery does not append it again and is safe if the prior delivery did not reach DingTalk.
+  await cards.send(final)
+  const card = requestBody(3).cardData.cardParamMap
+  expect(card.flowStatus).toBe('3')
+  expect(card.markdown.match(/已核验日程结果/g)).toHaveLength(1)
+  expect(card.markdown).not.toMatch(/未创建|请等待/)
 })
