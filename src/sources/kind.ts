@@ -6,6 +6,9 @@ import type { Deployment } from '../deployment.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { ProjectEventDefinition } from './project-events.ts'
 import type { SourceContext, SourceHost } from './host.ts'
+import type { Member, Project, ProjectInput } from '../app/projects.ts'
+import type { MessageAttachment, ProjectMessage } from './project-message.ts'
+import type { AttachmentReader, LinkedDocumentReader } from '../app/project-attachments.ts'
 
 export interface Localized { zh: string; en: string }
 /** `advanced` folds a rarely changed field (such as a polling tunable) behind the card's Advanced section. */
@@ -44,6 +47,7 @@ export interface SourcePolicyPart<P extends Record<string, unknown>> {
 export interface ChannelLink { url: string; label: Localized; triggerId?: string }
 export type ChannelLinks = Partial<Pick<Deployment, 'repository' | 'feishu'>>
 /** Outbound messaging adapter for a source kind's threads. */
+export interface SourceDelivery { nativeMessageId?: string; nativeMention?: boolean }
 export interface SourceChannel<C> {
   formats?: readonly ('text' | 'markdown')[]
   transports?: readonly string[]
@@ -55,7 +59,7 @@ export interface SourceChannel<C> {
    * Sends a message idempotently by ID; returns `'gone'` when the target conversation no longer accepts replies.
    * @throws when delivery failed but may succeed on a later retry.
    */
-  send(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'>
+  send(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone' | SourceDelivery>
   /** Returns the URL and label for `address`; `url` is empty when `links` lack the required deployment info. */
   link(address: Record<string, string>, links: ChannelLinks): ChannelLink
 }
@@ -86,6 +90,22 @@ export interface TriggerContext {
   image(agent: Agent, commands: Commands, message: { id: string; text: string }, key: string, stateDir: string,
     signal: AbortSignal): Promise<unknown>
 }
+/** Project chat capabilities and native identity are supplied by the installed adapter. */
+export interface ProjectConversationSource {
+  binding(project: Project): string | null | undefined
+  room(channel: ChannelRef): string | undefined
+  channel(host: SourceContext, project: Project, recipient?: Member): ChannelRef | undefined
+  incoming?(host: SourceContext, trigger: Trigger): {
+    scope: string; message: Pick<ProjectMessage, 'nativeMessageId' | 'replyToNativeMessageId' | 'sourceUrl' | 'attachments' | 'attachmentOnly'>
+    mentioned?: readonly string[]
+    intake?: Pick<ProjectInput, 'dingTalkGroup' | 'feishuChatId' | 'conversationBindings'>
+    senderName?: string
+  } | undefined
+  authorize?(host: SourceContext, channel: ChannelRef, member: Member): boolean
+  attachment?(host: SourceContext, ...args: Parameters<AttachmentReader>): ReturnType<AttachmentReader>
+  quotedAttachments?(host: SourceContext, message: ProjectMessage, signal: AbortSignal): Promise<MessageAttachment[]>
+  document?(host: SourceContext): LinkedDocumentReader | undefined
+}
 /** Pluggable source kind descriptor registered with SourceRegistry. */
 export interface SourceKind<C extends Record<string, unknown> = Record<string, unknown>> {
   /** Stable ID; a default instance with the same ID exists when none is stored. */
@@ -101,6 +121,7 @@ export interface SourceKind<C extends Record<string, unknown> = Record<string, u
   health: string[]
   /** Optional project facts normalized by this adapter; definitions include built-in defaults and documentation. */
   projectEvents?: readonly ProjectEventDefinition[]
+  projectConversation?: ProjectConversationSource
   /** Optional repository capability: parse only this provider's discussion addresses into a safe reply channel. */
   discussion?(repository: string, url: string): ChannelRef | undefined
   /** Listening rule for a trigger (or recorded Mandate basis) of this kind; kinds without `scope` listen to everything they produce and observe none of it. */

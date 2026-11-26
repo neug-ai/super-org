@@ -149,7 +149,7 @@ it('follows up through the Mock DingTalk callback, records the quoted reply and 
   const history = await h.api('GET', `projects/${id}/history`)
   expect(history.body).toMatchObject({ notifications: expect.arrayContaining([expect.objectContaining({ status: 'sent',
     origin: { projectId: id, eventId: events('tracking.ping.requested')[0]!.id, taskId: task.id } })]) })
-  expect(history.body).toMatchObject({ entries: expect.arrayContaining([expect.objectContaining({ delivery: { status: 'sent' } })]) })
+  expect(history.body).toMatchObject({ entries: expect.arrayContaining([expect.objectContaining({ delivery: { status: 'sent', nativeMention: true } })]) })
   await advance('16:00')
   expect(events('tracking.check.resolved').map(event => event.data)).toMatchObject([{ state: 'quiet' }, { state: 'queued' }])
   expect(events('progress.recorded')).toHaveLength(1)

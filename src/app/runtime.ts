@@ -44,7 +44,8 @@ import { ProjectIssues } from './project-issues.ts'
 import { resumeProjectActions } from './project-actions.ts'
 import { ProjectProgress } from './project-progress.ts'
 import { ProjectTracking } from './project-tracking.ts'
-import { obsoleteExplicitProjectMention, projectChannel } from './project-notifications.ts'
+import { ProjectChannels } from './project-channels.ts'
+import { enrollmentIntent, isMeetingMinutes, submitFirstProjectMinutes, submitProjectConversation } from './project-intake.ts'
 import { ProjectRepository as ProjectRepositorySync } from './project-repository.ts'
 import { projectResources } from './repository-delivery.ts'
 import { ProjectHistory } from './project-history.ts'
@@ -92,6 +93,7 @@ export class Runtime extends Service implements SourceHost {
   readonly prompts: Prompts
   readonly effects: Effects
   readonly sources: SourceRegistry
+  readonly projectChannels: ProjectChannels
   readonly commands: Commands
   readonly sessions: Sessions
   readonly settings: Settings
@@ -129,7 +131,7 @@ export class Runtime extends Service implements SourceHost {
   constructor(ctx: Context, readonly machine: Machine, restart: () => void, private readonly notificationGroup?: string,
     received?: (trigger: Trigger) => void,
     workerDelivery?: (ticketId: string, deliveryId: string, triggerId: string) => { card_id: string; ticket_id: string; trigger_id: string } | undefined,
-    projectPlanner?: ProjectPlanner, private readonly robotAgents?: RobotAgents, calendarExecutor?: CalendarExecutor) {
+    projectPlanner?: ProjectPlanner, private readonly robotAgents?: RobotAgents, calendarExecutor?: CalendarExecutor | readonly CalendarExecutor[]) {
     super(ctx, 'orchestrator')
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
@@ -207,17 +209,18 @@ export class Runtime extends Service implements SourceHost {
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
       let communication: Communication | undefined
+      const channels = this.projectChannels = new ProjectChannels(store, this)
       const outbox = this.outbox = new Outbox({ store, effects, sources, commands, paused: () => this.paused(),
         prepare: message => bindDingTalkReply(runtime.context({ kind: 'dingtalk', health: [] }), communication?.prepare(message) ?? message),
-        obsolete: message => obsoleteExplicitProjectMention(store, message) || this.projectTracking.obsolete(message),
+        obsolete: message => channels.obsolete(message) || this.projectTracking.obsolete(message),
         acknowledgementId: (ticketId, trigger) => cardAcknowledgementId(runtime.context({ kind: 'dingtalk', health: [] }), ticketId, trigger),
         mirrors: message => githubMentionReplies(runtime.context({ kind: 'dingtalk', health: [] }), message) })
-      communication = this.communication = new Communication({ store, events: projectEvents, effects, outbox,
+      communication = this.communication = new Communication({ store, channels, events: projectEvents, effects, outbox,
         planner: () => this.projectPlanning?.planner, lifetime: this.lifetime, capabilities: () => this.runtimeCapabilities(),
         formats: source => sources.kind(source)?.channel?.formats ?? ['text'],
         runnable: () => setup.configured() && !this.paused() && !this.closing() })
       projectEvents.register('execution', [deliveryReady, taskBlocked])
-      this.projectReviews = new ProjectReviews({ store, events: projectEvents, notify: message => this.communication.notify(message) })
+      this.projectReviews = new ProjectReviews({ store, channels, events: projectEvents, notify: message => this.communication.notify(message) })
       this.deliveryReady = new DeliveryReady({ store, events: projectEvents, reviews: this.projectReviews, notify: message => outbox.send(message) })
       this.projectRepository = new ProjectRepositorySync({ store, events: projectEvents, effects, commands, delivery: this.deliveryReady,
         agent: () => this.projectAgent,
@@ -227,40 +230,27 @@ export class Runtime extends Service implements SourceHost {
           ? { purpose: 'attention', ticketId, triggerId, question, text: `${text}\n\n需要处理：${question}` }
           : { purpose: 'answer', ticketId, triggerId, text }) },
         runnable: () => setup.configured() && !this.paused() && !this.closing() })
-      this.taskBlocked = new TaskBlocked({ store, events: projectEvents, notify: message => this.communication.notify(message), withdraw: id => this.communication.withdraw(id) })
+      this.taskBlocked = new TaskBlocked({ store, channels, events: projectEvents, notify: message => this.communication.notify(message), withdraw: id => this.communication.withdraw(id) })
       const { assessor, executor } = this
       const policy = () => settingsPolicy(store.settings(), sources)
       const planner = robotAgents ? () => robotAgents.planner(robotAgents.active(store.get(KV.runtime.robotPlanner))) : projectPlanner
       this.projectTracking = new ProjectTracking({ store, effects, events: projectEvents, planner: () => this.projectPlanning?.planner,
-        recipient: (project, owner, preferredSource) => {
-          if (!preferredSource || preferredSource === 'request' || preferredSource === 'dingtalk') {
-            const channel = projectChannel(store, project, owner)
-            if (channel.address.mentionUserId && (preferredSource === 'dingtalk' || sources.channelAllowed(channel))) return channel
-          }
-          if (!preferredSource || preferredSource === 'request' || preferredSource === 'feishu') {
-            const chatId = project.feishuChatId
-            const appId = setup.deployment.feishu?.appId
-            const account = appId && owner.accounts.find(item => item.provider === 'feishu' && item.scope === appId && /^ou_[\w-]+$/.test(item.accountId))
-            if (chatId && account) return { source: 'feishu', thread: `feishu:${chatId}`, address: { chatId, mentionUserId: account.accountId } }
-          }
-        },
+        recipient: (project, owner, preferredSource) => channels.target(project, owner, preferredSource),
         channelAllowed: channel => sources.channelAllowed(channel), notify: message => this.communication.notify(message),
         lifetime: this.lifetime, runnable: () => setup.configured() && !this.paused() && !this.closing() })
       if (planner) {
         const planning = this.projectPlanning = new ProjectPlanning(store, effects, planner, message => outbox.send(message), this.lifetime)
         const issues = new ProjectIssues(store, effects, commands, message => outbox.send(message),
           () => setup.configured() && !!setup.deployment.github.cli)
-        const calendar = calendarExecutor && new ProjectCalendar(store, effects, calendarExecutor, message => outbox.send(message), this.lifetime,
+        const calendar = calendarExecutor && new ProjectCalendar(store, effects, 'provider' in calendarExecutor ? [calendarExecutor] : calendarExecutor, message => outbox.send(message), this.lifetime,
           channel => sources.channelAllowed(channel), () => setup.configured() && !this.paused() && !this.closing())
-        const tools = this.projectTools = new ProjectTools({ store, issues, reviews: this.projectReviews, communication: this.communication,
+        const tools = this.projectTools = new ProjectTools({ store, channels, issues, reviews: this.projectReviews, communication: this.communication,
           capabilities: channel => this.runtimeCapabilities(channel), knowledgeDir: machine.knowledgeDir, calendar,
-          authorizeHistory: ({ channel, actorId }) => {
-            if (!sources.channelAllowed(channel)) return false
-            if (channel.source !== 'feishu') return true
-            const senderId = channel.address.projectSenderId
-            const appId = setup.deployment.feishu?.appId
-            return !!senderId && !!appId && !!allowedSender(store.settings(), { source: 'feishu', id: senderId })
-              && new Projects(store).directoryMemberForAccount('feishu', appId, senderId)?.id === actorId
+          authorizeHistory: ({ projectId, channel, actorId }) => {
+            if (!actorId) return channel.source === 'request'
+            const project = new Projects(store).detail(projectId)
+            const member = project.members.find(item => item.id === actorId)
+            return !!member && channels.authorize(project, channel, member)
           },
           progress: () => this.projectProgress,
           tracking: () => this.projectTracking,
@@ -268,12 +258,12 @@ export class Runtime extends Service implements SourceHost {
           stop: (projectId, taskId, ticketId) => this.stopProjectTask(projectId, taskId, ticketId),
           follow: (projectId, taskId, ticketId, text, origin, materials) => this.followProjectTask(projectId, taskId, ticketId, text, origin, materials),
           reply: (context, taskId, url, text) => this.projectRepository.reply(context, taskId, url, text) })
-        this.projectAgent = new ProjectAgent({ store, events: projectEvents, effects, tools, planner: () => planning.planner,
+        this.projectAgent = new ProjectAgent({ store, channels, events: projectEvents, effects, tools, planner: () => planning.planner,
           notify: message => this.communication.notify(message), lifetime: this.lifetime,
           attachmentDirectory: attachmentDirectory(machine.stateDir),
           teamSkills: () => prompts.current().config.skills,
           runnable: () => setup.configured() && !this.paused() && !this.closing() })
-        this.projectProgress = new ProjectProgress({ store, events: projectEvents, agent: this.projectAgent, lifetime: this.lifetime })
+        this.projectProgress = new ProjectProgress({ store, channels, events: projectEvents, agent: this.projectAgent, lifetime: this.lifetime })
         this.projectRepository.connect(this.projectAgent)
         resumeProjectActions(effects, this.projectAgent)
       }
@@ -332,6 +322,7 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         projectRepositories: () => new Projects(store).repositoryBindings(),
         projectResources: () => projectResources(store),
+        isAllowedSender: actor => !!allowedSender(store.settings(), actor),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => {
           const repositoryObservation = trigger.source === 'github' && trigger.meta.repositoryObservation === true
           if (trigger.source === 'github' && !repositoryObservation && trigger.meta.ci === true &&
@@ -355,7 +346,7 @@ export class Runtime extends Service implements SourceHost {
               : githubEventTask(trigger, notificationGroup)
           }
           return store.atomic(() => {
-            const projectMessage = runtime.receiveFeishuProjectMessage(incoming)
+            const projectMessage = runtime.receiveProjectConversation(incoming)
             if (projectMessage) return projectMessage
             const result = passes.receive(incoming)
             if (result === 'stored' && incoming.taskRequest) received?.(incoming)
@@ -428,27 +419,50 @@ export class Runtime extends Service implements SourceHost {
     return ticketEnvironment({ deployment, sources, settings: this.store.settings(), ticket, ...trigger ? { trigger } : {} })
   }
   checkSetup(): void { this.setup.check() }
-  private receiveFeishuProjectMessage(trigger: Trigger): ReceiveResult | undefined {
+  private receiveProjectConversation(trigger: Trigger): ReceiveResult | undefined {
     const { channel } = trigger
-    if (!this.projectAgent || !this.configured() || trigger.source !== 'feishu' || !trigger.human || trigger.addressed !== 'mention'
-      || channel?.source !== 'feishu' || channel.address.direct === 'true' || !this.sources.scope(trigger).listened) return
-    const appId = this.deployment.feishu?.appId
-    if (!appId || !allowedSender(this.store.settings(), trigger.actor)) return
+    const kind = this.sources.kind(trigger.source)
+    const parse = kind?.projectConversation?.incoming
+    if (!this.projectAgent || !this.configured() || !channel || !kind || !parse ||
+      !trigger.human || trigger.addressed !== 'mention' || channel.source !== trigger.source || !this.sources.scope(trigger).listened) return
     // Preserve normal intake for messages on a ticket subscription.
     if (trigger.threads.some(ref => this.store.threads.get(threadKey(ref))?.subscriptions.length)) return
+    const incoming = parse(this.context(kind), trigger)
+    if (!incoming) return
+    const project = this.projectChannels.boundProject(channel)
     const projects = new Projects(this.store)
-    const project = channel.address.chatId && projects.forFeishuChat(channel.address.chatId)
+    const planning = this.projectPlanning
+    const enrollment = incoming.intake && enrollmentIntent(trigger.text)
+    const firstMeeting = !project && incoming.intake && planning && isMeetingMinutes(trigger.text)
+    if (incoming.intake && (enrollment || firstMeeting) && allowedSender(this.store.settings(), trigger.actor)) {
+      const result = this.passes.receive({ ...trigger, meta: { ...trigger.meta, projectConversation: true, ...(project && { projectId: project.id }) } })
+      if (result !== 'filtered') return result
+      const name = incoming.senderName ?? `${kind.title.zh}成员 ${trigger.actor.id.slice(-6)}`
+      let text = '请 @ 机器人发送「登记项目成员」。'
+      if (enrollment === 'self') {
+        if (project) {
+          const member = projects.addAccountSender(project.id, kind.kind, incoming.scope, trigger.actor.id, name)
+          text = member.added ? `已加入「${member.projectName}」项目。` : `你已是「${member.projectName}」的项目成员。`
+        } else {
+          projects.registerAccountSender(kind.kind, incoming.scope, trigger.actor.id, name)
+          text = '已登记你的成员账号，可以提交首次项目纪要。'
+        }
+      } else if (firstMeeting && planning) {
+        const member = projects.directoryMemberForAccount(kind.kind, incoming.scope, trigger.actor.id)
+        text = submitFirstProjectMinutes(planning, trigger, incoming.intake, name, member?.id)
+      }
+      this.communication.notify({ id: key('project-intake', trigger.id), kind: 'notice', channel, text })
+      return result
+    }
     if (!project) return
-    const member = projects.memberForAccount(project.id, 'feishu', appId, trigger.actor.id)
-    if (!member) return
+    const member = projects.memberForAccount(project.id, kind.kind, incoming.scope, trigger.actor.id)
+    const sourceChannel = { ...channel, address: { ...channel.address, projectSenderId: trigger.actor.id } }
+    if (!member || !this.projectChannels.authorize(project, sourceChannel, member)) return
     const text = trigger.text.trim()
     if (!text || text.length > 26_000) return
     const result = this.passes.receive({ ...trigger, meta: { ...trigger.meta, projectConversation: true, projectId: project.id } })
-    if (result === 'filtered') this.projectAgent.submit({ projectId: project.id, actorId: member.id, messageId: trigger.id,
-      channel: { ...channel, address: { ...channel.address, projectSenderId: trigger.actor.id } },
-      text, sentAt: trigger.at, nativeMessageId: channel.address.messageId,
-      replyToNativeMessageId: typeof trigger.meta.parentId === 'string' ? trigger.meta.parentId : undefined,
-      sourceUrl: /^https?:\/\//i.test(trigger.url ?? '') ? trigger.url : undefined })
+    if (result === 'filtered') submitProjectConversation(this.projectAgent, projects, project.id, member.id, incoming.scope,
+      { ...incoming.message, messageId: trigger.id, channel: sourceChannel, text, sentAt: trigger.at }, incoming.mentioned)
     return result
   }
   receive(trigger: Trigger): ReceiveResult { return this.passes.receive(trigger) }

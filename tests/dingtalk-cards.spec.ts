@@ -93,18 +93,18 @@ it.each([true, false])('sends Markdown with a native mention or a readable recip
     .toMatchObject({ format: 'markdown', transport: active ? 'session-webhook' : 'application-group-api', messageType: active ? 'markdown' : 'sampleMarkdown',
       nativeMention: active })
 })
-it('discloses when an explicit mention can only be delivered as text', async () => {
+it('discloses when a project follow-up can only be delivered as text', async () => {
   const route = dingTalkTrigger(raw, context)!.route
   context.state.set(dingTalkRoute(route.conversationId), { ...route, expires: 0 })
   const request = vi.fn(async (url: string, _init?: RequestInit) => Response.json(
     url.endsWith('/accessToken') ? { accessToken: 'token' } : { processQueryKey: 'sent' },
   ))
   const bot = new DingTalk(context, { clientId: 'client', clientSecret: 'secret' }, () => {}, request as typeof fetch)
-  const notice: OutboundMessage = { id: 'explicit', kind: 'notice', text: '请核对小屏布局。',
+  const notice: OutboundMessage = { id: 'tracking-reminder', kind: 'notice', text: '请核对小屏布局。',
     channel: { source: 'dingtalk', thread: 'dingtalk:group', address: {
-      conversationId: 'group', mentionUserId: 'reviewer', mentionUserName: 'Reviewer', explicitMentionMemberId: 'member',
+      conversationId: 'group', mentionUserId: 'reviewer', mentionUserName: 'Reviewer', projectRecipientId: 'member',
     } } }
-  await bot.send(notice)
+  await expect(bot.send(notice)).resolves.toEqual({ nativeMention: false })
   const body = JSON.parse(String(request.mock.calls[1]?.[1]?.body))
   expect(JSON.parse(body.msgParam).content).toContain('本条为文字提醒，当前会话的原生 @ 不可用。')
   expect(dingTalkKind(async () => {}).channel!.deliveryInfo?.(context, notice.channel)).toMatchObject({ nativeMention: false })
@@ -121,7 +121,7 @@ it.each([true, false])('sends a standalone native mention and checks the group d
     channel: { source: 'dingtalk', thread: 'dingtalk:group', address: {
       conversationId: 'group', mentionUserId: 'reviewer', mentionUserName: 'Reviewer',
     } } }
-  if (accepted) await bot.send(notice)
+  if (accepted) await expect(bot.send(notice)).resolves.toEqual({ nativeMention: true })
   else await expect(bot.send(notice)).rejects.toThrow('DingTalk did not accept the mention card')
   const [url, init] = request.mock.calls[1]!
   expect(url).toBe('https://api.dingtalk.com/v1.0/card/instances/createAndDeliver')

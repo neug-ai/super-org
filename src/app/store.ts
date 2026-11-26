@@ -16,7 +16,7 @@ export interface TimelinePlace { at: string; id: string }
 /** Why a message was dropped: its conversation can never receive it (`channelGone`), or its Source no longer listens to it (`channelIgnored`). */
 export type DropReason = 'channelGone' | 'channelIgnored' | 'obsolete'
 /** Outbound message receipt tracked in the outbox from the moment it is queued (`pending`, `sent`, or `dropped`); delivery attempt counts live on its `reply` effect. */
-export interface Receipt extends OutboundMessage { status: ReplyStatus; dropped?: { at: string; reason: DropReason } }
+export interface Receipt extends OutboundMessage { nativeMessageId?: string; nativeMention?: boolean; status: ReplyStatus; dropped?: { at: string; reason: DropReason } }
 /** A dropped outbound message receipt, with the timestamp and reason it was dropped. */
 export type Dropped = Receipt & { dropped: { at: string; reason: DropReason } }
 /** Saved settings snapshot with the policy version and ticket notifications it produced (`internal` saves have no origin). */
@@ -306,6 +306,10 @@ export class Store implements Repositories {
         AND ((outbox.value ->> '$.kind' = 'reply' AND earlier.value ->> '$.meta.projectId' IS NULL)
           OR (outbox.value ->> '$.origin.projectId' = ? AND outbox.value ->> '$.origin.runId' IS NOT NULL))
       ORDER BY outbox.rowid DESC LIMIT 5`, triggerId, projectId ?? null).reverse(),
+    nativeProjectReply: (projectId: string, channel: ChannelRef, nativeMessageId: string): Receipt | undefined =>
+      this.values<Receipt>(`SELECT value FROM outbox WHERE value ->> '$.nativeMessageId' = ? AND value ->> '$.status' = 'sent'
+        AND value ->> '$.origin.projectId' = ? AND value ->> '$.channel.source' = ? AND value ->> '$.channel.thread' = ? LIMIT 1`,
+      nativeMessageId, projectId, channel.source, channel.thread)[0],
     /** Pending message receipts, oldest first. */
     waiting: (): Receipt[] => this.values("SELECT value FROM outbox WHERE value ->> '$.status' = 'pending' ORDER BY rowid"),
     /** True if an earlier message for the same ticket and conversation is still pending with fewer than `failures` consecutive failed `reply` effect attempts. */
@@ -324,8 +328,8 @@ export class Store implements Repositories {
      * Marks a pending receipt as sent or dropped (with drop reason and timestamp), recreating the receipt if the message
      * was withdrawn while being sent so its ID cannot be queued again.
      */
-    settle: (message: OutboundMessage, outcome: 'sent' | DropReason): void => {
-      const settled = outcome === 'sent' ? { status: 'sent' } : { status: 'dropped', dropped: { at: new Date().toISOString(), reason: outcome } }
+    settle: (message: OutboundMessage, outcome: 'sent' | DropReason, delivery?: Pick<Receipt, 'nativeMessageId' | 'nativeMention'>): void => {
+      const settled = outcome === 'sent' ? { status: 'sent', ...delivery } : { status: 'dropped', dropped: { at: new Date().toISOString(), reason: outcome } }
       const { id } = message
       const settle = () => {
         const updated = this.db.prepare("UPDATE outbox SET value = json_patch(value, ?) WHERE id = ? AND value ->> '$.status' = 'pending'")

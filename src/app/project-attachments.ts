@@ -30,27 +30,24 @@ export const attachmentDirectory = (stateDir: string): string => join(stateDir, 
 
 /** Provider-neutral attachment download, original storage and preview. */
 export class ProjectAttachments {
-  private readonly readers = new Map<string, AttachmentReader>()
-  private readonly linkedReaders = new Map<string, LinkedDocumentReader>()
-
-  constructor(private readonly directory?: string) {}
-
-  register(source: string, reader: AttachmentReader): void {
-    if (this.readers.has(source)) throw new Error('This attachment source is already registered')
-    this.readers.set(source, reader)
-  }
-
-  registerLinked(source: string, reader: LinkedDocumentReader): void {
-    if (this.linkedReaders.has(source)) throw new Error('This linked document source is already registered')
-    this.linkedReaders.set(source, reader)
-  }
+  constructor(private readonly directory: string | undefined, private readonly capabilities: {
+    attachment(source: string): AttachmentReader | undefined
+    quotedAttachments(message: ProjectMessage, signal: AbortSignal): Promise<MessageAttachment[]> | undefined
+    documents(): LinkedDocumentReader[]
+  }) {}
 
   async readLinked(message: ProjectMessage, links: readonly string[], planner: ProjectPlanner, signal: AbortSignal): Promise<LinkedDocumentResult[]> {
-    const reader = this.linkedReaders.get(message.channel.source)
-    if (!reader) return []
-    const recognized = new Set(links.map(link => reader.recognize(link)).filter(link => link !== undefined))
+    const readers = this.capabilities.documents()
+    const recognized = new Map<string, LinkedDocumentReader>()
+    for (const link of links) {
+      const matches = readers.flatMap(reader => {
+        const canonical = reader.recognize(link)
+        return canonical ? [{ canonical, reader }] : []
+      })
+      if (matches.length === 1) recognized.set(matches[0]!.canonical, matches[0]!.reader)
+    }
     const results: LinkedDocumentResult[] = []
-    for (const link of recognized) {
+    for (const [link, reader] of recognized) {
       let name = '在线文档'
       try {
         const document = await reader.read(message, link, signal)
@@ -82,8 +79,13 @@ export class ProjectAttachments {
   async read(message: ProjectMessage, planner: ProjectPlanner, signal: AbortSignal,
     retained: readonly AttachmentResult[] = []): Promise<AttachmentResult[]> {
     const results: AttachmentResult[] = []
-    const reader = this.readers.get(message.channel.source)
-    for (const attachment of message.attachments ?? []) {
+    const reader = this.capabilities.attachment(message.channel.source)
+    const attached = message.attachments ?? []
+    const quoted = message.replyToNativeMessageId && attached.length < maxProjectAttachments &&
+      !attached.some(item => item.nativeMessageId === message.replyToNativeMessageId)
+      ? await this.capabilities.quotedAttachments(message, signal) : undefined
+    const attachments = [...new Map([...attached, ...(quoted ?? [])].map(item => [item.id, item])).values()].slice(0, maxProjectAttachments)
+    for (const attachment of attachments) {
       const cached = retained.find(item => item.attachmentId === attachment.id && item.original)
       const attachmentId = attachment.id
       const extension = extname(attachment.name).toLowerCase()

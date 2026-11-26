@@ -36,6 +36,7 @@ export interface SourceContext {
   readonly ready: Promise<void>
   /** True once setup resolved the repository and accounts; Sources poll only then. */
   configured(): boolean
+  isAllowedSender?(actor: Trigger['actor']): boolean
   projectRepositories?(): { repository: string; since: string }[]
   projectResources?(): import('./repository-events.ts').ProjectRepositoryTarget[]
   /** Exact automation output provenance, for echo suppression without treating a shared user account as a bot. */

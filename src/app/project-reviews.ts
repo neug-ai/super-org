@@ -5,6 +5,7 @@ import { key, type ChannelRef, type OutboundMessage } from '../core/index.ts'
 import type { ProjectEvent, ProjectEventDefinition } from '../sources/project-events.ts'
 import { currentReview, reviewReference, type DeliveryEvidence, type ReviewOutcome } from './project-deliveries.ts'
 import { announce } from './project-notifications.ts'
+import type { ProjectChannels } from './project-channels.ts'
 import { ProjectError, Projects, type ProjectTask } from './projects.ts'
 import type { ProjectEvents } from './project-events.ts'
 import type { Store } from './store.ts'
@@ -37,7 +38,7 @@ export const reviewFeedback = definition('review.feedback', '把反馈附到当�
 const reviewEvents = { accepted: reviewAccepted, rejected: reviewRejected, feedback: reviewFeedback }
 const basis = (task: ProjectTask) => createHash('sha256').update(JSON.stringify([task.deliveryVersion, task.title, task.description,
   task.acceptance, task.ownerId, task.executionMode, task.blockedBy, task.status, task.ticketId, task.executionStartedAt])).digest('hex')
-interface Host { store: Store; events: ProjectEvents; notify(message: OutboundMessage): void }
+interface Host { store: Store; channels: ProjectChannels; events: ProjectEvents; notify(message: OutboundMessage): void }
 
 /** Provides a shared, durable review entry for worker deliveries, human submissions, the board and Agent tools. */
 export class ProjectReviews {
@@ -121,9 +122,13 @@ export class ProjectReviews {
     if (context.actorId === null) {
       if (!['request', 'execution'].includes(context.channel.source)) throw new ProjectError(403, '缺少有效的成员身份。')
     } else if (!project.memberIds.includes(context.actorId)) throw new ProjectError(403, '请先登记为这个项目的成员。')
-    if (context.channel.source === 'dingtalk' && context.channel.address.conversationId !== project.dingTalkGroup ||
-      context.channel.source === 'feishu' && context.channel.address.chatId !== project.feishuChatId)
-      throw new ProjectError(403, '这条验收消息来自另一个项目群。')
+    if (context.actorId && !['request', 'execution'].includes(context.channel.source)) {
+      if (!this.host.channels.matches(project, context.channel))
+        throw new ProjectError(403, '这条验收消息来自另一个项目群。')
+      const member = project.members.find(item => item.id === context.actorId)!
+      if (!this.host.channels.authorize(project, context.channel, member))
+        throw new ProjectError(403, '这条验收消息的项目群或成员身份无效。')
+    }
     const task = project.tasks.find(item => item.id === taskId)
     if (!task) throw new ProjectError(404, '任务不属于当前项目。')
     return { project, task }
@@ -177,7 +182,7 @@ export class ProjectReviews {
         : '验证人可引用本消息，在原任务上记录反馈或结论。',
       evidence: JSON.stringify({ result: evidence.summary, acceptance: review.requirements.acceptance, links: evidence.links }),
       reference: reviewReference(review), details: `项目看板 →「${project.name}」→「${task.title}」→ 交付与验收记录。`,
-    }, owner)
+    }, owner, ['request', 'execution'].includes(context.channel.source) ? undefined : context.channel.source)
     return { status: 'applied' as const }
   }
 
@@ -189,8 +194,9 @@ export class ProjectReviews {
         ...(reviewerName && { reviewerName }) })
     if (outcome === 'feedback') return { status: 'applied' as const }
     const review = currentReview(updated.tasks.find(item => item.id === task.id)!)!
-    if (!(context.replyOwner === 'agent' && context.channel.source === 'dingtalk' && context.channel.address.conversationId === updated.dingTalkGroup))
-      announce(this.host, updated, event.id, `${reviewReference(review)}「${task.title}」${outcome === 'accepted' ? '验收通过，任务已完成。' : '已退回，任务返回进行中。'}\n原因：${reason.slice(0, 1200)}${outcome === 'rejected' ? '\n请按退回意见修订后再次提交交付。' : ''}`)
+    if (!(context.replyOwner === 'agent' && this.host.channels.matches(updated, context.channel)))
+      announce(this.host, updated, event.id, `${reviewReference(review)}「${task.title}」${outcome === 'accepted' ? '验收通过，任务已完成。' : '已退回，任务返回进行中。'}\n原因：${reason.slice(0, 1200)}${outcome === 'rejected' ? '\n请按退回意见修订后再次提交交付。' : ''}`,
+        undefined, context.channel.source)
     return { status: 'applied' as const }
   }
 

@@ -53,7 +53,7 @@ export interface HttpHost {
   readonly projectAgent?: Pick<ProjectAgent, 'submit' | 'runs' | 'webConversation'>
   readonly projectTools?: Pick<ProjectTools, 'catalog' | 'snapshot'>
   readonly projectReviews?: Pick<ProjectReviews, 'deliver' | 'decide'>
-  readonly communication?: Pick<Communication, 'read' | 'update'>
+  readonly communication?: Pick<Communication, 'read' | 'update' | 'projectChannel'>
   readonly store: Store
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
@@ -206,15 +206,14 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
   return {
     'GET projects/:id/conversation-preferences': ({ params }) => {
       if (!host?.communication) throw new ProjectError(409, '沟通偏好服务尚未启动。')
-      const project = projects.detail(params.id)
-      return host.communication.read({ source: project.dingTalkGroup ? 'dingtalk' : 'request', thread: project.dingTalkGroup ? `dingtalk:${project.dingTalkGroup}` : project.id })
+      return host.communication.read(host.communication.projectChannel(params.id))
     },
     'PUT projects/:id/conversation-preferences': async ({ params, body }) => {
       if (!host?.communication) throw new ProjectError(409, '沟通偏好服务尚未启动。')
       const value = z.strictObject({ requestId: ticketId, revision: z.number().int().nonnegative(), value: CommunicationPreference }).parse(await body())
       const project = projects.detail(params.id)
       const channel = { source: 'request', thread: project.id, address: { projectId: project.id } }
-      const target = project.dingTalkGroup ? { source: 'dingtalk', thread: `dingtalk:${project.dingTalkGroup}`, address: { conversationId: project.dingTalkGroup } } : channel
+      const target = host.communication.projectChannel(project.id)
       return host.communication.update({ projectId: project.id, actorId: null, operationId: value.requestId, channel }, value.revision, value.value, target)
     },
     'POST projects/:id/tasks/:taskId/deliveries': async ({ params, body }) => {

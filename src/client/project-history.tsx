@@ -244,6 +244,7 @@ function Notifications({ t, records, filter, setFilter, taskName, total }: { t: 
         <span className="dt-history-record-icon"><Icon name="message" /></span>
         <div>
           <div className="dt-project-meta"><Tag tone={deliveryTone[item.status]}>{t(`project.notification.${item.status}`)}</Tag>
+            {item.nativeMention !== undefined && <Tag tone={item.nativeMention ? 'success' : 'warning'}>{t(item.nativeMention ? 'project.notification.nativeMention' : 'project.notification.textMention')}</Tag>}
             <span>{item.source}</span>{item.origin.taskId && <strong>{taskName(item.origin.taskId)}</strong>}</div>
           <details className="dt-history-message"><summary>{item.text.split('\n').find(line => line.trim())?.trim() || t('project.eventEvidence')}</summary>
             <MarkdownContent t={t} text={item.text} />

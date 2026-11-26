@@ -46,7 +46,7 @@ it('captures manual evidence and requirements once, notifies the owner to coordi
   const review = await submit()
   expect(readTask()).toMatchObject({ status: 'in-review', deliveryVersion: 1, reviews: [{ status: 'pending', requirements: { ownerId: owner.id, acceptance: 'Reproducible evidence' }, evidence: { summary: 'Experiment output and repeatable results' } }] })
   expect(send).toHaveBeenCalledWith(expect.objectContaining({ text: expect.stringContaining(reviewReference(review)),
-    channel: expect.objectContaining({ address: { conversationId: 'group', mentionUserId: 'owner', mentionUserName: owner.name } }) }))
+    channel: expect.objectContaining({ address: expect.objectContaining({ conversationId: 'group', mentionUserId: 'owner', mentionUserName: owner.name }) }) }))
   expect(projects.detail(id).tasks).toHaveLength(1)
   expect(await decide(review.id, 'accepted')).toMatchObject({ status: 200 })
   expect(readTask()).toMatchObject({ status: 'done', completedAt: expect.any(String), reviews: [{ status: 'accepted', decision: { actorId: null, source: 'request', reason: 'Checked all evidence' } }] })

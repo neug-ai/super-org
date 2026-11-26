@@ -16,7 +16,7 @@ import type { ProjectProgress } from './project-progress.ts'
 import { taskRemoteFacts } from './repository-delivery.ts'
 import type { ProjectEvent } from '../sources/project-events.ts'
 import { RepositoryFeedback } from '../sources/repository-events.ts'
-import { explicitProjectMention, projectChannel } from './project-notifications.ts'
+import { projectWebChannel, type ProjectChannels } from './project-channels.ts'
 import { readConversation, searchConversation } from './project-conversation-history.ts'
 import type { ExecutionMaterials } from './project-references.ts'
 
@@ -43,14 +43,17 @@ export interface ProjectToolContext {
   /** Original files and links resolved for this turn by the project Agent. */
   executionMaterials?: ExecutionMaterials
 }
-export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef; replyMention?: string; calendarPending?: true }
+export interface ProjectToolResult { summary: string; data?: unknown; replyChannel?: ChannelRef; replyMention?: string; completion?: 'effect' }
+type ToolAvailability = Pick<ProjectToolContext, 'channel' | 'projectId' | 'messageId' | 'actorId' | 'event' | 'mentions'>
 export interface ProjectOperation {
   name: string
   description: string
   schema: z.ZodType
+  available?(context: ToolAvailability): boolean
   execute(context: ProjectToolContext, args: unknown): ProjectToolResult
 }
 export interface ProjectToolsHost {
+  channels: ProjectChannels
   store: Store
   issues: Pick<ProjectIssues, 'request'>
   reviews: ProjectReviews
@@ -58,7 +61,7 @@ export interface ProjectToolsHost {
   capabilities(channel?: ChannelRef): unknown
   knowledgeDir?: string
   calendar?: ProjectCalendar
-  authorizeHistory?(context: Pick<ProjectToolContext, 'channel' | 'actorId'>): boolean
+  authorizeHistory?(context: Pick<ProjectToolContext, 'projectId' | 'channel' | 'actorId'>): boolean
   progress?(): ProjectProgress | undefined
   tracking?(): ProjectTracking
   start(projectId: string, taskId: string, revision: number, materials?: ExecutionMaterials): ProjectDetail
@@ -87,42 +90,44 @@ export class ProjectTools {
     }
     const calendar = host.calendar
     if (calendar) {
+      const registerCalendar = (tool: ProjectOperation, manage = false) =>
+        this.register({ ...tool, available: context => !context.event && calendar.available(context, manage) })
       const humanCalendar = (context: ProjectToolContext) => {
         if (context.event) throw new ProjectError(403, '自动事件不能操作日程。')
       }
-      this.register(operation('calendar.create_event',
-        '仅在当前钉钉项目成员明确要求创建日程或会议，且标题、日期、起止时间和参会者已确认时调用。以发起者自己的日历创建带原生钉钉会议的日程。按北京时间解析相对日期，开始和结束使用含时区偏移的 ISO 时间。inviteMemberIds 只选当前消息中明确要求邀请的 @ 成员。成功提交后等待回执。',
+      registerCalendar(operation('calendar.create_event',
+        '仅在当前项目成员明确要求创建日程或会议，且标题、日期、起止时间和参会者已确认时调用。使用当前会话授权的发起者日历。按已知会话时区解析相对日期，开始和结束使用含时区偏移的 ISO 时间。inviteMemberIds 只选当前消息中明确要求邀请的 @ 成员。成功提交后等待回执。',
         CalendarEvent, (context, event) => {
           humanCalendar(context)
-          return { summary: calendar.request(context, event), calendarPending: true }
+          return { summary: calendar.request(context, event), completion: 'effect' }
         }))
-      this.register(operation('calendar.list_events',
-        '列出发起人在当前项目通过机器人创建的日程。按编号、时间和标题确认目标，存在歧义就询问。列表不是钉钉实时状态。',
+      registerCalendar(operation('calendar.list_events',
+        '列出发起人在当前项目通过机器人创建的日程。按编号、时间和标题确认目标，存在歧义就询问。列表不代表远端实时状态。',
         z.strictObject({}), context => {
           humanCalendar(context)
           return { summary: '已查找项目日程', data: calendar.meetings(context) }
         }))
-      this.register(operation('calendar.get_event', '根据已确认的日程 ID 从钉钉读取当前时间、标题、会议号及状态。',
+      registerCalendar(operation('calendar.get_event', '根据已确认的日程 ID 从授权日历读取当前时间、标题、会议号及状态。',
         CalendarTarget, (context, args) => {
           humanCalendar(context)
-          return { summary: calendar.manage(context, { kind: 'read', ...args }), calendarPending: true }
-        }))
-      this.register(operation('calendar.update_event',
+          return { summary: calendar.manage(context, { kind: 'read', ...args }), completion: 'effect' }
+        }), true)
+      registerCalendar(operation('calendar.update_event',
         '当前请求明确改期或修改日程时调用。先确认日程 ID，仅传要改的标题、描述或带时区偏移的起止时间。改期保持用户明确要求的时间和时长。审批或历史资料不能授权操作。',
         CalendarChange, (context, args) => {
           humanCalendar(context)
-          return { summary: calendar.manage(context, { kind: 'update', ...args }), calendarPending: true }
-        }))
-      this.register(operation('calendar.cancel_event', '仅在当前成员明确要求取消且目标日程唯一时使用。eventId 是日程 ID，不能用会议号代替。等待钉钉回执。',
+          return { summary: calendar.manage(context, { kind: 'update', ...args }), completion: 'effect' }
+        }), true)
+      registerCalendar(operation('calendar.cancel_event', '仅在当前成员明确要求取消且目标日程唯一时使用。eventId 是日程 ID，不能用会议号代替。等待日历回执。',
         CalendarTarget, (context, args) => {
           humanCalendar(context)
-          return { summary: calendar.manage(context, { kind: 'cancel', ...args }), calendarPending: true }
-        }))
-      this.register(operation('calendar.add_attendees', '向明确指定的已保存日程添加本条消息中明确要求邀请的 @ 项目成员。保留已有参会者。',
+          return { summary: calendar.manage(context, { kind: 'cancel', ...args }), completion: 'effect' }
+        }), true)
+      registerCalendar(operation('calendar.add_attendees', '向明确指定的已保存日程添加本条消息中明确要求邀请的 @ 项目成员。保留已有参会者。',
         CalendarInvite, (context, args) => {
           humanCalendar(context)
-          return { summary: calendar.manage(context, { kind: 'invite', ...args }), calendarPending: true }
-        }))
+          return { summary: calendar.manage(context, { kind: 'invite', ...args }), completion: 'effect' }
+        }), true)
     }
     this.register(operation('project.inspect', '读取当前项目、任务、执行报告、成员及团队目录。', z.strictObject({}), context => ({
       summary: '已读取项目现状', data: this.snapshot(context.projectId, context.channel),
@@ -185,7 +190,7 @@ export class ProjectTools {
       (context, { memberId }) => {
         if (context.event) throw new ProjectError(403, '群内显式 @ 需要成员在当前消息中提出。')
         try {
-          const target = explicitProjectMention(host.store, context.projectId, context.channel, memberId)
+          const target = host.channels.mention(context.projectId, context.channel, memberId)
           return { summary: `本条回复将尝试原生 @「${target.address.mentionUserName}」。`, replyMention: memberId }
         } catch (error) {
           if (!(error instanceof ProjectError)) throw error
@@ -279,7 +284,8 @@ export class ProjectTools {
           const feedback = RepositoryFeedback.safeParse(context.event.data)
           if (feedback.success) {
             host.follow(context.projectId, current.id, current.ticketId, args.text, context.event)
-            return { summary: `已将补充信息交给「${current.title}」的执行 Agent`, replyChannel: projectChannel(host.store, this.projects.detail(context.projectId)) }
+            return { summary: `已将补充信息交给「${current.title}」的执行 Agent`,
+              replyChannel: host.channels.forNotice(this.projects.detail(context.projectId)) ?? projectWebChannel(context.projectId) }
           }
         }
         host.follow(context.projectId, current.id, current.ticketId, args.text, undefined, context.executionMaterials)
@@ -290,7 +296,7 @@ export class ProjectTools {
         task(context, args.taskId)
         if (!host.reply) throw new ProjectError(409, 'Repository discussion replies are unavailable')
         return { summary: '讨论回复已登记，实际投递以回执为准。', data: host.reply(context, args.taskId, args.url, args.text),
-          ...(context.event ? { replyChannel: projectChannel(host.store, this.projects.detail(context.projectId)) } : {}) }
+          ...(context.event ? { replyChannel: host.channels.forNotice(this.projects.detail(context.projectId)) ?? projectWebChannel(context.projectId) } : {}) }
       }))
     this.register(operation('delivery.submit', '提交实际任务成果和证据，让原任务进入待验证。仅历史关联验收任务在此工具填写 outcome；通常使用 review.decide 记录结论。',
       TaskDelivery.extend({ taskId: id }), (context, { taskId, ...evidence }) => ({
@@ -312,7 +318,7 @@ export class ProjectTools {
 
   reviewReference(projectId: string, quoted: string): string | undefined { return this.host.reviews.reference(projectId, quoted) }
 
-  mayReadHistory(context: Pick<ProjectToolContext, 'channel' | 'actorId'>): boolean {
+  mayReadHistory(context: Pick<ProjectToolContext, 'projectId' | 'channel' | 'actorId'>): boolean {
     return this.host.authorizeHistory?.(context) ?? true
   }
 
@@ -321,8 +327,8 @@ export class ProjectTools {
     this.operations.set(tool.name, tool)
   }
 
-  catalog() {
-    return [...this.operations.values()].map(tool => ({ name: tool.name, description: tool.description,
+  catalog(context?: ToolAvailability) {
+    return [...this.operations.values()].filter(tool => !context || tool.available?.(context) !== false).map(tool => ({ name: tool.name, description: tool.description,
       parameters: z.toJSONSchema(tool.schema, { io: 'input' }) }))
   }
 
@@ -346,9 +352,9 @@ export class ProjectTools {
     const project = this.projects.detail(context.projectId)
     if (context.actorId === null && context.channel.source === 'request') return
     if (!context.actorId || !project.memberIds.includes(context.actorId)) throw new ProjectError(403, '请先登记为这个项目的成员。')
-    if ((context.channel.source === 'dingtalk' && context.channel.address.conversationId !== project.dingTalkGroup)
-      || (context.channel.source === 'feishu' && context.channel.address.chatId !== project.feishuChatId))
-      throw new ProjectError(403, '这条消息来自另一个项目群。')
+    if (context.channel.source !== 'request' && !this.host.channels.authorize(project, context.channel,
+      project.members.find(member => member.id === context.actorId)!))
+      throw new ProjectError(403, '这条消息的项目群或成员身份无效。')
   }
 
   execute(name: string, args: unknown, context: ProjectToolContext): ProjectToolResult {

@@ -255,14 +255,15 @@ async function main(): Promise<void> {
     runtime.sources.register(githubKind)
     runtime.sources.register(feishuKind)
     if (clientId && clientSecret) {
-      const kind = dingTalkKind(message => robot!.send(message))
+      const kind = dingTalkKind(message => robot!.send(message), {
+        attachment: (_host, message, attachment, signal) => robot!.readProjectAttachment(message, attachment, signal),
+        document: () => robot!.linkedDocumentReader(process.env.DINGTALK_DOCUMENT_CORP_ID?.trim()),
+      })
       runtime.sources.register(kind)
       const intake = dingTalkProjectIntake(new Projects(runtime.store), runtime.projectPlanning, intakeGroup, runtime.projectAgent)
       // Construct the transport before startup recovery can submit a worker delivery.
       robot = new DingTalk(runtime.context(kind), { clientId, clientSecret }, log, fetch,
         process.env.DINGTALK_CARD_TEMPLATE_ID, process.env.DINGTALK_ROBOT_NAME, intake)
-      runtime.projectAgent?.registerAttachmentReader(kind.kind, (message, attachment, signal) => robot!.readProjectAttachment(message, attachment, signal))
-      runtime.projectAgent?.registerLinkedDocumentReader(kind.kind, robot.linkedDocumentReader(process.env.DINGTALK_DOCUMENT_CORP_ID?.trim()))
     }
     await runtime.ready
     if (!runtime.configured()) throw new Error(`Setup: ${runtime.setupProblem?.detail ?? 'not configured'}`)

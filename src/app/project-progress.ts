@@ -8,7 +8,7 @@ import type { ProjectAgent } from './project-agent.ts'
 import type { ProjectEvents } from './project-events.ts'
 import { ProjectError, type Project, type ProjectTask } from './projects.ts'
 import type { Store } from './store.ts'
-import { projectChannel } from './project-notifications.ts'
+import { projectWebChannel, type ProjectChannels } from './project-channels.ts'
 import { isProjectAgent } from './project-member.ts'
 import { awaitsTaskExecution } from './project-task-context.ts'
 
@@ -28,7 +28,7 @@ export const checkDue: ProjectEventDefinition = {
   documentation: 'docs/events/follow-up.zh-CN.md',
 }
 export interface ProjectCheck { id: string; projectId: string; taskId: string; at: string; reason: string; signature: string; fired?: boolean }
-interface Host { store: Store; events: ProjectEvents; agent: Pick<ProjectAgent, 'react'> & Partial<Pick<ProjectAgent, 'registerReaction'>>; lifetime: AbortSignal; now?: () => number }
+interface Host { store: Store; channels?: ProjectChannels; events: ProjectEvents; agent: Pick<ProjectAgent, 'react'> & Partial<Pick<ProjectAgent, 'registerReaction'>>; lifetime: AbortSignal; now?: () => number }
 const scope = (project: Project, task: ProjectTask) => key(JSON.stringify({ repository: project.repository,
   title: task.title, description: task.description, acceptance: task.acceptance, ownerId: task.ownerId,
   deliveryMode: task.deliveryMode ?? 'report', pullRequestUrl: task.pullRequestUrl ?? null, targetBranch: task.targetBranch ?? null,
@@ -82,7 +82,7 @@ export class ProjectProgress {
 
   private channel(project: Project, task: ProjectTask): ChannelRef {
     const owner = task.ownerId && this.host.store.get(KV.projects.member(task.ownerId))
-    return projectChannel(this.host.store, project, owner || undefined)
+    return this.host.channels?.forNotice(project, owner || undefined) ?? projectWebChannel(project.id)
   }
 
   private assignee(event: ProjectEvent): string | undefined {

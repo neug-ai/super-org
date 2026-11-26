@@ -5,9 +5,10 @@ import { type SourceContext } from './host.ts'
 import { type ProjectPlanning } from '../app/project-planning.ts'
 import { type ProjectAgent } from '../app/project-agent.ts'
 import type { Projects } from '../app/projects.ts'
+import { enrollmentIntent, isMeetingMinutes, meetingClarification, meetingEvidence, meetingFeedback, submitFirstProjectMinutes, submitProjectConversation } from '../app/project-intake.ts'
 import { DWClient, TOPIC_ROBOT } from 'dingtalk-stream'
 import { z } from 'zod'
-import { type SourceKind } from './kind.ts'
+import { type ProjectConversationSource, type SourceDelivery, type SourceKind } from './kind.ts'
 import { maxProjectAttachments, projectMessageReceived, type MessageAttachment, type ProjectMessage } from './project-message.ts'
 import { DingTalkCards } from './dingtalk-cards.ts'
 import { AttachmentReadError, maxAttachmentBytes, readAttachmentText, supportedAttachment } from '../app/attachment-text.ts'
@@ -18,11 +19,6 @@ function sender(trigger: Trigger) {
   const corpId = trigger.meta.senderCorpId
   const name = typeof trigger.meta.senderNick === 'string' ? trigger.meta.senderNick : `钉钉成员 ${trigger.actor.id.slice(-6)}`
   return { corpId: typeof corpId === 'string' && corpId.length <= 128 && trigger.actor.id.length <= 128 ? corpId : undefined, name }
-}
-function enrollmentIntent(text: string): 'self' | 'help' | undefined {
-  const message = text.replace(/[。！？!?]+$/u, '').trim()
-  if (/^(?:登记项目成员|(?:请)?(?:帮我|给我|把我|将我)\s*(?:登记(?:加入(?:项目)?|为(?:本|这个)?项目成员)?|加入(?:本|这个)?项目)|我要(?:登记(?:为)?项目成员|加入(?:本|这个)?项目))$/u.test(message)) return 'self'
-  if (/^(?:请问[，,：:\s]*)?(?:(?:这个群|本群|群里)的?成员|项目成员|群成员)?\s*(?:如何|怎么|怎样)(?:登记(?:为?项目成员)?(?:上来)?|加入(?:本|这个)?项目)(?:呢|呀|吗)?$/u.test(message)) return 'help'
 }
 function enrollmentHelp(project?: DingTalkIntake['project']): string {
   const action = '每位群成员可以 @ 我发「登记项目成员」，也可以发「把我登记加入」。'
@@ -44,32 +40,14 @@ export function dingTalkProjectIntake(projects: Projects, planning?: ProjectPlan
         return added ? '已登记你的成员账号。团队讨论后可以提交首次项目纪要。' : '你的成员账号已登记。'
       },
       onMeeting: (trigger: Trigger) => {
-        if (trigger.text.length > 26_000) return '会议纪要超过 26,000 字，请缩短后重发。'
         const { corpId, name } = sender(trigger)
-        const member = corpId && projects.directoryMemberForAccount('dingtalk', corpId, trigger.actor.id)
-        if (!member) return '请先 @ 我发「登记项目成员」，再提交会议纪要。'
-        const names = [...trigger.text.matchAll(/^项目名称[：:][ \t]*(.*)$/gm)]
-        const projectName = names[0]?.[1]?.trim()
-        if (names.length !== 1 || !projectName || projectName.length > 200) return '团队确认项目名称后，请在纪要里保留一行「项目名称：…」。'
-        const repositories = [...trigger.text.matchAll(/^GitHub 仓库[：:][ \t]*(.*)$/gim)]
-        const raw = repositories[0]?.[1]?.trim()
-        if (repositories.length > 1) return '如果会议已确定 GitHub 仓库，请在同一行填写一个 owner/repo 或 GitHub 仓库链接。'
-        try { planning.submitFirstMinutes({ name: projectName, repository: raw && raw !== '无' ? raw : null, dingTalkGroup: group }, {
-          ...meetingEvidence(trigger, name, member.id), text: trigger.text, channel: trigger.channel,
-          clarificationHint: '补充时请 @ 我发「会议反馈：…」。',
-        }) } catch (error) {
-          if (error instanceof z.ZodError) return '如果会议已确定 GitHub 仓库，请在同一行填写一个 owner/repo 或 GitHub 仓库链接。'
-          throw error
-        }
-        return `已建立「${projectName}」，当前待开工。正在整理本次会议的分工。`
+        const member = corpId ? projects.directoryMemberForAccount('dingtalk', corpId, trigger.actor.id) : undefined
+        return submitFirstProjectMinutes(planning, trigger, { dingTalkGroup: group }, name, member?.id)
       },
     }
   } }
 }
-function meetingEvidence(trigger: Trigger, name: string, memberId?: string) {
-  return { triggerId: trigger.id, source: trigger.source, name, at: trigger.at, memberId,
-    messageId: typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined }
-}
+
 export function dingTalkProjects(conversationId: string, projectId: string, projects: Projects, planning: ProjectPlanning, agent?: ProjectAgent): DingTalkIntake {
   const enrollFirst = '请先在项目群里 @ 我发送「登记项目成员」。'
   const evidence = (trigger: Trigger) => {
@@ -78,31 +56,24 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
     return meetingEvidence(trigger, name, member?.id)
   }
   const meetingMessage = (trigger: Trigger, text = trigger.text) => ({ ...evidence(trigger), projectId, text,
-    channel: trigger.channel, clarificationHint: '补充时请 @ 我发「会议反馈：…」。' })
+    channel: trigger.channel, clarificationHint: meetingClarification })
   const manage = (trigger: Trigger) => {
     const { memberId } = evidence(trigger)
     if (!memberId) return enrollFirst
     if (!trigger.channel || !agent) return '项目消息通道尚未就绪。'
     const { corpId } = sender(trigger)
-    const mentions = new Map<string, { memberId: string; name: string }>()
-    let unresolvedCount = 0
-    const mentionedStaffIds = trigger.meta.mentionedStaffIds
-    if (corpId && Array.isArray(mentionedStaffIds)) {
-      for (const staffId of mentionedStaffIds) {
-        const member = typeof staffId === 'string' ? projects.directoryMemberForAccount('dingtalk', corpId, staffId) : undefined
-        if (member) mentions.set(member.id, { memberId: member.id, name: member.name })
-        else unresolvedCount++
-      }
-    }
+    if (!corpId) return enrollFirst
     const attachments = Array.isArray(trigger.meta.attachments) ? trigger.meta.attachments as MessageAttachment[] : undefined
     const quotedLinks = trigger.meta.quotedDocumentLinks
-    const result = agent.submit({ projectId, actorId: memberId, messageId: trigger.id, channel: trigger.channel,
-      text: trigger.text, quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '',
+    const mentions = Array.isArray(trigger.meta.mentionedStaffIds) ? trigger.meta.mentionedStaffIds.map(id => typeof id === 'string' ? id : null) : []
+    const result = submitProjectConversation(agent, projects, projectId, memberId, corpId, {
+      messageId: trigger.id, channel: trigger.channel, text: trigger.text,
+      quoted: typeof trigger.meta.replyToBotText === 'string' ? trigger.meta.replyToBotText : '',
       sentAt: trigger.at, nativeMessageId: typeof trigger.meta.messageId === 'string' ? trigger.meta.messageId : undefined,
       replyToNativeMessageId: typeof trigger.meta.replyToMessageId === 'string' ? trigger.meta.replyToMessageId : undefined,
       ...(Array.isArray(quotedLinks) && quotedLinks.length && { quotedDocumentLinks: quotedLinks }),
       ...(attachments?.length && { attachments, ...(trigger.meta.attachmentOnly === true && { attachmentOnly: true as const }) }),
-      ...(mentions.size || unresolvedCount ? { mentions: { members: [...mentions.values()], unresolvedCount } } : {}) })
+    }, mentions)
     return result.status === 'disabled' ? '项目消息处理已关闭，可在事件配置中开启。' :
       { text: '已收到，正在结合项目现状处理。', kind: 'acknowledgement' as const }
   }
@@ -125,12 +96,12 @@ export function dingTalkProjects(conversationId: string, projectId: string, proj
     discussion: trigger => {
       if (agent) return () => manage(trigger)
       const { name, status, meeting } = projects.meetingStatus(projectId)
-      const explicit = /^会议反馈[：:]/u.test(trigger.text)
+      const explicit = meetingFeedback.test(trigger.text)
       const quote = typeof trigger.meta.replyToMessageId === 'string' && projects.detail(projectId).decisions
         .find(item => item.meetingSource?.messageId === trigger.meta.replyToMessageId)
       if (!meeting || !(explicit || quote || status === 'planning')) return
       return () => {
-        const text = trigger.text.replace(/^会议反馈[：:]\s*/u, '').trim()
+        const text = trigger.text.replace(meetingFeedback, '').trim()
         if (!text) return '请在「会议反馈」后附上具体意见。'
         const result = planning.recordFeedback(meetingMessage(trigger, text.slice(0, 8000)), (quote || meeting).id, explicit || !!quote)
         if (result === 'membership-required') return enrollFirst
@@ -430,7 +401,7 @@ export class DingTalk {
           const textCommand = (trigger.meta.messageType === 'text' || trigger.meta.messageType === 'richText')
             && context.config('dingtalk') !== undefined
           const enrollment = textCommand && handlers?.onSender ? enrollmentIntent(trigger.text) : undefined
-          const meeting = textCommand && handlers?.onMeeting && /^项目会议纪要(?:[：:]|\r?\n)/u.test(trigger.text)
+          const meeting = textCommand && handlers?.onMeeting && isMeetingMinutes(trigger.text)
           const handle = enrollment === 'self' ? handlers?.onSender : enrollment === 'help' ? () => enrollmentHelp(handlers?.project)
             : meeting ? handlers?.onMeeting : undefined
           const discussion = context.config('dingtalk') !== undefined && !handle ? handlers?.discussion?.(trigger) : undefined
@@ -648,7 +619,7 @@ export class DingTalk {
       return Buffer.concat(chunks, length)
     } finally { await stream.cancel() }
   }
-  async send(message: OutboundMessage): Promise<void> {
+  async send(message: OutboundMessage): Promise<SourceDelivery | undefined> {
     const conversation = message.channel.address.conversationId!
     const route = this.context.state.get(dingTalkRoute(conversation))
     if (message.ticketId) this.context.state.set(tickets(conversation, message.ticketId.slice(0, 12)), message.ticketId)
@@ -660,7 +631,7 @@ export class DingTalk {
     const title = message.title ?? '项目更新'
     if (body.length > 4000) throw new Error('DingTalk result exceeds 4000 characters; provide a brief result and a link')
     // Project lifecycle notices are sent to the group without threading them under an old request card.
-    if (this.cards && (message.kind !== 'notice' || message.channel.address.triggerId || message.channel.address.cardId || message.ticketId)) {
+    if (!mention && this.cards && (message.kind !== 'notice' || message.channel.address.triggerId || message.channel.address.cardId || message.ticketId)) {
       await this.cards.send(message)
       this.context.state.set(deliveries(conversation), { messageId: message.id, format: 'markdown', transport: 'ai-card', messageType: 'card', at: new Date().toISOString() })
       return
@@ -675,11 +646,11 @@ export class DingTalk {
         conversationId: conversation, robotCode: route?.robotCode ?? this.credentials.clientId, userId: mention, name: mentionName,
       }, { title, text: body })
       this.context.state.set(deliveries(conversation), { messageId: message.id, format: 'markdown', transport: 'ai-card', messageType: 'card', at: new Date().toISOString(), nativeMention: true })
-      return
+      return { nativeMention: true }
     }
     // The application group-send API does not render mentions. Display the recipient's name as ordinary text.
     const recipientText = active && mention ? `@${mention} ${body}` : mention && mentionName ? `请 ${mentionName} 查看\n\n${body}` : body
-    const text = !active && message.channel.address.explicitMentionMemberId
+    const text = !active && mention && (message.channel.address.projectRecipientId || message.channel.address.explicitMentionMemberId)
       ? `${recipientText}\n\n本条为文字提醒，当前会话的原生 @ 不可用。` : recipientText
     if (text.length > 4000) throw new Error('DingTalk result exceeds 4000 characters; provide a brief result and a link')
     const token = await this.accessToken()
@@ -696,15 +667,38 @@ export class DingTalk {
     }
     this.context.state.set(deliveries(conversation), { messageId: message.id, format: markdown ? 'markdown' : 'text', ...(mention && { nativeMention: active }),
       transport: active ? 'session-webhook' : 'application-group-api', messageType: active ? markdown ? 'markdown' : 'text' : markdown ? 'sampleMarkdown' : 'sampleText', at: new Date().toISOString() })
+    return mention ? { nativeMention: active } : undefined
   }
 }
 /** The original SourceRegistry and Outbox own admission and delivery; this kind only translates DingTalk messages. */
-export function dingTalkKind(send: (message: OutboundMessage) => Promise<void>): SourceKind {
+export function dingTalkKind(send: (message: OutboundMessage) => Promise<SourceDelivery | void>,
+  readers: Pick<ProjectConversationSource, 'attachment' | 'document'> = {}): SourceKind {
   return {
     kind: 'dingtalk', title: { zh: '钉钉', en: 'DingTalk' },
     description: { zh: 'Stream 群内 @ 消息（所有消息类型）', en: 'Stream group mentions (all message types)' },
     schema: z.object({}).strict(), fields: [], health: ['dingtalk'],
     projectEvents: [projectMessageReceived],
+    projectConversation: {
+      ...readers,
+      binding: project => project.dingTalkGroup,
+      room: channel => channel.address.conversationId,
+      channel(host, project, recipient) {
+        const conversationId = project.dingTalkGroup
+        if (!conversationId) return
+        const address: Record<string, string> = { conversationId }
+        if (recipient) {
+          const route = host.state.get(dingTalkRoute(conversationId))
+          const meeting = route?.corpId ? undefined : project.decisions.findLast(decision => decision.meetingSource?.source === 'dingtalk')?.meetingSource
+          const origin = meeting && host.triggers.get(meeting.triggerId)
+          const corpId = route?.corpId ?? (origin?.meta.conversationId === conversationId ? origin.meta.senderCorpId : undefined)
+          const accounts = recipient.accounts.filter(item => item.provider === 'dingtalk' && item.scope === corpId)
+          if (accounts.length !== 1) return
+          address.mentionUserId = accounts[0]!.accountId
+          address.mentionUserName = recipient.name
+        }
+        return { source: 'dingtalk', thread: `dingtalk:${conversationId}`, address }
+      },
+    },
     scope: ({ meta }) => {
       if (meta.projectEnrollment === true) return { listened: false, reason: 'DingTalk project membership command' }
       if (meta.projectMeeting === true) return { listened: false, reason: 'DingTalk meeting minutes for project review' }
@@ -717,7 +711,7 @@ export function dingTalkKind(send: (message: OutboundMessage) => Promise<void>):
       transports: ['session-webhook (text/markdown)', 'application-group-api (sampleText/sampleMarkdown)'],
       documentation: ['https://open.dingtalk.com/document/orgapp/types-of-messages-sent-by-robots', 'https://open.dingtalk.com/document/robots/custom-robot-access'],
       deliveryInfo: (host, channel) => channel.address.conversationId ? host.state.get(deliveries(channel.address.conversationId)) : undefined,
-      send: async (_host, message) => { await send(message); return 'sent' },
+      send: async (_host, message) => (await send(message)) ?? 'sent',
       link: () => ({ url: '', label: { zh: '钉钉群', en: 'DingTalk group' } }),
     },
   }

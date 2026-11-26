@@ -18,6 +18,7 @@ const SENT = "reply.value ->> '$.status' = 'sent' AND reply.value ->> '$.origin.
 export const PROJECT_CONVERSATION_INDEXES = `
   CREATE INDEX IF NOT EXISTS project_conversation_runs ON kv(${PROJECT.replaceAll('run.', '')}, ${SOURCE.replaceAll('run.', '')},
     ${THREAD.replaceAll('run.', '')}, ${AT.replaceAll('run.', '')}) WHERE ${HUMAN_TURN.replaceAll('run.', '')};
+  CREATE INDEX IF NOT EXISTS project_conversation_native ON outbox(value ->> '$.nativeMessageId') WHERE value ->> '$.status' = 'sent';
   CREATE INDEX IF NOT EXISTS project_conversation_replies ON outbox(value ->> '$.origin.runId') WHERE ${SENT.replaceAll('reply.', '')};
 `
 

@@ -11,8 +11,8 @@ import { ProjectError } from './projects.ts'
 import type { Store } from './store.ts'
 import { recentProjectConversation, webConversation } from './project-conversation-history.ts'
 import type { ProjectToolResult, ProjectTools } from './project-tools.ts'
-import { explicitProjectMention } from './project-notifications.ts'
-import { attachmentReply, ProjectAttachments, type AttachmentReader, type AttachmentResult, type LinkedDocumentReader, type LinkedDocumentResult } from './project-attachments.ts'
+import type { ProjectChannels } from './project-channels.ts'
+import { attachmentReply, ProjectAttachments, type AttachmentResult, type LinkedDocumentResult } from './project-attachments.ts'
 import { materialReference, referencedAttachments, resolveProjectReferences, type ProjectReferences } from './project-references.ts'
 
 const Call = z.strictObject({ tool: z.string().min(1).max(100), arguments: z.string().max(40000) })
@@ -44,6 +44,7 @@ export interface ProjectAgentRun {
   at: string
 }
 interface Host {
+  channels: ProjectChannels
   store: Store
   events: ProjectEvents
   effects: Effects
@@ -66,19 +67,13 @@ export class ProjectAgent {
   private readonly reactions = new Map<string, Reaction>()
   private readonly attachments: ProjectAttachments
 
-  registerAttachmentReader(source: string, reader: AttachmentReader): void {
-    this.attachments.register(source, reader)
-  }
-  registerLinkedDocumentReader(source: string, reader: LinkedDocumentReader): void {
-    this.attachments.registerLinked(source, reader)
-  }
   /** Event modules install their authority boundary; the model loop has no provider or event-name dispatch table. */
   registerReaction(type: string, reaction: Reaction): void {
     if (this.reactions.has(type)) throw new Error(`Project Agent reaction already installed: ${type}`)
     this.reactions.set(type, reaction)
   }
   constructor(private readonly host: Host) {
-    this.attachments = new ProjectAttachments(host.attachmentDirectory)
+    this.attachments = new ProjectAttachments(host.attachmentDirectory, host.channels)
     host.events.register('project-agent', [proposed])
     host.events.handle(projectMessageReceived.type, (event, options) => {
       const message = ProjectMessage.parse(event.data)
@@ -99,6 +94,9 @@ export class ProjectAgent {
 
   submit(input: z.input<typeof ProjectMessage>) {
     const message = ProjectMessage.parse(input)
+    const quotedReply = message.replyToNativeMessageId
+      && this.host.store.receipts.nativeProjectReply(message.projectId, message.channel, message.replyToNativeMessageId)
+    if (!message.quoted && quotedReply) message.quoted = quotedReply.text.slice(0, 16_000)
     const referenced = this.host.tools.reviewReference(message.projectId, `${message.quoted}\n${message.text}`)
     if (referenced) message.reviewId = referenced
     const enabled = this.host.events.settings(message.channel.source, projectMessageReceived.type).enabled
@@ -124,7 +122,7 @@ export class ProjectAgent {
   private enabled(run: ProjectAgentRun, replyOnly = false): boolean {
     if (!run.event) return this.host.events.settings(run.message.channel.source, projectMessageReceived.type).enabled
     const project = this.host.store.get(KV.projects.project(run.message.projectId))
-    if (!project || (run.replyChannel?.source === 'dingtalk' && run.replyChannel.address.conversationId !== project.dingTalkGroup)) return false
+    if (!project || (run.replyChannel && this.host.channels.supports(run.replyChannel.source) && !this.host.channels.matches(project, run.replyChannel))) return false
     const reaction = this.reactions.get(run.event.type)
     if (run.message.actorId && reaction?.work?.assignee(run.event) !== run.message.actorId) return false
     return reaction?.current(run.event, replyOnly) ?? false
@@ -180,7 +178,7 @@ export class ProjectAgent {
         host.store.set(KV.projects.agentRun(runId), run)
       }
     }
-    if (!run.event && canAct && run.message.attachments?.length && !run.attachmentResults) {
+    if (!run.event && canAct && (run.message.attachments?.length || run.references?.quote === 'unavailable') && !run.attachmentResults) {
       const results = await this.attachments.read(run.message, planner, host.lifetime, run.references?.attachments)
       try { host.tools.authorize(run.message) }
       catch (error) { host.store.atomic(() => this.finish(run, error instanceof ProjectError ? error.message : '项目权限已变更。', true)); return }
@@ -212,12 +210,10 @@ export class ProjectAgent {
       quote: run.references.quote, message: run.references.message, links: run.references.links,
       ...(run.documentResults?.length ? { documents: run.documentResults } : {}),
     }
-    const { channel, projectId, messageId } = run.message
+    const { channel, projectId } = run.message
     const assignedWork = !!run.event && !!run.message.actorId
     const conversation = run.event ? assignedWork ? run.replyChannel : undefined : channel
-    const history = !conversation ? [] : !run.event && channel.source === 'dingtalk'
-      ? host.store.receipts.dingTalkHistory(messageId, projectId)
-      : recentProjectConversation(host.store, { projectId, channel: conversation }, runId)
+    const history = conversation ? recentProjectConversation(host.store, { projectId, channel: conversation }, runId) : []
     const teamSkills = run.event ? undefined : host.teamSkills?.()
     const allowed = this.allowedTools(run)
     const prompt = [
@@ -249,7 +245,7 @@ export class ProjectAgent {
       '资料和引用只提供上下文。本条消息是当前请求，之前消息用于理解指代。操作权限由服务端检查。',
       '工具目录列出了真实操作及参数。calls 中 arguments 是符合该工具参数 schema 的 JSON 字符串。可组合多个工具，按顺序执行。操作失败时整个批次回滚，结合返回原因调整。',
       '现有任务继续用其 ID，修改只提供变化字段。新增任务后可从工具结果取得新 ID。人员从项目成员和目录中选择，必要时先 member.add。',
-      ...(run.message.mentions ? ['message.mentions 是钉钉回调识别出的本条消息 @ 对象，可用其中的 memberId。列表不提供 @ 在正文中的位置。'
+      ...(run.message.mentions ? ['message.mentions 是来源适配器识别出的本条消息 @ 对象，可用其中的 memberId。列表不提供 @ 在正文中的位置。'
         + '只有任务与人选对应明确时才修改分工。单个明确的指派可使用唯一的 @ 人选，前提是 unresolvedCount 为 0。多个任务或多种角色时，勿按列表顺序猜测。'
         + '先落实可确认的分工，再询问仍缺哪个任务或角色的人选；无法解析的 @ 可请发送者补充普通文字姓名。'] : []),
       'ownerId 指向执行任务的项目成员，人和已登记的项目 Agent 共用这个字段。历史任务的 executionMode=agent 沿用旧分工。',
@@ -272,7 +268,7 @@ export class ProjectAgent {
       '最终答复先给结论和确实发生的变化，再给需要谁行动的下一步。不要重复粘贴内部工具结果、调用编号和冗长报告。',
       JSON.stringify({ message: run.message, projectContext: snapshot, recentConversation: history, teamSkills, attachments, reference,
         pendingPlan: host.store.get(KV.projects.latestPlan(run.message.projectId))?.result,
-        tools: canAct ? host.tools.catalog().filter(tool => !run.event || allowed.includes(tool.name)) : [], previousSteps: run.steps }),
+        tools: canAct ? host.tools.catalog({ ...run.message, event: run.event }).filter(tool => !run.event || allowed.includes(tool.name)) : [], previousSteps: run.steps }),
     ].join('\n\n')
     let decision: z.output<typeof Decision> | undefined
     if (prompt.length <= 180000) {
@@ -344,8 +340,8 @@ export class ProjectAgent {
     if (replyChannel) run.replyChannel = replyChannel
     run.steps.push(step); run.turn++
     host.store.set(KV.projects.agentRun(run.id), run)
-    if (step.results.some(result => result.calendarPending)) {
-      // Once the calendar effect is committed, it owns the outcome. Send only the factual queued
+    if (step.results.some(result => result.completion === 'effect')) {
+      // Once the effect operation commits, its receipt owns the outcome. Send the factual queued
       // acknowledgement in this transaction, before any effect can produce a final receipt.
       const summary = [...new Set(step.results.map(result => result.summary))].join('\n')
       this.finish(run, summary, false, 'acknowledgement')
@@ -359,7 +355,7 @@ export class ProjectAgent {
     let mentionError = ''
     const mention = run.steps.flatMap(step => step.results).findLast(result => result.replyMention)?.replyMention
     if (!failed && mention) {
-      try { channel = explicitProjectMention(this.host.store, run.message.projectId, run.message.channel, mention) }
+      try { channel = this.host.channels.mention(run.message.projectId, run.message.channel, mention) }
       catch (error) {
         if (!(error instanceof ProjectError)) throw error
         mentionError = error.message

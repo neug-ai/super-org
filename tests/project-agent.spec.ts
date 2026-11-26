@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, expect, it, vi } from 'vitest'
 import { z } from 'zod'
@@ -6,10 +8,11 @@ import { DWClient } from 'dingtalk-stream'
 import { KV } from '../src/kv.ts'
 import { Commands } from '../src/infra/commands.ts'
 import type { CalendarExecutor } from '../src/app/project-calendar.ts'
+import { reviewReference } from '../src/app/project-deliveries.ts'
+import { dingTalkCalendarIdentity } from '../src/infra/aliding-calendar.ts'
 import type { ProjectAgentRun } from '../src/app/project-agent.ts'
 import type { ProjectPlanner } from '../src/app/project-planning.ts'
 import { materialReference, resolveProjectReferences } from '../src/app/project-references.ts'
-import { obsoleteExplicitProjectMention } from '../src/app/project-notifications.ts'
 import { MemberInput, ProjectChange, ProjectInput, Projects } from '../src/app/projects.ts'
 import { projectMessageReceived } from '../src/sources/project-message.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
@@ -407,7 +410,8 @@ it('continues DingTalk conversation, reads local knowledge, and retains project 
 it('reads quoted DingTalk files and native documents with the sender access, and records only supported progress', async () => {
   const { h, projects, task, id, propose } = await pilot()
   const send = vi.fn()
-  const kind = dingTalkKind(async message => { send(message) })
+  let bot: DingTalk
+  const kind = dingTalkKind(async message => { send(message) }, { document: () => bot.linkedDocumentReader('test-corp') })
   h.runtime.sources.register(kind)
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } } })
@@ -459,9 +463,8 @@ it('reads quoted DingTalk files and native documents with the sender access, and
   })
   try {
     const agent = h.runtime.projectAgent!
-    const bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, http as typeof fetch,
+    bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, http as typeof fetch,
       undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, agent))
-    agent.registerLinkedDocumentReader(kind.kind, bot.linkedDocumentReader('test-corp'))
     const post = async (msgId: string, content: string, document?: string, corpId = 'test-corp', staffId = 'member') => {
       await receive({ headers: { messageId: msgId }, data: JSON.stringify({
         msgId, senderStaffId: staffId, senderCorpId: corpId, conversationId: 'test-group', conversationType: '2',
@@ -601,7 +604,10 @@ it('uses DingTalk attachment previews for progress and hands the original to new
   change({ kind: 'project', value: { name: '2048 事件验收', status: 'active' } })
   const task = change({ kind: 'task', value: { title: '整理交付材料', ownerId: member.id } }).tasks.at(-1)!
   const send = vi.fn()
-  const kind = dingTalkKind(async message => { send(message) })
+  let bot: DingTalk
+  const kind = dingTalkKind(async message => { send(message) }, {
+    attachment: (_host, message, attachment, signal) => bot.readProjectAttachment(message, attachment, signal),
+  })
   h.runtime.sources.register(kind)
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } },
@@ -633,9 +639,8 @@ it('uses DingTalk attachment previews for progress and hands the original to new
   })
   try {
     const agent = h.runtime.projectAgent!
-    const bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, fetchFile as typeof fetch,
+    bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, fetchFile as typeof fetch,
       undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, agent))
-    agent.registerAttachmentReader('dingtalk', (message, attachment, signal) => bot.readProjectAttachment(message, attachment, signal))
     const sourceLink = 'https://docs.example.org/slide-notes'
     const post = async (msgId: string, options: { sender?: string; name?: string; code?: string; summaryCard?: string; link?: string } = {}) => {
       await receive({ headers: { messageId: msgId }, data: JSON.stringify({ msgId, senderStaffId: options.sender ?? 'member', conversationId: 'test-group',
@@ -750,7 +755,9 @@ it('reads native, captioned and quoted DingTalk images through the shared attach
   const task = change({ kind: 'task', value: { title: '核对测试画面', ownerId: member.id } }).tasks.at(-1)!
   let bot: DingTalk
   const send = vi.fn((message: Parameters<DingTalk['send']>[0]) => bot.send(message))
-  const kind = dingTalkKind(send)
+  const kind = dingTalkKind(send, {
+    attachment: (_host, message, attachment, signal) => bot.readProjectAttachment(message, attachment, signal),
+  })
   h.runtime.sources.register(kind)
   const settings = h.runtime.store.settings()
   h.runtime.store.saveSettings({ ...settings, sources: { ...settings.sources, dingtalk: { enabled: true, config: {} } } })
@@ -778,7 +785,6 @@ it('reads native, captioned and quoted DingTalk images through the shared attach
     const agent = h.runtime.projectAgent!
     bot = new DingTalk(h.runtime.context(kind), { clientId: 'test', clientSecret: 'test' }, () => {}, http as typeof fetch,
       undefined, undefined, dingTalkProjectIntake(projects, h.runtime.projectPlanning, undefined, agent))
-    agent.registerAttachmentReader('dingtalk', (message, attachment, signal) => bot.readProjectAttachment(message, attachment, signal))
     const post = async (msgId: string, content: Record<string, unknown>) => {
       await receive({ headers: { messageId: msgId }, data: JSON.stringify({ msgId, senderStaffId: 'member', conversationId: 'test-group',
         conversationType: '2', isInAtList: true, senderCorpId: 'test-corp', robotCode: 'robot',
@@ -814,7 +820,7 @@ it('reads native, captioned and quoted DingTalk images through the shared attach
     await post('rich-image', caption)
     const mentioned = send.mock.calls.map(([message]) => message).filter(message => message.channel.address.mentionUserId)
     expect(mentioned).toMatchObject([{ text: rich?.reply, channel: { address: {
-      conversationId: 'test-group', mentionUserId: 'assignee', mentionUserName: '李顺阳', explicitMentionMemberId: assignee.id,
+      conversationId: 'test-group', mentionUserId: 'assignee', mentionUserName: '李顺阳', projectRecipientId: assignee.id,
     } } }])
     expect(mentioned[0]?.channel.address.triggerId).toBeUndefined()
     const nativePayloads = sendToDingTalk.mock.calls.map(([request]) => JSON.parse(String(request?.body))).filter(payload => payload.at)
@@ -843,15 +849,15 @@ it('reads native, captioned and quoted DingTalk images through the shared attach
     expect(describe).toHaveBeenCalledTimes(4)
     expect(fetchMedia.mock.calls.filter(([url]) => !String(url).endsWith('/accessToken'))).toHaveLength(8)
     expect(JSON.stringify(agent.runs(id))).not.toMatch(/image-code|signed-url/)
-    expect(obsoleteExplicitProjectMention(h.runtime.store, mentioned[0]!)).toBe(false)
+    expect(h.runtime.projectChannels.obsolete(mentioned[0]!)).toBe(false)
     change({ kind: 'remove-member', memberId: assignee.id })
-    expect(obsoleteExplicitProjectMention(h.runtime.store, mentioned[0]!)).toBe(true)
+    expect(h.runtime.projectChannels.obsolete(mentioned[0]!)).toBe(true)
     const unbound = projects.registerDingTalkSender('different-corp', 'different-staff-id', '其他企业成员').member
     change({ kind: 'add-member', memberId: unbound.id })
     propose.mockResolvedValueOnce({ calls: [call('progress.record', { taskId: task.id, summary: '已人工核对部分画面。' }),
       call('conversation.mention', { memberId: unbound.id })], reply: '' })
     propose.mockImplementationOnce(async prompt => {
-      expect(prompt).toContain('尚未绑定本企业的钉钉账号，无法原生 @')
+      expect(prompt).toContain('尚未绑定当前平台的可用账号，无法原生 @')
       return done('已记录进展。该成员尚未绑定本企业的钉钉账号。')
     })
     const withoutBinding = await post('unbound-mention', { msgtype: 'text', text: { content: '我已核对部分画面，请记录并通知其他企业成员。' } })
@@ -863,6 +869,7 @@ it('reads native, captioned and quoted DingTalk images through the shared attach
 
 it('keeps task start restricted to the owner and leaves progress available while dependencies are open', async () => {
   const { h, id, member, assignee, task, change, projects } = await pilot()
+  h.runtime.sources.register(dingTalkKind(async () => {}))
   change({ kind: 'project', value: { name: '2048 事件验收', status: 'active' } })
   change({ kind: 'add-member', memberId: assignee.id })
   const downstream = change({ kind: 'task', value: { title: '整理交付材料', ownerId: member.id,
@@ -911,7 +918,114 @@ it('routes a bound Feishu project conversation and retrieves a retained message 
     ...settings.policy.sources, feishu: { allowed: [] },
   } } })
   expect(() => h.runtime.projectTools!.execute('conversation.history.read', { messageId: old.id },
-    { ...recent.message, operationId: 'history-after-revocation' })).toThrow('无法读取当前会话的历史')
+    { ...recent.message, operationId: 'history-after-revocation' })).toThrow('项目群或成员身份无效')
+})
+
+it('uses Feishu attachments, group-shared Docs, native mentions and a quoted review in one project conversation', async () => {
+  const { h, projects, propose } = await pilot()
+  const project = projects.create(ProjectInput.parse({ name: '飞书验收', feishuChatId: CHAT }))
+  const member = projects.saveMember(MemberInput.parse({
+    name: 'Alice', accounts: [{ provider: 'feishu', scope: 'cli_bot', accountId: MEMBER }],
+  }))
+  const reviewer = projects.saveMember(MemberInput.parse({
+    name: 'Bob', accounts: [{ provider: 'feishu', scope: 'cli_bot', accountId: 'ou_bob' }],
+  }))
+  const change = (change: ProjectChange['change']) => projects.change(project.id, ProjectChange.parse({ revision: projects.detail(project.id).revision, change }))
+  change({ kind: 'add-member', memberId: member.id })
+  change({ kind: 'add-member', memberId: reviewer.id })
+  const settings = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...settings, policy: { ...settings.policy, sources: {
+    ...settings.policy.sources, feishu: { ...settings.policy.sources.feishu, syncChat: '', allowed: [{ id: MEMBER }, { id: 'ou_bob' }] },
+  } } })
+  const task = change({ kind: 'task', value: { title: '准备测试报告', ownerId: member.id, status: 'in-progress' } }).tasks[0]!
+  const source = h.runtime.context(feishuKind)
+  const send = (id: string, text: string, fields: Record<string, unknown> = {}) => source.receive(feishu(id, text, fields))
+  const lark = vi.mocked(Commands.prototype.lark)
+  let shared = true
+  lark.mockImplementation(async (args, cwd) => {
+    if (args.includes('+chat-members-list'))
+      return { users: [{ member_id: MEMBER, name: 'Alice' }, { member_id: 'ou_bob', name: 'Bob' }], has_more: false }
+    if (args.includes('+messages-resources-download')) {
+      expect(args).toContain('file_fixture')
+      expect(args).toContain('om_original-file')
+      const saved_path = join(cwd!, 'attachment.md')
+      await writeFile(saved_path, '演练结果：通过移动测试。')
+      return { saved_path }
+    }
+    if (args[2]?.endsWith('/members')) return { items: shared ? [{ member_type: 'openchat', member_id: CHAT, perm: 'view' }] : [] }
+    if (args[2]?.endsWith('/raw_content')) return { content: '方案正文：小屏重开测试仍待复核。' }
+    if (args.includes('+messages-send')) return { message_id: 'om_review_notice' }
+    return { message_id: 'om_thread_reply' }
+  })
+  // A file posted without a bot mention is retained as group context for a subsequent quote.
+  await send('original-file', '{"file_key":"file_fixture","file_name":"test.md"}', { msg_type: 'file', mentions: [] })
+  const original = feishu('original-file', '', { mentions: [] })
+  expect(h.runtime.store.triggers.get(original.id)).toBeDefined()
+  propose.mockImplementationOnce(async prompt => {
+    expect(prompt).toContain('通过移动测试')
+    return { summary: '已通过移动测试。' }
+  }).mockImplementationOnce(async prompt => {
+    expect(prompt).toContain('"summary":"已通过移动测试。"')
+    return { calls: [call('progress.record', { taskId: task.id, summary: '已通过移动测试。' })], reply: '' }
+  }).mockResolvedValueOnce(done('已记录进展。'))
+  await send('use-file', '请根据这份文件更新进展。', { parent_id: 'om_original-file' })
+  await h.runtime.idle()
+  expect(projects.detail(project.id).tasks[0]?.progress).toMatchObject([{ summary: '已通过移动测试。' }])
+
+  const doc = 'https://team.feishu.cn/docx/ExampleDoc'
+  propose.mockImplementationOnce(async prompt => {
+    expect(prompt).toContain('小屏重开测试仍待复核')
+    return { summary: '小屏重开测试仍待复核。' }
+  }).mockImplementationOnce(async prompt => {
+    expect(prompt).toContain('小屏重开测试仍待复核')
+    return done('小屏重开测试待复核。')
+  })
+  await send('use-doc', `请读正文 ${doc}`)
+  await h.runtime.idle()
+  expect(h.runtime.projectAgent!.runs(project.id).find(run => run.message.nativeMessageId === 'om_use-doc')?.documentResults)
+    .toMatchObject([{ link: doc, summary: '小屏重开测试仍待复核。' }])
+  shared = false
+  const bodies = () => lark.mock.calls.filter(([args]) => args[2]?.endsWith('/raw_content')).length
+  const before = bodies()
+  await send('private-doc', `请读正文 ${doc}`)
+  await h.runtime.idle()
+  expect(bodies()).toBe(before)
+  expect(h.runtime.projectAgent!.runs(project.id).find(run => run.message.nativeMessageId === 'om_private-doc')?.reply).toContain('未向当前飞书群授予阅读权限')
+
+  propose.mockResolvedValueOnce({ calls: [call('delivery.submit', { taskId: task.id, summary: '提交首版报告。' })], reply: '' })
+    .mockImplementationOnce(async () => done('已提交。'))
+  await send('submit-delivery', '提交首版报告，请安排验收。')
+  await h.runtime.idle()
+  const review = projects.detail(project.id).tasks.find(item => item.id === task.id)!.reviews!.at(-1)!
+  const notice = h.runtime.store.receipts.forProject(project.id).find(row => row.text.includes(reviewReference(review)) && !!row.nativeMention)!
+  expect(notice).toMatchObject({ nativeMessageId: 'om_review_notice', nativeMention: true, status: 'sent' })
+  const sendArgs = lark.mock.calls.find(([args]) => args.includes('+messages-send'))?.[0]
+  expect(sendArgs).toContain(CHAT)
+  expect(JSON.parse(sendArgs![sendArgs!.indexOf('--content') + 1]!).text).toContain(`<at user_id="${MEMBER}"></at>`)
+
+  propose.mockImplementationOnce(async prompt => {
+    expect(prompt).toContain(`"reviewId":"${review.id}"`)
+    return { calls: [call('review.decide', { taskId: task.id, reviewId: review.id, outcome: 'accepted', reason: '规则通过。' })], reply: '' }
+  }).mockResolvedValueOnce(done('已登记验收通过。'))
+  const input = feishu('accept-review', '我验收通过。', { parent_id: 'om_review_notice', sender_id: 'ou_bob' })
+  const live = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...live, policy: { ...live.policy, sources: {
+    ...live.policy.sources, feishu: { ...live.policy.sources.feishu, syncChat: '', allowed: [{ id: MEMBER }, { id: 'ou_bob' }] },
+  } } })
+  expect(input.addressed).toBe('mention')
+  expect(projects.memberForAccount(project.id, 'feishu', 'cli_bot', 'ou_bob')?.id).toBe(reviewer.id)
+  expect(h.runtime.store.settings().policy.sources.feishu?.allowed).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'ou_bob' })]))
+  expect(h.runtime.projectChannels.authorize(projects.detail(project.id),
+    { ...input.channel!, address: { ...input.channel!.address, projectSenderId: 'ou_bob' } }, reviewer)).toBe(true)
+  expect(await source.receive(input)).toBe('filtered')
+  await h.runtime.idle()
+  const accepted = h.runtime.projectAgent!.runs(project.id).find(run => run.message.nativeMessageId === 'om_accept-review')
+  expect(accepted?.message.reviewId).toBe(review.id)
+  expect(accepted?.steps[0]?.error, JSON.stringify(accepted?.steps)).toBeUndefined()
+  expect(projects.detail(project.id).tasks.find(item => item.id === task.id)?.status).toBe('done')
+  expect(h.runtime.projectChannels.obsolete(notice)).toBe(false)
+  change({ kind: 'project', value: { name: project.name, feishuChatId: 'oc_newchat' } })
+  expect(h.runtime.projectChannels.obsolete(notice)).toBe(true)
 })
 
 it('rejects membership spoofing, cross-project tools and stale group membership', async () => {
@@ -920,11 +1034,11 @@ it('rejects membership spoofing, cross-project tools and stale group membership'
   const other = projects.create(ProjectInput.parse({ name: 'Other project' }))
   const otherTask = projects.change(other.id, ProjectChange.parse({ revision: other.revision,
     change: { kind: 'task', value: { title: 'Private task' } } })).tasks[0]!
+  const kind = dingTalkKind(async () => {})
+  h.runtime.sources.register(kind)
   expect(() => h.runtime.projectTools!.execute('task.update', { taskId: otherTask.id, changes: { title: 'Intrusion' } }, {
     projectId: id, actorId: member.id, messageId: 'bad', operationId: 'bad', channel: { source: 'dingtalk', thread: 'test-group', address: { conversationId: 'test-group' } },
   })).toThrow('does not belong')
-  const kind = dingTalkKind(async () => {})
-  h.runtime.sources.register(kind)
   const pending = deferred<unknown>()
   propose.mockImplementationOnce(() => pending.promise)
   h.runtime.projectAgent!.submit({ projectId: id, actorId: member.id, messageId: 'remove-member', text: '补充条件', quoted: '',
@@ -953,7 +1067,7 @@ it('queues a DingTalk meeting for its authorized sender, requires current mentio
       { title: '调整后会议', roomCode: '123 456 789' },
   }))
   const { h, id, projects, assignee, change, propose } = await pilot(undefined, undefined,
-    { corpId: 'test-corp', organizers: ['member'], create, manage, receipt })
+    { ...dingTalkCalendarIdentity('test-corp', ['member']), create, manage, receipt })
   change({ kind: 'add-member', memberId: assignee.id })
   const send = vi.fn()
   const kind = dingTalkKind(async message => { send(message) })
