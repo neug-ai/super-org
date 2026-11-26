@@ -6,6 +6,7 @@ import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { Member, Project } from './app/projects.ts'
 import type { ProjectPlanRecord } from './app/project-planning.ts'
+import type { CalendarAttempt } from './app/project-calendar.ts'
 import type { ProjectIssueAttempt } from './app/project-issues.ts'
 import type { ProjectActionSelection } from './app/project-actions.ts'
 import type { ProjectWorkflowVersion } from './app/project-events.ts'
@@ -54,6 +55,7 @@ export const KV = {
   projects: { project: family<Project>('project:'), member: family<Member>('project-member:'),
     workflow: record<ProjectWorkflowVersion>('project-workflow'),
     agentRun: family<ProjectAgentRun>('project-agent-run:'),
+    calendarAttempt: family<CalendarAttempt>('project-calendar-attempt:'),
     blockage: family<ProjectBlockage>('project-blockage:'),
     readiness: family<{ signature: string; episode: string }>('project-readiness:'),
     check: family<ProjectCheck>('project-check:'),

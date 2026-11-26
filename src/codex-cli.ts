@@ -23,6 +23,7 @@ import { dingTalkProjectIntake } from './sources/dingtalk.ts'
 import { DingTalk, dingTalkKind } from './sources/dingtalk.ts'
 import { githubKind, watchGithub } from './sources/github.ts'
 import { feishuKind, runFeishu } from './sources/feishu.ts'
+import { alidingCalendar } from './infra/aliding-calendar.ts'
 import { GithubAppSchema } from './infra/github-app.ts'
 
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`
@@ -228,6 +229,7 @@ async function main(): Promise<void> {
   const robotAgents = new RobotAgents({ codex: process.env.CODEX_BINARY, qwen: process.env.QWEN_BINARY, codexModel: model,
     qwenModel: process.env.QWEN_MODEL, qoder: process.env.QODER_BINARY, qoderModel: process.env.QODER_MODEL })
   const binary = robotAgents.binary('codex') ?? process.env.CODEX_BINARY ?? 'codex'
+  const calendar = alidingCalendar(process.env.SUPERAGENT_DINGTALK_CALENDAR, stateDir)
   const harness = new CodexHarness(ctx, { binary, model, sandbox, port })
   let runtime: Runtime | undefined, robot: DingTalk | undefined
   const githubController = new AbortController()
@@ -247,7 +249,7 @@ async function main(): Promise<void> {
     runtime = new Runtime(ctx, machine, () => { log('restart_required'); void stop() },
       notificationGroup, trigger => robot?.received(trigger),
       (ticketId, deliveryId, triggerId) => robot?.bindWorkerDelivery(ticketId, deliveryId, triggerId),
-      undefined, robotAgents)
+      undefined, robotAgents, calendar)
     runtime.lifetime.addEventListener('abort', () => { githubController.abort(); robot?.stop(); void harness.close() }, { once: true })
     runtime.sources.register(githubKind)
     runtime.sources.register(feishuKind)

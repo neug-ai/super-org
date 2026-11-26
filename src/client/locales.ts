@@ -43,6 +43,7 @@ const TEXT = {
   'health.project-issue-intent': ['任务 Issue 请求识别', 'Task Issue request interpretation'],
   'health.project-action': ['项目操作请求识别', 'Project action interpretation'],
   'health.project-events': ['项目事件队列', 'Project event queue'],
+  'health.project-calendar': ['钉钉日程与会议', 'DingTalk calendars and meetings'],
   'health.project-agent': ['项目 Agent 消息处理', 'Project Agent message processing'],
   'health.project-tracking': ['项目进展检查', 'Project progress checks'],
   'health.project-issue': ['任务 Issue 创建与关联', 'Task Issue creation and linking'],
