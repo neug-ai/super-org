@@ -245,6 +245,7 @@ it.each([
   ['feedback', zh['project.addReviewFeedback']],
   ['rejected', zh['project.rejectDelivery']],
   ['preview', undefined],
+  ['network-drag', zh['project.acceptTask']],
 ] as const)('handles %s review actions according to entry-point capabilities', async (outcome, label) => {
   vi.stubGlobal('crypto', { getRandomValues: crypto.getRandomValues.bind(crypto) })
   const task: ProjectTask = { id: 'task', title: 'Check delivery', status: 'in-review', priority: 'do',
@@ -258,7 +259,12 @@ it.each([
     if (route === 'GET projects') return [project]
     if (route === 'GET members') return []
     if (route === 'GET projects/agents') return null
-    if (route === 'GET projects/execution') return { deliveryReviewAvailable: outcome !== 'preview', state: 'ready' }
+    if (route === 'GET projects/execution') return { deliveryReviewAvailable: outcome !== 'preview', state: 'ready',
+      ...(outcome === 'network-drag' && { reviewMemberId: 'member' }) }
+    if (route === 'POST projects/:id/tasks/:taskId/reviews/:reviewId' && outcome === 'network-drag') {
+      project.tasks = [{ ...task, status: 'done', reviews: [{ ...task.reviews![0]!, status: 'accepted' }] }]
+      return { status: 'applied' }
+    }
     if (route === 'POST projects/:id/tasks/:taskId/reviews/:reviewId') throw new ApiError('This review has changed', 409)
     return project
   })
@@ -282,13 +288,45 @@ it.each([
       return
     }
     expect(detail.textContent).toContain(zh['project.rejectDelivery'])
-    await act(async () => { [...detail.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === label)!.click() })
+    if (outcome === 'network-drag') {
+      expect(detail.textContent).not.toContain(zh['project.editTask'])
+      expect(page.container.textContent).not.toContain(zh['project.addTask'])
+      await act(async () => { detail.querySelector<HTMLButtonElement>(`[aria-label="${zh.close}"]`)!.click() })
+      const card = page.container.querySelector('[data-column="in-review"] .dt-kanban-task')!
+      const lane = page.container.querySelector('[data-column="done"]')!
+      const values = new Map<string, string>()
+      const dataTransfer = { get types() { return [...values.keys()] },
+        setData: (type: string, data: string) => { values.set(type, data) }, getData: (type: string) => values.get(type) }
+      const drag = (node: Element, name: string) => act(() => { node.dispatchEvent(Object.assign(
+        new Event(name, { bubbles: true, cancelable: true }), { dataTransfer })) })
+      drag(card, 'dragstart')
+      drag(lane, 'dragover')
+      expect(lane.getAttribute('data-over')).toBe('true')
+      drag(lane, 'drop')
+      expect(lane.querySelector('.dt-kanban-task')).toBeNull()
+      expect(call.mock.calls.some(([route]) => route.startsWith('POST '))).toBe(false)
+    } else {
+      await act(async () => { [...detail.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === label)!.click() })
+    }
     const form = document.querySelector<HTMLFormElement>('[role="dialog"] form')!
     const reason = form.querySelector<HTMLTextAreaElement>('[name="reason"]')!
     expect(reason.required).toBe(true)
     reason.value = 'I checked this delivery against its criteria'
     const requestId = form.querySelector<HTMLInputElement>('[name="messageId"]')!.value
     expect(requestId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    if (outcome === 'network-drag') {
+      expect(form.textContent).toContain(zh['project.memberReviewHelp'])
+      expect(form.textContent).toContain('Original review criteria')
+      expect(form.querySelector('[name="reviewerName"]')).toBeNull()
+      await act(async () => { form.requestSubmit() })
+      expect(call).toHaveBeenCalledWith('POST projects/:id/tasks/:taskId/reviews/:reviewId', {
+        id: 'project', taskId: 'task', reviewId: 'review-original',
+        body: { messageId: requestId, outcome: 'accepted', reason: 'I checked this delivery against its criteria' },
+      })
+      expect(call.mock.calls.some(([route]) => route === 'POST projects/:id/changes')).toBe(false)
+      expect(page.container.querySelector('[data-column="done"] .dt-kanban-task')?.textContent).toContain(task.title)
+      return
+    }
     project.tasks = [{ ...task, deliveryVersion: 2, reviews: [{ ...task.reviews![0]!, id: 'review-new', version: 2 }] }]
     await act(async () => { form.requestSubmit() })
     expect(form.textContent).toContain('This review has changed')

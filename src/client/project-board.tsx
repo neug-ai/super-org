@@ -16,9 +16,10 @@ interface Column<Id extends string> {
   context?: string
 }
 
-export function ProjectBoard({ t, view, project, tasks, pending, select, moveStatus, movePriority }: {
+export function ProjectBoard({ t, view, project, tasks, pending, select, moveStatus, canMoveStatus, movePriority }: {
   t: T; view: 'kanban' | 'priority'; project: ProjectDetail; tasks: ProjectTask[]; pending: boolean;
   select: (task: ProjectTask) => void; moveStatus: (task: ProjectTask, status: ProjectTask['status']) => void;
+  canMoveStatus?: (task: ProjectTask, status: ProjectTask['status']) => boolean
   movePriority: (task: ProjectTask, priority: ProjectPriority) => void
 }) {
   if (view === 'priority') return <Columns key="priority" t={t} view={view} project={project} tasks={tasks.filter(task => !stopped(task))}
@@ -26,12 +27,13 @@ export function ProjectBoard({ t, view, project, tasks, pending, select, moveSta
     pending={pending} select={select} group={priorityOf} move={movePriority} />
   return <Columns key="kanban" t={t} view={view} project={project} tasks={tasks.filter(task => task.status !== 'cancelled')}
     columns={LANES.map(id => ({ id, label: t(`project.state.${id}`) }))}
-    pending={pending} select={select} group={task => task.status} move={moveStatus} />
+    pending={pending} select={select} group={task => task.status} move={moveStatus} canMove={canMoveStatus} />
 }
 
-function Columns<Id extends string>({ t, view, project, columns, tasks, pending, select, group, move }: {
+function Columns<Id extends string>({ t, view, project, columns, tasks, pending, select, group, move, canMove }: {
   t: T; view: 'kanban' | 'priority'; project: ProjectDetail; columns: Column<Id>[]; tasks: ProjectTask[];
   pending: boolean; select: (task: ProjectTask) => void; group: (task: ProjectTask) => Id; move: (task: ProjectTask, id: Id) => void
+  canMove?: (task: ProjectTask, id: Id) => boolean
 }) {
   const [source, setSource] = useState<string>()
   const [over, setOver] = useState<Id>()
@@ -44,6 +46,7 @@ function Columns<Id extends string>({ t, view, project, columns, tasks, pending,
   const clear = () => { setSource(undefined); setOver(undefined) }
   const admit = (event: DragEvent<HTMLElement>, column: Id) => {
     if (!source || pending || !event.dataTransfer.types.includes(TASK_DRAG)) return
+    if (canMove && !tasks.some(task => task.id === source && canMove(task, column))) { setOver(undefined); return }
     event.preventDefault()
     event.dataTransfer.dropEffect = 'move'
     setOver(column)
@@ -53,7 +56,7 @@ function Columns<Id extends string>({ t, view, project, columns, tasks, pending,
     event.preventDefault()
     const task = tasks.find(task => task.id === event.dataTransfer.getData(TASK_DRAG) && task.id === source)
     clear()
-    if (task && group(task) !== column) move(task, column)
+    if (task && group(task) !== column && (!canMove || canMove(task, column))) move(task, column)
   }
   return <div className="dt-kanban" data-view={view}>
     {columns.map(column => {
@@ -69,7 +72,8 @@ function Columns<Id extends string>({ t, view, project, columns, tasks, pending,
             const overdue = !stopped(task) && task.dueDate && new Date(`${task.dueDate}T00:00:00`) < today
             const ticket = task.ticketId ? tickets.get(task.ticketId) : undefined
             const issue = task.issueUrl?.replace(/^https:\/\/github\.com\//, '').replace('/issues/', '#')
-            return <li key={task.id}><button className="dt-kanban-task" type="button" draggable={!pending} data-dragging={source === task.id}
+            return <li key={task.id}><button className="dt-kanban-task" type="button"
+              draggable={!pending && (!canMove || columns.some(column => canMove(task, column.id)))} data-dragging={source === task.id}
               onClick={() => select(task)}
               onDragStart={event => {
                 event.dataTransfer.setData(TASK_DRAG, task.id)

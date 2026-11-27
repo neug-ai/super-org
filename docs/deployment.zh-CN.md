@@ -59,7 +59,13 @@ App 模式需要对读取的仓库安装应用。首次启动可以用 `SUPERAGE
 
 默认仅本机。独立项目管理模式可用 `SUPERAGENT_PROJECT_PREVIEW_IP` 指定本机网卡 IPv4，配合 `SUPERAGENT_PROJECT_PREVIEW_LAN=1` 允许同网段访问。设回 `0` 并重启恢复本机限制。
 
-若需要在独立管理模式提供公网入口，设置 `SUPERAGENT_PROJECT_PUBLIC_ENABLED=1`、`SUPERAGENT_PROJECT_PUBLIC_ORIGIN=https://projects.example.com`，并用 `SUPERAGENT_PROJECT_PUBLIC_USER` 和 `SUPERAGENT_PROJECT_PUBLIC_PASSWORD` 配置账号和至少 16 字符的密码。以 `pnpm start:codex --env-file .env --projects-only` 启动。外部 HTTPS 反向代理指向 `127.0.0.1:3092` 或配置的专用端口，保留外部 Host 和浏览器 Origin，并由代理设置 `X-Forwarded-Proto: https`。登录账号具有项目编辑权限。完整 Agent 服务仍使用本机管理入口。
+设置 `SUPERAGENT_PROJECT_PUBLIC_ENABLED=1`、`SUPERAGENT_PROJECT_PUBLIC_ORIGIN=https://projects.example.com`，并用 `SUPERAGENT_PROJECT_PUBLIC_USER` 和 `SUPERAGENT_PROJECT_PUBLIC_PASSWORD` 配置账号和至少 16 字符的密码。HTTPS 反向代理指向 `127.0.0.1:3092` 或 `SUPERAGENT_PROJECT_PUBLIC_PORT` 配置的专用端口，保留外部 Host 和浏览器 Origin，并由代理设置 `X-Forwarded-Proto: https`。以 `--projects-only` 启动时，该登录账号具有项目编辑权限，交付和验收只供查看。
+
+### 在完整服务中启用网络验收
+
+1. 在本机面板把操作者加到项目。可从本机 `GET /orchestrator/api/projects/<项目 ID>` 响应的 `members` 字段，按姓名找到成员的 `id`，填入 `SUPERAGENT_PROJECT_PUBLIC_REVIEW_MEMBER_ID`。每个部署配置一个专用登录账号，交付和验收以该成员身份留痕。凭据仅供该成员使用。
+2. 使用上面的 HTTPS 代理，或直接在本机局域网 IPv4 上启用 HTTPS。直接访问时，把 `SUPERAGENT_PROJECT_PUBLIC_ORIGIN` 设置为例如 `https://192.168.1.10:3092`，端口与 `SUPERAGENT_PROJECT_PUBLIC_PORT` 一致，填写 `SUPERAGENT_PROJECT_PUBLIC_TLS_CERT_FILE` 和 `SUPERAGENT_PROJECT_PUBLIC_TLS_KEY_FILE`。证书须受浏览器信任，并在 SAN 中包含该 IP。直接监听只允许配置网卡的同网段客户端。
+3. 用 `pnpm start:codex --env-file .env` 启动完整服务。访问配置的 HTTPS 地址下的 `/orchestrator/projects` 并登录。该面板显示操作者所属项目，支持提交自己的交付及记录验收结果。待验收任务拖到「完成」时会打开对应版本的验收表单，提交通过后才进入「完成」。
 
 ## 升级与数据迁移
 
