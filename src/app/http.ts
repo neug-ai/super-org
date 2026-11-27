@@ -4,6 +4,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { createHash, timingSafeEqual, randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { createServer as createHttpsServer, type ServerOptions as TlsOptions } from 'node:https'
+import { TLSSocket } from 'node:tls'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { BlockList } from 'node:net'
 import { z } from 'zod'
@@ -29,6 +31,7 @@ import type { ProjectEvents } from './project-events.ts'
 import type { ProjectAgent } from './project-agent.ts'
 import type { ProjectTools } from './project-tools.ts'
 import { ReviewInput, TaskDelivery, type ProjectReviews } from './project-reviews.ts'
+import { isProjectAgent } from './project-member.ts'
 import { CommunicationPreference, type Communication } from './communication.ts'
 import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
@@ -186,17 +189,19 @@ const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-
 const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
 
+interface ProjectReviewAccess { service: NonNullable<HttpHost['projectReviews']>; memberId: string }
 type ProjectRoute = Extract<keyof Routes, `${string} projects${string}` | `${string} members${string}`>
 function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 'projectIssue' | 'updateProjectPlan' | 'robotAgentSettings' |
-  'selectRobotPlanner' | 'runProjectTask' | 'followProjectTask' | 'stopProjectTask' | 'projectEvents' | 'projectAgent' | 'projectTools' | 'projectReviews' | 'communication' | 'projectProgress' | 'projectTracking' | 'projectHistory' | 'projectRepository'>): Pick<Routes, ProjectRoute> {
+  'selectRobotPlanner' | 'runProjectTask' | 'followProjectTask' | 'stopProjectTask' | 'projectEvents' | 'projectAgent' | 'projectTools' | 'projectReviews' | 'communication' | 'projectProgress' | 'projectTracking' | 'projectHistory' | 'projectRepository'>, reviewAccess?: ProjectReviewAccess): Pick<Routes, ProjectRoute> {
   const projects = new Projects(store)
   const runtime = () => {
     if (!host) throw new ProjectError(409, 'Start the full Super-Org service to run project tasks')
     return host
   }
   const reviews = () => {
-    if (!host?.projectReviews) throw new ProjectError(409, '当前入口无法提交交付或验收。请在运行 Super Org 的电脑上使用本机项目面板。')
-    return host.projectReviews
+    const service = reviewAccess?.service ?? host?.projectReviews
+    if (!service) throw new ProjectError(409, '当前入口无法提交交付或验收。请使用已配置登录的 HTTPS 验收面板，或在运行 Super Org 的电脑上使用本机面板。')
+    return service
   }
   const ticketId = z.string().min(1).max(128)
   const events = () => {
@@ -223,7 +228,11 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     'POST projects/:id/tasks/:taskId/deliveries': async ({ params, body }) => {
       const reviewService = reviews()
       const { messageId, ...evidence } = TaskDelivery.extend({ messageId: ticketId }).parse(await body())
-      return reviewService.deliver({ projectId: params.id, actorId: null, operationId: messageId,
+      if (reviewAccess) {
+        const task = store.get(KV.projects.project(params.id))?.tasks.find(item => item.id === params.taskId)
+        if (task && task.ownerId !== reviewAccess.memberId) throw new ProjectError(403, '请由任务负责人提交结果。')
+      }
+      return reviewService.deliver({ projectId: params.id, actorId: reviewAccess?.memberId ?? null, operationId: messageId,
         channel: { source: 'request', thread: params.id, address: { projectId: params.id } } }, params.taskId, evidence)
     },
     'POST projects/:id/tasks/:taskId/progress': async ({ params, body }) => {
@@ -239,7 +248,7 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     'POST projects/:id/tasks/:taskId/reviews/:reviewId': async ({ params, body }) => {
       const reviewService = reviews()
       const value = ReviewInput.extend({ messageId: ticketId }).parse(await body())
-      return reviewService.decide({ projectId: params.id, actorId: null, operationId: value.messageId,
+      return reviewService.decide({ projectId: params.id, actorId: reviewAccess?.memberId ?? null, operationId: value.messageId,
         channel: { source: 'request', thread: params.id, address: { projectId: params.id } } }, params.taskId, params.reviewId, value.outcome,
         value.reason, undefined, value.links, value.reviewerName)
     },
@@ -339,6 +348,41 @@ function projectRoutes(store: Store, host?: Pick<HttpHost, 'projectExecution' | 
     'POST members': async ({ body }) => projects.saveMember(MemberInput.parse(await body())),
     'PUT members/:id': async ({ params, body }) => projects.saveMember(MemberInput.parse(await body()), params.id),
     'DELETE members/:id': ({ params }) => { projects.deleteMember(params.id); return { deleted: true } },
+  }
+}
+
+function remoteReviewRoutes(store: Store, access: ProjectReviewAccess): Partial<Routes> {
+  const projects = new Projects(store)
+  const activeMember = () => {
+    const member = store.get(KV.projects.member(access.memberId))
+    return !!member && !isProjectAgent(member)
+  }
+  const memberProject = (projectId: string) => {
+    const project = store.get(KV.projects.project(projectId))
+    return project?.memberIds.includes(access.memberId) && activeMember() ? project : undefined
+  }
+  const authorize = (projectId: string) => {
+    if (!memberProject(projectId)) throw new ProjectError(403, '此账号未登记为该项目的成员。')
+  }
+  const routes = projectRoutes(store, undefined, access)
+  return {
+    'GET projects': () => projects.list().filter(project => memberProject(project.id))
+      .map(({ conversationBindings: _bindings, ...project }) => project),
+    'GET projects/execution': () => ({ state: 'planning', deliveryReviewAvailable: activeMember(), reviewMemberId: access.memberId }),
+    'GET projects/:id': ({ params }) => {
+      authorize(params.id)
+      const { dingTalkGroup: _dingTalkGroup, feishuChatId: _feishuChatId, conversationBindings: _bindings, ...project } = projects.detail(params.id)
+      return { ...project, members: project.members.map(member => ({ ...member, accounts: [] })) }
+    },
+    'GET members': () => [],
+    'POST projects/:id/tasks/:taskId/deliveries': input => {
+      authorize(input.params.id)
+      return routes['POST projects/:id/tasks/:taskId/deliveries'](input)
+    },
+    'POST projects/:id/tasks/:taskId/reviews/:reviewId': input => {
+      authorize(input.params.id)
+      return routes['POST projects/:id/tasks/:taskId/reviews/:reviewId'](input)
+    },
   }
 }
 
@@ -446,12 +490,14 @@ async function serveProjectsPage(path: string, req: IncomingMessage, res: Server
   res.writeHead(200, { ...headers, 'content-type': 'text/javascript; charset=utf-8' }); res.end(script)
 }
 
-interface PublicProjectGate { origin: URL; credentialHash: Buffer }
+interface PublicProjectGate { origin: URL; credentialHash: Buffer; directTls: boolean }
 const hashCredentials = (credentials: string | Buffer) => createHash('sha256').update(credentials).digest()
 
 function authorizePublicProject(req: IncomingMessage, res: ServerResponse, access: PublicProjectGate): boolean {
-  if (req.socket.remoteAddress !== '127.0.0.1' || req.headers.host !== access.origin.host || req.headers['x-forwarded-proto'] !== 'https') {
-    json(res, 403, { error: 'Use the configured public project address through the local HTTPS reverse proxy' })
+  const https = access.directTls ? req.socket instanceof TLSSocket && req.socket.encrypted :
+    req.socket.remoteAddress === '127.0.0.1' && req.headers['x-forwarded-proto'] === 'https'
+  if (!https || req.headers.host !== access.origin.host) {
+    json(res, 403, { error: 'Use the configured HTTPS project address' })
     return false
   }
   const credential = /^Basic ([A-Za-z0-9+/]+={0,2})$/i.exec(req.headers.authorization ?? '')?.[1]
@@ -500,16 +546,24 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
 }
 
 export interface ProjectPublicAccess { origin: URL; username: string; password: string }
-interface ProjectHttpAccess { publicAccess?: ProjectPublicAccess; previewNetwork?: BlockList }
+interface ProjectHttpAccess {
+  publicAccess?: ProjectPublicAccess; previewNetwork?: BlockList; tls?: TlsOptions; reviewAccess?: ProjectReviewAccess
+}
 
-/** Project-only HTTP listener for either a local preview or the local upstream of a public HTTPS proxy. */
-export function projectHttpServer(store: Store, port: number, address: string, { publicAccess, previewNetwork }: ProjectHttpAccess = {}) {
-  const gate = publicAccess && { origin: publicAccess.origin, credentialHash: hashCredentials(`${publicAccess.username}:${publicAccess.password}`) }
-  const handler = managementHandler(projectRoutes(store), Promise.resolve(), { port }, address, gate, previewNetwork)
-  return createServer((req, res) => {
-    void handler(req, res).catch(() => {
+/** Project routes are separate from the full local management server. */
+export function projectHttpServer(store: Store, port: number, address: string,
+  { publicAccess, previewNetwork, tls, reviewAccess }: ProjectHttpAccess = {}) {
+  if ((tls || reviewAccess) && !publicAccess) throw new Error('Remote review requires authenticated HTTPS')
+  if (publicAccess && !tls && address !== '127.0.0.1') throw new Error('An HTTPS proxy upstream must listen on loopback')
+  const gate = publicAccess && { origin: publicAccess.origin, directTls: !!tls,
+    credentialHash: hashCredentials(`${publicAccess.username}:${publicAccess.password}`) }
+  const routes = reviewAccess ? remoteReviewRoutes(store, reviewAccess) : projectRoutes(store)
+  const handle = managementHandler(routes, Promise.resolve(), { port }, address, gate, previewNetwork)
+  const listener = (req: IncomingMessage, res: ServerResponse) => {
+    void handle(req, res).catch(() => {
       if (res.headersSent) res.destroy()
       else { res.writeHead(500); res.end() }
     })
-  })
+  }
+  return tls ? createHttpsServer({ ...tls, minVersion: 'TLSv1.2' }, listener) : createServer(listener)
 }

@@ -1,7 +1,10 @@
 import { readFileSync } from 'node:fs'
+import { once } from 'node:events'
+import { request } from 'node:http'
 import { afterEach, expect, it, vi } from 'vitest'
 import { KV } from '../src/kv.ts'
 import { currentReview, reviewReference } from '../src/app/project-deliveries.ts'
+import { projectHttpServer } from '../src/app/http.ts'
 import { ProjectChange, ProjectInput, Projects, TaskInput } from '../src/app/projects.ts'
 import { reviewAccepted, reviewFeedback, reviewRejected, reviewRequested, type ReviewContext } from '../src/app/project-reviews.ts'
 import { dingTalkKind, dingTalkRoute } from '../src/sources/dingtalk.ts'
@@ -53,6 +56,65 @@ it('captures manual evidence and requirements once, notifies the owner to coordi
   expect(projects.detail(id).tickets).toEqual([])
   expect(h.runtime.projectEvents.list({ projectId: id })).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'review.accepted', status: 'applied' })]))
 })
+
+it('records a network review under the authenticated human member and only for the current delivery', async () => {
+  const { h, projects, id, owner, other, task, submit, readTask, change } = await pilot(null)
+  const review = await submit()
+  const inaccessible = projects.create(ProjectInput.parse({ name: 'Another project' }))
+  const ownTask = change({ kind: 'task', value: { title: 'Reviewer’s own task', ownerId: other.id } }).tasks.at(-1)!
+  const origin = new URL('https://projects.example.com')
+  const username = 'reviewer', password = 'test-only-review-credential'
+  const server = projectHttpServer(h.runtime.store, 0, '127.0.0.1', { publicAccess: { origin, username, password },
+    reviewAccess: { service: h.runtime.projectReviews, memberId: other.id } })
+  server.listen(0, '127.0.0.1')
+  try {
+    await once(server, 'listening')
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('Expected a TCP server')
+    const headers = { host: origin.host, 'x-forwarded-proto': 'https', origin: origin.origin, 'x-orchestrator-request': '1',
+      authorization: `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`, 'content-type': 'application/json' }
+    const call = (path: string, body?: object, overrides?: Record<string, string>) => new Promise<{
+      status: number | undefined; text: string
+    }>((resolve, reject) => {
+      const req = request(`http://127.0.0.1:${address.port}/orchestrator/api/${path}`, {
+        headers: { ...headers, ...overrides }, method: body ? 'POST' : 'GET',
+      }, response => {
+        let text = ''
+        response.setEncoding('utf8').on('data', chunk => { text += chunk })
+        response.on('end', () => resolve({ status: response.statusCode, text })).on('error', reject)
+      })
+      req.on('error', reject).end(body && JSON.stringify(body))
+    })
+    expect((await call('projects', undefined, { authorization: '' })).status).toBe(401)
+    expect(JSON.parse((await call('projects')).text)).toMatchObject([{ id }])
+    expect(JSON.parse((await call('projects/execution')).text)).toMatchObject({ deliveryReviewAvailable: true, reviewMemberId: other.id })
+    expect((await call(`projects/${inaccessible.id}`)).status).toBe(403)
+    expect((await call(`projects/${id}/changes`, {})).status).toBe(404)
+    expect((await call('members', {})).status).toBe(404)
+    expect((await call('state')).status).toBe(404)
+    expect((await call(`projects/${id}/tasks/${task.id}/deliveries`, { messageId: 'not-owner', summary: 'Another member’s output' })).status).toBe(403)
+    expect((await call(`projects/${id}/tasks/${ownTask.id}/deliveries`, { messageId: 'own-delivery', summary: 'Output ready' })).status).toBe(200)
+    await h.runtime.idle()
+    const ownReview = currentReview(projects.detail(id).tasks.find(item => item.id === ownTask.id)!)!
+    const path = `projects/${id}/tasks/${task.id}/reviews/${review.id}`
+    const input = { messageId: 'accept-from-network', outcome: 'accepted', reason: 'Checked the current version' }
+    expect((await call(path, input, { origin: 'https://other.example.com' })).status).toBe(403)
+    expect((await call(`projects/${id}/tasks/${task.id}/reviews/previous-delivery`, input)).status).toBe(409)
+    const ownPath = `projects/${id}/tasks/${ownTask.id}/reviews/${ownReview.id}`
+    expect((await call(ownPath, input)).status).toBe(403)
+    expect(readTask().status).toBe('in-review')
+    expect((await call(path, input)).status).toBe(200)
+    await h.runtime.idle()
+    expect(readTask()).toMatchObject({ status: 'done', reviews: [{ id: review.id, status: 'accepted',
+      decision: { actorId: other.id, actorName: other.name, reason: input.reason } }] })
+    expect(readTask().ownerId).toBe(owner.id)
+    expect((await call(ownPath, { ...input, messageId: 'delegated-review', reviewerName: owner.name })).status).toBe(200)
+    await h.runtime.idle()
+    change({ kind: 'remove-member', memberId: other.id })
+    expect((await call(`projects/${id}`)).status).toBe(403)
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
+})
+
 it('verifies both human and Agent deliveries on their original tasks without assigning a reviewer', async () => {
   const { h, id, owner, other, projects, context, change } = await pilot()
   const roster = change({ kind: 'add-agent' })

@@ -192,7 +192,7 @@ it('reports delivery review availability independently of execution and explains
   } })
   for (const endpoint of [path, 'projects/project/tasks/task/deliveries']) {
     expect(await preview('POST', endpoint, {})).toEqual({ status: 409, body: {
-      error: '当前入口无法提交交付或验收。请在运行 Super Org 的电脑上使用本机项目面板。',
+      error: '当前入口无法提交交付或验收。请使用已配置登录的 HTTPS 验收面板，或在运行 Super Org 的电脑上使用本机面板。',
     } })
   }
 

@@ -3,7 +3,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { execFileSync } from 'node:child_process'
 import { loadEnvFile } from 'node:process'
 import { resolve, join } from 'node:path'
-import { existsSync, mkdirSync, realpathSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
 import type { Server } from 'node:http'
 import { BlockList } from 'node:net'
 import { networkInterfaces } from 'node:os'
@@ -109,6 +109,31 @@ async function startProjects(stateDir: string, port: number, previewIp: string |
   } catch (error) { await stop(); throw error }
 }
 
+function projectReviewListener(localPort: number) {
+  const remote = projectPublicAccess(localPort)
+  if (!remote) return
+  const memberId = z.uuid().safeParse(process.env.SUPERAGENT_PROJECT_PUBLIC_REVIEW_MEMBER_ID?.trim())
+  if (!memberId.success) throw new Error('Set SUPERAGENT_PROJECT_PUBLIC_REVIEW_MEMBER_ID to the project member UUID for this login')
+  const certFile = process.env.SUPERAGENT_PROJECT_PUBLIC_TLS_CERT_FILE?.trim()
+  const keyFile = process.env.SUPERAGENT_PROJECT_PUBLIC_TLS_KEY_FILE?.trim()
+  const options = { port: remote.port, publicAccess: remote.access, memberId: memberId.data }
+  if (!certFile && !keyFile) return { ...options, address: '127.0.0.1' }
+  if (!certFile || !keyFile) throw new Error('Set both SUPERAGENT_PROJECT_PUBLIC_TLS_CERT_FILE and SUPERAGENT_PROJECT_PUBLIC_TLS_KEY_FILE')
+  const address = remote.access.origin.hostname
+  const network = Object.values(networkInterfaces()).flat().find(info =>
+    info?.family === 'IPv4' && !info.internal && info.address === address)
+  const prefix = Number(network?.cidr?.split('/')[1])
+  if (Number(remote.access.origin.port || 443) !== remote.port || !Number.isInteger(prefix) || prefix < 1 || prefix > 32)
+    throw new Error('Set SUPERAGENT_PROJECT_PUBLIC_ORIGIN to the HTTPS address of a local IPv4 interface with SUPERAGENT_PROJECT_PUBLIC_PORT')
+  const previewNetwork = new BlockList()
+  previewNetwork.addSubnet(address, prefix)
+  try {
+    return { ...options, address, previewNetwork, tls: { cert: readFileSync(certFile), key: readFileSync(keyFile) } }
+  } catch {
+    throw new Error('Setup: Could not read the project HTTPS certificate or private key')
+  }
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
   const usage = 'Usage: node lib/codex-cli.js [--env-file /absolute/path/to/env] [--projects-only]'
@@ -125,8 +150,7 @@ async function main(): Promise<void> {
     try { await startProjects(stateDir, port, process.env.SUPERAGENT_PROJECT_PREVIEW_IP?.trim()); return }
     catch (error) { throw new Error(`Setup: Project management could not start. ${error instanceof Error ? error.message : String(error)}`, { cause: error }) }
   }
-  if (process.env.SUPERAGENT_PROJECT_PUBLIC_ENABLED?.trim() === '1')
-    throw new Error('Set SUPERAGENT_PROJECT_PUBLIC_ENABLED=1 only with --projects-only')
+  const remoteReview = projectReviewListener(port)
   const clientId = process.env.DINGTALK_CLIENT_ID || process.env.DINGTALK_APP_KEY
   const clientSecret = process.env.DINGTALK_CLIENT_SECRET || process.env.DINGTALK_APP_SECRET
   if (!!clientId !== !!clientSecret) throw new Error('Set both DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET for DingTalk delivery')
@@ -237,9 +261,11 @@ async function main(): Promise<void> {
   let githubPolling: Promise<void> | undefined
   let feishuPolling: Promise<unknown> | undefined
   let stopping: Promise<void> | undefined
+  let reviewServer: Server | undefined
   const stop = () => stopping ??= (async () => {
     robot?.stop()
     githubController.abort()
+    if (reviewServer?.listening) await new Promise<void>(resolve => reviewServer!.close(() => resolve()))
     await githubPolling
     const stopped = runtime?.stop()
     await harness.close()
@@ -278,6 +304,16 @@ async function main(): Promise<void> {
         github: { ...policy.sources.github, allowed } } }, runtime.store.blockRevision('policy'), 'sync')
     }
     await harness.listen()
+    if (remoteReview) {
+      const server = reviewServer = projectHttpServer(runtime.store, remoteReview.port, remoteReview.address, {
+        ...remoteReview, reviewAccess: { service: runtime.projectReviews, memberId: remoteReview.memberId },
+      })
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(remoteReview.port, remoteReview.address, () => { server.off('error', reject); resolve() })
+      }).catch(() => { throw new Error('Setup: Could not open the authenticated project review listener') })
+      console.log(`Authenticated project reviews at ${remoteReview.publicAccess.origin.origin}/orchestrator/projects`)
+    }
     feishuPolling = runFeishu(runtime.context(feishuKind), runtime.lifetime)
     await robot?.start()
     githubPolling = watchGithub(runtime.context(githubKind), githubController.signal)
